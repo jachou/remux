@@ -1123,7 +1123,7 @@ impl ProbeDataExt for api::MediaSourceInfo {
 /// request may reuse instead of running ffprobe again. A filename guess
 /// (`ProbeOrigin::FilenameGuess`) is never a completed probe — it must not
 /// block a real ffprobe attempt, even if it happens to carry a "video stream".
-fn is_reusable_probe_cache(cached: &api::MediaSourceInfo) -> bool {
+pub(crate) fn is_reusable_probe_cache(cached: &api::MediaSourceInfo) -> bool {
     let Some(_video) = cached.video_stream() else {
         return false;
     };

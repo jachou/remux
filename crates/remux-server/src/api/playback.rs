@@ -1228,10 +1228,12 @@ async fn videos_stream_inner(
                     })
                     .unwrap_or(false)
             {
+                tracing::info!(item = %id, redirect_url = %url, "redirecting client to upstream stream (307)");
                 return Ok(axum::response::Redirect::temporary(url).into_response());
             }
         }
 
+        tracing::info!(item = %id, media_source = ?q.media_source_id, "serving stream directly to client via proxy (200/206)");
         let resp = if let Some(addon_id) = descriptor.addon_id() {
             let addon = state
                 .ctx

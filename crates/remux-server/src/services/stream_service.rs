@@ -1,7 +1,9 @@
 use crate::{
     AppContext, api, db,
     db::PreProbeQualityExt,
-    playback::probe::{ProbeDataExt, probe_stream, resolve_stream_root},
+    playback::probe::{
+        ProbeDataExt, is_reusable_probe_cache, probe_stream, resolve_stream_root,
+    },
 };
 use remux_sdks::{
     remux::{MediaStreamType, StreamFilter, VideoRangeType},
@@ -855,7 +857,73 @@ impl StreamService {
             .get::<Uuid>(format!("gitem:{}:{}", user_id, group_id))
             .map(|id| *id)
     }
+    /// Pre-emptively probe only the primary candidate (Candidate #1).
+    /// Skips probing if Candidate #1 is already cached with reusable probe data.
+    /// Does not probe or rewrite any other candidates.
+    pub async fn probe_primary_candidate(&self) -> anyhow::Result<Option<Uuid>> {
+        let sel = self.select_streams();
+        let primary = if let Some(pref_id) = sel.preferred_probe_id {
+            sel.candidates.iter().find(|s| s.id == pref_id).cloned()
+        } else {
+            sel.candidates.first().cloned()
+        };
+
+        let Some(stream) = primary else {
+            return Ok(None);
+        };
+
+        if let Some(cached) = &stream.probe_data {
+            if is_reusable_probe_cache(cached) {
+                tracing::info!(item = %self.item_id, stream = %stream.id, "Candidate #1 already has reusable probe data; skipping");
+                return Ok(Some(stream.id));
+            }
+        }
+
+        let probe_cfg = db::Settings::get_config_or_default(&self.ctx.db).await;
+        let timeout = probe_cfg.probe_timeout_secs.unwrap_or(20) as u64;
+        let timeout_p2p = probe_cfg.probe_timeout_p2p_secs.unwrap_or(60) as u64;
+        let auto_next = probe_cfg.auto_next_stream_on_probe_fail.unwrap_or(true);
+        let max_retries = probe_cfg.max_probe_fallback_streams.unwrap_or(3) as usize;
+        let port = self.ctx.config.port;
+
+        let url_opt = stream
+            .stream_info
+            .as_ref()
+            .map(|si| si.descriptor.server_input(stream.id, port));
+
+        let timeout_secs = if stream
+            .stream_info
+            .as_ref()
+            .map_or(false, |si| si.is_p2p())
+        {
+            timeout_p2p
+        } else {
+            timeout
+        };
+
+        tracing::info!(item = %self.item_id, stream = %stream.id, "probing Candidate #1 preemptively");
+        let (_info, effective) = probe_stream(
+            &stream,
+            url_opt,
+            false,
+            timeout_secs,
+            auto_next,
+            max_retries,
+            &sel.probe_pool,
+            sel.restrict_resolution,
+            port,
+            &self.ctx.db,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+        tracing::info!(item = %self.item_id, effective = %effective.id, "preemptive probe of Candidate #1 completed");
+        Ok(Some(effective.id))
+    }
 }
+
+static PREEMPTIVE_PROBES: std::sync::LazyLock<dashmap::DashSet<Uuid>> =
+    std::sync::LazyLock::new(dashmap::DashSet::new);
 
 /// Spawns a background task to pre-emptively probe the primary stream candidate
 /// for the given Movie or Episode item.
@@ -864,14 +932,43 @@ pub fn spawn_preemptive_probe(
     item_id: Uuid,
     user_id: Option<Uuid>,
 ) {
+    if !PREEMPTIVE_PROBES.insert(item_id) {
+        tracing::debug!(%item_id, "preemptive probe already in flight, skipping duplicate spawn");
+        return;
+    }
+    tracing::info!(%item_id, "spawning preemptive probe task");
     let ctx = ctx.clone();
     tokio::spawn(async move {
+        struct PreemptiveGuard(Uuid);
+        impl Drop for PreemptiveGuard {
+            fn drop(&mut self) {
+                PREEMPTIVE_PROBES.remove(&self.0);
+            }
+        }
+        let _guard = PreemptiveGuard(item_id);
+
         let Ok(Some(media)) = db::Media::get_by_id(&ctx.db, &item_id).await else {
             return;
         };
 
         if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
             return;
+        }
+
+        // Fast path: if streams exist in DB and Candidate #1 already has reusable probe data, skip immediately!
+        let mut check_media = media.clone();
+        if let Ok(streams) = check_media.streams(&ctx.db).await {
+            if !streams.is_empty() {
+                let pool = quality_ordered_probe_pool(&streams);
+                if let Some(top) = pool.first() {
+                    if let Some(pd) = &top.probe_data {
+                        if is_reusable_probe_cache(pd) {
+                            tracing::info!(%item_id, stream_id = %top.id, "Candidate #1 already probed in DB; skipping preemptive probe");
+                            return;
+                        }
+                    }
+                }
+            }
         }
 
         let probe_cfg = db::Settings::get_config_or_default(&ctx.db).await;
@@ -885,9 +982,19 @@ pub fn spawn_preemptive_probe(
             user_id,
         });
 
-        if service.load(media).await.is_ok() {
-            if let Ok(probed) = service.probe_candidates().await {
-                tracing::info!(%item_id, candidates = probed.results.len(), "preemptive probe finished");
+        if let Err(e) = service.load(media).await {
+            tracing::warn!(%item_id, error = %e, "preemptive probe service.load failed");
+            return;
+        }
+        match service.probe_primary_candidate().await {
+            Ok(Some(stream_id)) => {
+                tracing::info!(%item_id, %stream_id, "preemptive probe finished successfully");
+            }
+            Ok(None) => {
+                tracing::debug!(%item_id, "preemptive probe found no candidate streams");
+            }
+            Err(e) => {
+                tracing::warn!(%item_id, error = %e, "preemptive probe failed");
             }
         }
     });
