@@ -109,15 +109,27 @@ pub async fn shows_episodes(
             }
         }
     }
-    let items = get_items(state, session.clone(), q.clone(), true)
+    let result = get_items(state.clone(), session.clone(), q.clone(), true)
         .await?
         .with_permissions()
         .with_client_patches()
         .build();
 
+    if let Some(target) = result.items.iter().find(|i| {
+        i.user_data
+            .as_ref()
+            .map_or(true, |u| !u.played)
+    }).or_else(|| result.items.first()) {
+        crate::services::stream_service::spawn_preemptive_probe(
+            &state.ctx,
+            target.id,
+            Some(session.user.id),
+        );
+    }
+
     Ok(Json(api::BaseItemDtoQueryResult {
-        items: items.items,
-        total_record_count: items.total_count as i64,
+        items: result.items,
+        total_record_count: result.total_count as i64,
         start_index: q
             .start_index
             .unwrap_or(0),

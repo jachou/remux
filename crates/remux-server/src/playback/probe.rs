@@ -1226,10 +1226,21 @@ pub(crate) async fn probe_stream(
         }
     };
 
+    struct LeaderGuard {
+        id: Uuid,
+        tx: tokio::sync::broadcast::Sender<()>,
+    }
+    impl Drop for LeaderGuard {
+        fn drop(&mut self) {
+            IN_FLIGHT_PROBES.remove(&self.id);
+            let _ = self.tx.send(());
+        }
+    }
+
     if !is_leader {
         debug!(id = %stream.id, "attaching to in-flight probe");
         if let Some(mut rx) = rx {
-            let _ = rx.recv().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx.recv()).await;
         }
         if let Ok(Some(fresh_stream)) = db::Media::get_by_id(db, &stream.id).await {
             if let Some(cached) = &fresh_stream.probe_data {
@@ -1241,6 +1252,11 @@ pub(crate) async fn probe_stream(
             }
         }
     }
+
+    let _leader_guard = is_leader.then(|| LeaderGuard {
+        id: stream.id,
+        tx,
+    });
 
     let result = probe_with_fallback(
         stream.clone(),
@@ -1255,11 +1271,6 @@ pub(crate) async fn probe_stream(
         |url| probe_media(&url),
     )
     .await;
-
-    if is_leader {
-        IN_FLIGHT_PROBES.remove(&stream.id);
-        let _ = tx.send(());
-    }
 
     match result {
         Ok(result) => Ok(result),

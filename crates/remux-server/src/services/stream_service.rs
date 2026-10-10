@@ -887,7 +887,7 @@ pub fn spawn_preemptive_probe(
 
         if service.load(media).await.is_ok() {
             if let Ok(probed) = service.probe_candidates().await {
-                tracing::debug!(%item_id, candidates = probed.results.len(), "preemptive probe finished");
+                tracing::info!(%item_id, candidates = probed.results.len(), "preemptive probe finished");
             }
         }
     });
