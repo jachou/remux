@@ -1628,11 +1628,9 @@ async fn resume_items(
     session: auth::AuthSession,
     mut q: api::GetItemsQuery,
 ) -> Result<impl IntoResponse> {
-    q.user_id = Some(
-        session
-            .user
-            .id,
-    );
+    let user_id = session.user.id;
+    let ctx = state.ctx.clone();
+    q.user_id = Some(user_id);
     q.filters = Some(vec![api::ItemFilter::IsResumable]);
     let limit = *q
         .limit
@@ -1756,6 +1754,27 @@ async fn resume_items(
             .take(limit as usize)
             .collect();
     }
+
+    if start == 0 {
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
+        for target in items
+            .iter()
+            .filter(|i| {
+                i.user_data
+                    .as_ref()
+                    .and_then(|u| u.last_played_date)
+                    .map_or(true, |d| d >= cutoff)
+            })
+            .take(3)
+        {
+            crate::services::stream_service::spawn_preemptive_probe(
+                &ctx,
+                target.id,
+                Some(user_id),
+            );
+        }
+    }
+
     Ok(Json(api::BaseItemDtoQueryResult {
         items,
         total_record_count: total,
