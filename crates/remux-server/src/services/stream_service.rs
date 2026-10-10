@@ -1016,6 +1016,7 @@ pub fn spawn_next_episode_probe(
     ctx: &crate::AppContext,
     current_item_id: Uuid,
     user_id: Uuid,
+    trigger: &'static str,
 ) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
@@ -1055,7 +1056,7 @@ pub fn spawn_next_episode_probe(
         };
 
         if let Some(next_id) = target_id {
-            tracing::info!(%next_id, "Trigger 2: auto-probing next episode in background");
+            tracing::info!(%next_id, trigger, "{}: auto-probing next episode in background", trigger);
             spawn_preemptive_probe(&ctx, next_id, Some(user_id));
         }
     });

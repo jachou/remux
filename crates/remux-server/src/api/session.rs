@@ -146,6 +146,16 @@ pub async fn report_playback_start(
                 .unwrap_or(0),
             ..PlaybackContext::from_parts(&session, &data, playback.as_ref(), None)
         }));
+
+    if !data.item_id.is_nil() {
+        crate::services::stream_service::spawn_next_episode_probe(
+            &state.ctx,
+            data.item_id,
+            session.user.id,
+            "Trigger 1 (on playback start)",
+        );
+    }
+
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
@@ -181,7 +191,7 @@ pub async fn report_playback_progress(
                 .map(|s| s.play_session_id)
         });
     if let Some(ref psid) = effective_psid {
-        state
+        let crossed_80 = state
             .ctx
             .sessions
             .progress(
@@ -202,6 +212,24 @@ pub async fn report_playback_progress(
             .ctx
             .sessions
             .get(psid);
+        if crossed_80 {
+            let item_id = if !data.item_id.is_nil() {
+                Some(data.item_id)
+            } else {
+                playback
+                    .as_ref()
+                    .map(|p| p.item_id)
+                    .filter(|id| !id.is_nil())
+            };
+            if let Some(item_id) = item_id {
+                crate::services::stream_service::spawn_next_episode_probe(
+                    &state.ctx,
+                    item_id,
+                    session.user.id,
+                    "Trigger 3 (on 80% progress)",
+                );
+            }
+        }
         if let Some(current_playback) = playback.as_ref()
             && session
                 .device
@@ -365,6 +393,7 @@ pub async fn report_playback_stopped(
                     &state.ctx,
                     item_id,
                     session.user.id,
+                    "Trigger 2 (on playback stopped)",
                 );
             }
         }
@@ -407,6 +436,7 @@ pub async fn report_playback_stopped(
                 &state.ctx,
                 data.item_id,
                 session.user.id,
+                "Trigger 2 (on playback stopped)",
             );
         }
     }

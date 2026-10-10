@@ -35,6 +35,8 @@ pub struct PlaybackSession {
     pub group_id: Option<Uuid>,
     /// Kind of the item being played, used to populate NowPlayingItem in session broadcasts.
     pub item_kind: Option<db::MediaKind>,
+    /// Whether next episode probe has been triggered at the 80% progress milestone.
+    pub probed_next_episode_at_80: bool,
     /// Torrent sources selected for this playback. Their leases are released
     /// with the session, after any active HTTP response has finished reading.
     torrents: Vec<Arc<crate::torrent::TorrentLease>>,
@@ -209,6 +211,7 @@ impl PlaybackSessionManager {
             transcode: None,
             group_id,
             item_kind,
+            probed_next_episode_at_80: false,
             torrents: Vec::new(),
         };
 
@@ -289,11 +292,11 @@ impl PlaybackSessionManager {
         user: &db::User,
         psid: &str,
         data: &PlaybackInfo,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<bool> {
         let ps_snapshot = self.get(psid);
         let ps = match ps_snapshot.as_ref() {
             Some(ps) => ps,
-            None => return Ok(()),
+            None => return Ok(false),
         };
 
         // If the session has no valid item and the progress report can't supply one,
@@ -308,7 +311,7 @@ impl PlaybackSessionManager {
         {
             self.stop(psid)
                 .await;
-            return Ok(());
+            return Ok(false);
         }
 
         let item_id = if !data
@@ -367,7 +370,10 @@ impl PlaybackSessionManager {
                 .item_id
                 .is_nil()
             {
-                ps.item_id = data.item_id;
+                if ps.item_id != data.item_id {
+                    ps.item_id = data.item_id;
+                    ps.probed_next_episode_at_80 = false;
+                }
             }
             ps.position_ticks = data
                 .position_ticks
@@ -410,7 +416,22 @@ impl PlaybackSessionManager {
         let position_ticks = data
             .position_ticks
             .unwrap_or(ps.position_ticks);
+        let mut crossed_80_percent = false;
         if let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await {
+            let position_seconds = position_ticks / 10_000_000;
+            if media.kind == db::MediaKind::Episode {
+                if let Some(runtime) = media.runtime {
+                    if runtime > 0 && position_seconds >= (runtime * 80) / 100 {
+                        self.update(psid, |ps| {
+                            if !ps.probed_next_episode_at_80 {
+                                ps.probed_next_episode_at_80 = true;
+                                crossed_80_percent = true;
+                            }
+                        });
+                    }
+                }
+            }
+
             let cfg = user
                 .configuration
                 .as_ref()
@@ -446,7 +467,7 @@ impl PlaybackSessionManager {
             .await?;
         }
 
-        Ok(())
+        Ok(crossed_80_percent)
     }
 
     /// Handle a `POST /sessions/playing/stopped` report.
@@ -793,6 +814,7 @@ impl PlaybackSessionManager {
                         last_activity: Utc::now(),
                         group_id: None,
                         item_kind: None,
+                        probed_next_episode_at_80: false,
                         torrents: Vec::new(),
                     },
                 );
