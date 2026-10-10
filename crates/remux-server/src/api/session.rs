@@ -359,6 +359,14 @@ pub async fn report_playback_stopped(
                     played,
                     ..pctx
                 }));
+
+            if played {
+                crate::services::stream_service::spawn_next_episode_probe(
+                    &state.ctx,
+                    item_id,
+                    session.user.id,
+                );
+            }
         }
     } else if !data
         .item_id
@@ -393,6 +401,14 @@ pub async fn report_playback_stopped(
                 played,
                 ..PlaybackContext::from_parts(&session, &data, None, None)
             }));
+
+        if played {
+            crate::services::stream_service::spawn_next_episode_probe(
+                &state.ctx,
+                data.item_id,
+                session.user.id,
+            );
+        }
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

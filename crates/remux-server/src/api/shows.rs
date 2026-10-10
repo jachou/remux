@@ -271,6 +271,12 @@ pub async fn shows_nextup(
         return Ok(Json(api::BaseItemDtoQueryResult::default()).into_response());
     };
 
+    crate::services::stream_service::spawn_preemptive_probe(
+        &state.ctx,
+        ep.id,
+        Some(user_id),
+    );
+
     let mut enriched = vec![ep.clone()];
     db::Media::preload_parents(
         &state
@@ -527,6 +533,15 @@ async fn shows_nextup_all(
     if candidates.is_empty() {
         return Ok(Json(api::BaseItemDtoQueryResult::default()));
     }
+
+    for (media, _) in candidates.iter().take(2) {
+        crate::services::stream_service::spawn_preemptive_probe(
+            &state.ctx,
+            media.id,
+            Some(session.user.id),
+        );
+    }
+
     let order: HashMap<Uuid, usize> = candidates
         .iter()
         .enumerate()

@@ -857,6 +857,93 @@ impl StreamService {
     }
 }
 
+/// Spawns a background task to pre-emptively probe the primary stream candidate
+/// for the given Movie or Episode item.
+pub fn spawn_preemptive_probe(
+    ctx: &crate::AppContext,
+    item_id: Uuid,
+    user_id: Option<Uuid>,
+) {
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let Ok(Some(media)) = db::Media::get_by_id(&ctx.db, &item_id).await else {
+            return;
+        };
+
+        if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
+            return;
+        }
+
+        let probe_cfg = db::Settings::get_config_or_default(&ctx.db).await;
+        let show_ungrouped = probe_cfg.stream_groups_show_ungrouped.unwrap_or(true);
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id,
+            requested_id: None,
+            show_ungrouped,
+            stream_filter: None,
+            user_id,
+        });
+
+        if service.load(media).await.is_ok() {
+            if let Ok(probed) = service.probe_candidates().await {
+                tracing::debug!(%item_id, candidates = probed.results.len(), "preemptive probe finished");
+            }
+        }
+    });
+}
+
+/// Looks up the next episode in the series (e.g. S01E02 after S01E01, or S02E01 after S01 finale),
+/// and pre-emptively probes Candidate #1 in the background.
+pub fn spawn_next_episode_probe(
+    ctx: &crate::AppContext,
+    current_item_id: Uuid,
+    user_id: Uuid,
+) {
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let Ok(Some(current)) = db::Media::get_by_id(&ctx.db, &current_item_id).await else {
+            return;
+        };
+        if current.kind != db::MediaKind::Episode {
+            return;
+        }
+
+        let target_id = if let (Some(gp_id), Some(p_idx), Some(idx)) =
+            (current.grandparent_id, current.parent_idx, current.idx)
+        {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM media WHERE grandparent_id = ? AND ((parent_idx = ? AND idx > ?) OR (parent_idx > ?)) ORDER BY COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC LIMIT 1",
+            )
+            .bind(gp_id)
+            .bind(p_idx)
+            .bind(idx)
+            .bind(p_idx)
+            .fetch_optional(&ctx.db)
+            .await
+            .ok()
+            .flatten()
+        } else if let (Some(p_id), Some(idx)) = (current.parent_id, current.idx) {
+            sqlx::query_scalar::<_, Uuid>(
+                "SELECT id FROM media WHERE parent_id = ? AND idx > ? ORDER BY COALESCE(idx, 9999) ASC LIMIT 1",
+            )
+            .bind(p_id)
+            .bind(idx)
+            .fetch_optional(&ctx.db)
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
+        if let Some(next_id) = target_id {
+            tracing::info!(%next_id, "Trigger 2: auto-probing next episode in background");
+            spawn_preemptive_probe(&ctx, next_id, Some(user_id));
+        }
+    });
+}
+
 /// Result of `StreamService::select_streams` — partitioned candidate/probe lists and flags.
 pub(crate) struct StreamSelection {
     /// Streams to present to the client and probe.
