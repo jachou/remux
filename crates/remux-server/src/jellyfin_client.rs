@@ -143,8 +143,12 @@ pub fn merge_device_profile_subtitles(
     device: &Device,
     profile: Option<DeviceProfile>,
 ) -> Option<DeviceProfile> {
-    let mut profile = profile?;
-    if let Some(additional) = from_device(device).device_profile_subtitles() {
+    let additional = from_device(device).device_profile_subtitles();
+    if profile.is_none() && additional.is_none() {
+        return None;
+    }
+    let mut profile = profile.unwrap_or_default();
+    if let Some(additional) = additional {
         for subtitle in additional {
             if !profile
                 .subtitle_profiles

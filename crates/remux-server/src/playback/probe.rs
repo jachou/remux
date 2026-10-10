@@ -1208,56 +1208,6 @@ pub(crate) async fn probe_stream(
             debug!(id = %stream.id, "probe cache stale or filename-guess only, re-probing");
         }
     }
-    static IN_FLIGHT_PROBES: std::sync::LazyLock<dashmap::DashMap<Uuid, tokio::sync::broadcast::Sender<()>>> =
-        std::sync::LazyLock::new(dashmap::DashMap::new);
-
-    let (tx, mut rx, is_leader) = {
-        use dashmap::mapref::entry::Entry;
-        match IN_FLIGHT_PROBES.entry(stream.id) {
-            Entry::Occupied(occ) => {
-                let tx = occ.get().clone();
-                (tx.clone(), Some(tx.subscribe()), false)
-            }
-            Entry::Vacant(vac) => {
-                let (tx, _) = tokio::sync::broadcast::channel(1);
-                vac.insert(tx.clone());
-                (tx, None, true)
-            }
-        }
-    };
-
-    struct LeaderGuard {
-        id: Uuid,
-        tx: tokio::sync::broadcast::Sender<()>,
-    }
-    impl Drop for LeaderGuard {
-        fn drop(&mut self) {
-            IN_FLIGHT_PROBES.remove(&self.id);
-            let _ = self.tx.send(());
-        }
-    }
-
-    if !is_leader {
-        debug!(id = %stream.id, "attaching to in-flight probe");
-        if let Some(mut rx) = rx {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), rx.recv()).await;
-        }
-        if let Ok(Some(fresh_stream)) = db::Media::get_by_id(db, &stream.id).await {
-            if let Some(cached) = &fresh_stream.probe_data {
-                if is_reusable_probe_cache(cached) {
-                    let mut info = api::MediaSourceInfo::from(fresh_stream.clone());
-                    apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
-                    return Ok((info, fresh_stream));
-                }
-            }
-        }
-    }
-
-    let _leader_guard = is_leader.then(|| LeaderGuard {
-        id: stream.id,
-        tx,
-    });
-
     let result = probe_with_fallback(
         stream.clone(),
         url_opt,
