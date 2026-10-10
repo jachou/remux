@@ -116,11 +116,22 @@ pub async fn shows_episodes(
         .build();
 
     if q.start_index.unwrap_or(0) == 0 {
-        if let Some(target) = result.items.iter().find(|i| {
-            i.user_data
-                .as_ref()
-                .map_or(true, |u| !u.played)
-        }).or_else(|| result.items.first()) {
+        let unplayed: Vec<_> = result
+            .items
+            .iter()
+            .filter(|i| {
+                i.user_data
+                    .as_ref()
+                    .map_or(true, |u| !u.played)
+            })
+            .take(2)
+            .collect();
+        let targets = if unplayed.is_empty() {
+            result.items.iter().take(2).collect()
+        } else {
+            unplayed
+        };
+        for target in targets {
             crate::services::stream_service::spawn_preemptive_probe(
                 &state.ctx,
                 target.id,

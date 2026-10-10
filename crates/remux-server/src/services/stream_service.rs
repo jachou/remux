@@ -924,6 +924,8 @@ impl StreamService {
 
 static PREEMPTIVE_PROBES: std::sync::LazyLock<dashmap::DashSet<Uuid>> =
     std::sync::LazyLock::new(dashmap::DashSet::new);
+static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
 
 /// Spawns a background task to pre-emptively probe the primary stream candidate
 /// for the given Movie or Episode item.
@@ -981,6 +983,14 @@ pub fn spawn_preemptive_probe(
             stream_filter: None,
             user_id,
         });
+
+        let _permit = match PREEMPTIVE_SEMAPHORE.try_acquire() {
+            Ok(p) => p,
+            Err(_) => {
+                tracing::debug!(%item_id, "preemptive probe concurrency limit reached (max 2), skipping");
+                return;
+            }
+        };
 
         if let Err(e) = service.load(media).await {
             tracing::warn!(%item_id, error = %e, "preemptive probe service.load failed");
