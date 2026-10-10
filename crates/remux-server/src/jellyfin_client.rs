@@ -261,6 +261,8 @@ mod tests {
             app_name: "Infuse".into(),
             ..Default::default()
         };
-        assert!(merge_device_profile_subtitles(&infuse, None).is_none());
+        let infuse_none = merge_device_profile_subtitles(&infuse, None);
+        assert!(infuse_none.is_some());
+        assert!(!infuse_none.unwrap().subtitle_profiles.is_empty());
     }
 }
