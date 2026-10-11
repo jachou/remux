@@ -150,6 +150,11 @@ pub async fn shows_episodes(
     }))
 }
 
+fn is_unreleased_episode(ep: &db::Media, threshold: chrono::NaiveDateTime) -> bool {
+    let dates = [ep.digital_released_at, ep.released_at];
+    dates.iter().any(|d| d.is_some()) && dates.iter().filter_map(|&d| d).all(|d| d > threshold)
+}
+
 #[get("/shows/nextup")]
 pub async fn shows_nextup(
     State(state): State<AppState>,
@@ -206,6 +211,7 @@ pub async fn shows_nextup(
     )
     .await;
     let release_threshold = server_config.release_date_threshold();
+    let threshold = release_threshold.unwrap_or_else(|| chrono::Utc::now().naive_utc());
 
     // All released episodes for the series in watch order (season asc, episode asc)
     let mut ep_qb =
@@ -276,17 +282,20 @@ pub async fn shows_nextup(
             .rposition(|e| state_for(e).map_or(false, |s| s.play_count > 0));
 
         next_ep = if let Some(pos) = last_played_pos {
-            episodes.get(pos + 1)
+            episodes
+                .get(pos + 1)
+                .filter(|e| !is_unreleased_episode(e, threshold))
         } else if !disable_first {
             // Nothing watched yet — show first regular (Season 1+) episode,
             // skipping Season 0 specials just like Jellyfin server does.
             episodes
                 .iter()
+                .filter(|e| !is_unreleased_episode(e, threshold))
                 .find(|e| {
                     e.parent_idx
                         .map_or(true, |s| s > 0)
                 })
-                .or_else(|| episodes.first())
+                .or_else(|| episodes.iter().find(|e| !is_unreleased_episode(e, threshold)))
         } else {
             None
         };
@@ -357,6 +366,7 @@ pub(crate) async fn next_up_candidates(
     )
     .await;
     let release_threshold = server_config.release_date_threshold();
+    let threshold = release_threshold.unwrap_or_else(|| chrono::Utc::now().naive_utc());
 
     // Inner UNION selects last_played_at/played_at directly from idx_ums_user_play_state
     // (covering) so no second join to user_media_state is needed. UNION ALL is safe
@@ -490,7 +500,9 @@ pub(crate) async fn next_up_candidates(
                 .iter()
                 .rposition(|e| state_for(e).map_or(false, |s| s.play_count > 0));
             if let Some(pos) = last_played_pos {
-                let candidate = episodes.get(pos + 1);
+                let candidate = episodes
+                    .get(pos + 1)
+                    .filter(|e| !is_unreleased_episode(e, threshold));
                 // Mirror Jellyfin: when EnableResumable=false, skip a candidate that
                 // is already in-progress — the user should resume or mark it watched.
                 next_ep = if !enable_resumable {
@@ -517,6 +529,7 @@ pub(crate) async fn next_up_candidates(
     // effective key so fresh episodes surface first), then sort and build
     // candidates from that same precomputed value instead of recomputing it
     // per comparison and again afterward.
+    // Release date is capped at threshold so future dates cannot override activity.
     let epoch = chrono::NaiveDateTime::parse_from_str(
         "1970-01-01 00:00:00",
         "%Y-%m-%d %H:%M:%S",
@@ -528,7 +541,8 @@ pub(crate) async fn next_up_candidates(
             let release = ep
                 .digital_released_at
                 .or(ep.released_at)
-                .unwrap_or(epoch);
+                .unwrap_or(epoch)
+                .min(threshold);
             let activity = ep
                 .grandparent_id
                 .and_then(|gid| {
