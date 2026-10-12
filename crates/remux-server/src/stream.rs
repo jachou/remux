@@ -276,6 +276,9 @@ impl StreamDescriptor {
     /// Returns `false` only for HTTP streams whose ranged GET yields a 4xx/5xx
     /// status or a network/timeout error. Non-HTTP variants (local, torrent,
     /// opendal) return `true` immediately.
+    ///
+    /// Results are cached in-memory in `STREAM_LIVENESS_CACHE` with a 15-minute TTL,
+    /// so pre-probing and repeated checks resolve in sub-microsecond memory lookups.
     pub async fn is_alive(&self) -> bool {
         let Self::Http {
             url,
@@ -285,6 +288,11 @@ impl StreamDescriptor {
         else {
             return true;
         };
+
+        if let Some(alive) = STREAM_LIVENESS_CACHE.get(url) {
+            return alive;
+        }
+
         let mut request = AVAILABILITY_CLIENT.get(url);
         for (key, value) in request_headers {
             request = request.header(key.as_str(), value.as_str());
@@ -296,9 +304,13 @@ impl StreamDescriptor {
             .await
         {
             Ok(r) => {
-                r.status()
+                let is_ok = r.status()
                     .as_u16()
-                    < 400
+                    < 400;
+                if is_ok {
+                    STREAM_LIVENESS_CACHE.insert(url.clone(), true);
+                }
+                is_ok
             }
             Err(_) => false,
         }
@@ -475,6 +487,15 @@ impl StreamInfo {
 pub trait StreamSource: Send + Sync {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response>;
 }
+
+pub(crate) static STREAM_LIVENESS_CACHE: std::sync::LazyLock<
+    moka::sync::Cache<String, bool>,
+> = std::sync::LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(1_000)
+        .time_to_live(std::time::Duration::from_secs(15 * 60))
+        .build()
+});
 
 static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
@@ -859,8 +880,8 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TrackerUrl, is_tracker_url,
-        mime_from_path,
+        HttpSource, STREAM_LIVENESS_CACHE, STREAM_PROXY_CLIENT, StreamDescriptor, TrackerUrl,
+        is_tracker_url, mime_from_path,
     };
     use std::path::Path;
 
@@ -1057,5 +1078,33 @@ mod tests {
         resp.text()
             .await
             .expect("body should drain");
+    }
+
+    #[tokio::test]
+    async fn stream_descriptor_is_alive_caches_success_in_liveness_cache() {
+        let server = httpmock::MockServer::start();
+
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/live.mkv")
+                .header("Range", "bytes=0-0");
+            then.status(206);
+        });
+
+        let test_url = format!("{}/live.mkv", server.base_url());
+        let desc = StreamDescriptor::Http {
+            url: test_url.clone(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+
+        // First call: makes network request to mock server and caches result
+        assert!(desc.is_alive().await);
+        assert_eq!(mock.hits(), 1);
+        assert_eq!(STREAM_LIVENESS_CACHE.get(&test_url), Some(true));
+
+        // Second call: served directly from memory cache, 0 mock hits!
+        assert!(desc.is_alive().await);
+        assert_eq!(mock.hits(), 1);
     }
 }

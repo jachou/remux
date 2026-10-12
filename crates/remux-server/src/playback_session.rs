@@ -44,9 +44,17 @@ pub struct PlaybackSession {
     pub item_kind: Option<db::MediaKind>,
     /// Whether next episode probe has been triggered at the 80% progress milestone.
     pub probed_next_episode_at_80: bool,
+    /// Whether next episode probe has been triggered within the final 5 minutes of playback.
+    pub probed_next_episode_near_end: bool,
     /// Torrent sources selected for this playback. Their leases are released
     /// with the session, after any active HTTP response has finished reading.
     torrents: Vec<Arc<crate::torrent::TorrentLease>>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressMilestones {
+    pub crossed_80: bool,
+    pub near_end: bool,
 }
 
 impl PlaybackSession {
@@ -319,6 +327,7 @@ impl PlaybackSessionManager {
             group_id,
             item_kind,
             probed_next_episode_at_80: false,
+            probed_next_episode_near_end: false,
             torrents: Vec::new(),
         };
 
@@ -411,11 +420,11 @@ impl PlaybackSessionManager {
         user: &db::User,
         psid: &str,
         data: &PlaybackInfo,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<ProgressMilestones> {
         let ps_snapshot = self.get(psid);
         let ps = match ps_snapshot.as_ref() {
             Some(ps) => ps,
-            None => return Ok(false),
+            None => return Ok(ProgressMilestones::default()),
         };
 
         // If the session has no valid item and the progress report can't supply one,
@@ -430,7 +439,7 @@ impl PlaybackSessionManager {
         {
             self.stop(psid)
                 .await;
-            return Ok(false);
+            return Ok(ProgressMilestones::default());
         }
 
         let item_id = if !data
@@ -505,6 +514,7 @@ impl PlaybackSessionManager {
                 if ps.item_id != data.item_id {
                     ps.item_id = data.item_id;
                     ps.probed_next_episode_at_80 = false;
+                    ps.probed_next_episode_near_end = false;
                 }
             }
             ps.position_ticks = data
@@ -555,16 +565,22 @@ impl PlaybackSessionManager {
         let position_ticks = data
             .position_ticks
             .unwrap_or(ps.position_ticks);
-        let mut crossed_80_percent = false;
+        let mut milestones = ProgressMilestones::default();
         if let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await {
             let position_seconds = position_ticks / 10_000_000;
             if media.kind == db::MediaKind::Episode {
                 if let Some(runtime) = media.runtime {
-                    if runtime > 0 && position_seconds >= (runtime * 80) / 100 {
+                    if runtime > 0 {
+                        let crossed_80 = position_seconds >= (runtime * 80) / 100;
+                        let near_end = runtime.saturating_sub(position_seconds) <= 300;
                         self.update(psid, |ps| {
-                            if !ps.probed_next_episode_at_80 {
+                            if crossed_80 && !ps.probed_next_episode_at_80 {
                                 ps.probed_next_episode_at_80 = true;
-                                crossed_80_percent = true;
+                                milestones.crossed_80 = true;
+                            }
+                            if near_end && !ps.probed_next_episode_near_end {
+                                ps.probed_next_episode_near_end = true;
+                                milestones.near_end = true;
                             }
                         });
                     }
@@ -606,7 +622,7 @@ impl PlaybackSessionManager {
             .await?;
         }
 
-        Ok(crossed_80_percent)
+        Ok(milestones)
     }
 
     /// Handle a `POST /sessions/playing/stopped` report.
@@ -1018,6 +1034,7 @@ impl PlaybackSessionManager {
                         group_id: None,
                         item_kind: None,
                         probed_next_episode_at_80: false,
+                        probed_next_episode_near_end: false,
                         torrents: Vec::new(),
                     },
                 );
@@ -1323,6 +1340,7 @@ mod tests {
             item_kind: None,
             torrents: Vec::new(),
             probed_next_episode_at_80: false,
+            probed_next_episode_near_end: false,
         }
     }
 
@@ -1433,5 +1451,16 @@ mod tests {
                 .pending_play_methods
                 .contains_key(id)
         );
+    }
+
+    #[test]
+    fn progress_milestones_initialization_and_flags() {
+        let ps = playback_session("test-ms", PlayMethod::DirectPlay);
+        assert!(!ps.probed_next_episode_at_80);
+        assert!(!ps.probed_next_episode_near_end);
+
+        let ms = ProgressMilestones::default();
+        assert!(!ms.crossed_80);
+        assert!(!ms.near_end);
     }
 }

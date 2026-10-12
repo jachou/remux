@@ -192,7 +192,7 @@ pub async fn report_playback_progress(
                 .map(|s| s.play_session_id)
         });
     if let Some(ref psid) = effective_psid {
-        let crossed_80 = state
+        let milestones = state
             .ctx
             .sessions
             .progress(
@@ -213,7 +213,7 @@ pub async fn report_playback_progress(
             .ctx
             .sessions
             .get(psid);
-        if crossed_80 {
+        if milestones.crossed_80 || milestones.near_end {
             let item_id = if !data.item_id.is_nil() {
                 Some(data.item_id)
             } else {
@@ -223,12 +223,22 @@ pub async fn report_playback_progress(
                     .filter(|id| !id.is_nil())
             };
             if let Some(item_id) = item_id {
-                crate::services::stream_service::spawn_next_episode_probe(
-                    &state.ctx,
-                    item_id,
-                    session.user.id,
-                    "Trigger 3 (on 80% progress)",
-                );
+                if milestones.crossed_80 {
+                    crate::services::stream_service::spawn_next_episode_probe(
+                        &state.ctx,
+                        item_id,
+                        session.user.id,
+                        "Trigger 3 (on 80% progress)",
+                    );
+                }
+                if milestones.near_end {
+                    crate::services::stream_service::spawn_next_episode_probe(
+                        &state.ctx,
+                        item_id,
+                        session.user.id,
+                        "Trigger 4 (within 5m of end)",
+                    );
+                }
             }
         }
         if let Some(current_playback) = playback.as_ref()
