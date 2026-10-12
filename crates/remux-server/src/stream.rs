@@ -277,7 +277,7 @@ impl StreamDescriptor {
     /// status or a network/timeout error. Non-HTTP variants (local, torrent,
     /// opendal) return `true` immediately.
     ///
-    /// Results are cached in-memory in `STREAM_LIVENESS_CACHE` with a 15-minute TTL,
+    /// Results are cached in-memory in `STREAM_LIVENESS_CACHE` with a 1-hour TTL,
     /// so pre-probing and repeated checks resolve in sub-microsecond memory lookups.
     pub async fn is_alive(&self) -> bool {
         let Self::Http {
@@ -493,7 +493,7 @@ pub(crate) static STREAM_LIVENESS_CACHE: std::sync::LazyLock<
 > = std::sync::LazyLock::new(|| {
     moka::sync::Cache::builder()
         .max_capacity(1_000)
-        .time_to_live(std::time::Duration::from_secs(15 * 60))
+        .time_to_live(std::time::Duration::from_secs(60 * 60))
         .build()
 });
 
