@@ -2416,4 +2416,217 @@ pub(crate) mod test {
             1
         );
     }
+
+    #[tokio::test]
+    async fn next_up_filters_unreleased_episodes_and_sorts_by_activity() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::Utc;
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard.0.db;
+        let user_id: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+
+        let cfg = api::ServerConfiguration {
+            filter_by_digital_release_date: true,
+            digital_release_buffer_days: 0,
+            ..Default::default()
+        };
+        db::Settings::set_config(db, &cfg).await.unwrap();
+
+        let now = Utc::now().naive_utc();
+        let past = now - chrono::Duration::days(10);
+        let future = now + chrono::Duration::days(100);
+
+        // Series 1: Tracker
+        let series1_ext = db::ExternalIds {
+            imdb: db::NonEmptyString::try_new("tt_test_tracker_001".to_string()).ok(),
+            ..Default::default()
+        };
+        let series_id = uuid::Uuid::from(&db::MediaIdRaw {
+            kind: db::MediaKind::Series,
+            external_ids: series1_ext.clone(),
+            season: None,
+            episode: None,
+        });
+        let mut series = db::Media {
+            id: series_id,
+            title: "Tracker".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: series1_ext,
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        series.save(db).await.unwrap();
+
+        // Season 1
+        let season_id = uuid::Uuid::new_v4();
+        let mut season = db::Media {
+            id: season_id,
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            grandparent_id: Some(series_id),
+            parent_id: Some(series_id),
+            idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        season.save(db).await.unwrap();
+
+        // Episode 1 (watched recently)
+        let ep1_id = uuid::Uuid::new_v4();
+        let mut ep1 = db::Media {
+            id: ep1_id,
+            title: "Tracker S01E01".to_string(),
+            kind: db::MediaKind::Episode,
+            grandparent_id: Some(series_id),
+            parent_id: Some(season_id),
+            idx: Some(1),
+            parent_idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        ep1.save(db).await.unwrap();
+
+        // Episode 2 (next up, released in past)
+        let ep2_id = uuid::Uuid::new_v4();
+        let mut ep2 = db::Media {
+            id: ep2_id,
+            title: "Tracker S01E02".to_string(),
+            kind: db::MediaKind::Episode,
+            grandparent_id: Some(series_id),
+            parent_id: Some(season_id),
+            idx: Some(2),
+            parent_idx: Some(1),
+            digital_released_at: Some(past + chrono::Duration::days(1)),
+            released_at: Some(past + chrono::Duration::days(1)),
+            ..Default::default()
+        };
+        ep2.save(db).await.unwrap();
+
+        // User watched Ep1
+        let ums = db::UserMediaState {
+            user_id,
+            media_id: ep1_id,
+            play_count: 1,
+            played_at: Some(now - chrono::Duration::hours(2)),
+            last_played_at: Some(now - chrono::Duration::hours(2)),
+            playback_position: 0,
+            ..Default::default()
+        };
+        ums.save(db).await.unwrap();
+
+        // Series 2: Future Show with unreleased episode in future
+        let series2_ext = db::ExternalIds {
+            imdb: db::NonEmptyString::try_new("tt_test_future_002".to_string()).ok(),
+            ..Default::default()
+        };
+        let series2_id = uuid::Uuid::from(&db::MediaIdRaw {
+            kind: db::MediaKind::Series,
+            external_ids: series2_ext.clone(),
+            season: None,
+            episode: None,
+        });
+        let mut series2 = db::Media {
+            id: series2_id,
+            title: "Future Show".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: series2_ext,
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        series2.save(db).await.unwrap();
+
+        let season2_id = uuid::Uuid::new_v4();
+        let mut season2 = db::Media {
+            id: season2_id,
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            grandparent_id: Some(series2_id),
+            parent_id: Some(series2_id),
+            idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        season2.save(db).await.unwrap();
+
+        let ep2_1_id = uuid::Uuid::new_v4();
+        let mut ep2_1 = db::Media {
+            id: ep2_1_id,
+            title: "Future S01E01".to_string(),
+            kind: db::MediaKind::Episode,
+            grandparent_id: Some(series2_id),
+            parent_id: Some(season2_id),
+            idx: Some(1),
+            parent_idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        ep2_1.save(db).await.unwrap();
+
+        // Episode 2_2: Unreleased placeholder with future date
+        let ep2_2_id = uuid::Uuid::new_v4();
+        let mut ep2_2 = db::Media {
+            id: ep2_2_id,
+            title: "Future S01E02".to_string(),
+            kind: db::MediaKind::Episode,
+            grandparent_id: Some(series2_id),
+            parent_id: Some(season2_id),
+            idx: Some(2),
+            parent_idx: Some(1),
+            digital_released_at: Some(future),
+            released_at: Some(future),
+            ..Default::default()
+        };
+        ep2_2.save(db).await.unwrap();
+
+        // User watched Ep2_1
+        let ums2 = db::UserMediaState {
+            user_id,
+            media_id: ep2_1_id,
+            play_count: 1,
+            played_at: Some(now - chrono::Duration::days(1)),
+            last_played_at: Some(now - chrono::Duration::days(1)),
+            playback_position: 0,
+            ..Default::default()
+        };
+        ums2.save(db).await.unwrap();
+
+        // Hit /shows/nextup
+        let resp = server
+            .get("/shows/nextup")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        let body: serde_json::Value = resp.json();
+        let items = body["Items"].as_array().unwrap();
+
+        let ids: Vec<uuid::Uuid> = items
+            .iter()
+            .filter_map(|i| i["Id"].as_str().and_then(|s| uuid::Uuid::parse_str(s).ok()))
+            .collect();
+        assert!(
+            ids.contains(&ep2_id),
+            "Released episode must be in Next Up; items: {:?}",
+            items
+        );
+        assert!(
+            !ids.contains(&ep2_2_id),
+            "Future unreleased episode must NOT be in Next Up; items: {:?}",
+            items
+        );
+    }
 }
