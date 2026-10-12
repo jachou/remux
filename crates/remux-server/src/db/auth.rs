@@ -143,6 +143,19 @@ impl Device {
         .map_err(Into::into)
     }
 
+    pub async fn get_last_active_for_user(
+        db: &SqlitePool,
+        user_id: Uuid,
+    ) -> Result<Option<Self>> {
+        let row = sqlx::query_as::<_, Self>(
+            "SELECT * FROM devices WHERE user_id = ? ORDER BY COALESCE(last_activity_at, created_at) DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?;
+        Ok(row)
+    }
+
     /// Get all devices, optionally filtering to those active since `since`.
     pub async fn get_all(
         db: &SqlitePool,

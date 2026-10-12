@@ -137,12 +137,14 @@ pub async fn shows_episodes(
 }
 
 fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a api::BaseItemDto> {
+    let now = chrono::Utc::now();
     let unplayed_regular: Vec<_> = items
         .iter()
         .filter(|i| {
             let is_unplayed = i.user_data.as_ref().map_or(true, |u| !u.played);
             let is_regular = i.parent_index_number.map_or(true, |s| s > 0);
-            is_unplayed && is_regular
+            let is_released = i.premiere_date.map_or(true, |d| d <= now);
+            is_unplayed && is_regular && is_released
         })
         .take(2)
         .collect();
@@ -150,17 +152,25 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
     if !unplayed_regular.is_empty() {
         unplayed_regular
     } else {
-        // Fall back: if all regular episodes are played, or if the view contains only
-        // specials (e.g. user explicitly opened the Specials season), probe whatever is present.
+        // Fall back: if all unplayed regular episodes are played/none exist,
+        // probe the first released regular episodes (e.g. user rewatching or browsing completed show).
         let regular_items: Vec<_> = items
             .iter()
-            .filter(|i| i.parent_index_number.map_or(true, |s| s > 0))
+            .filter(|i| {
+                let is_regular = i.parent_index_number.map_or(true, |s| s > 0);
+                let is_released = i.premiere_date.map_or(true, |d| d <= now);
+                is_regular && is_released
+            })
             .take(2)
             .collect();
         if !regular_items.is_empty() {
             regular_items
         } else {
-            items.iter().take(2).collect()
+            items
+                .iter()
+                .filter(|i| i.premiere_date.map_or(true, |d| d <= now))
+                .take(2)
+                .collect()
         }
     }
 }

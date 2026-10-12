@@ -158,7 +158,7 @@ pub async fn items_playbackinfo_get(
 
 /// Load remembered audio/subtitle stream selections for a user+item
 /// (best-effort; failure means no recall).
-async fn load_saved_selections(
+pub(crate) async fn load_saved_selections(
     db: &sqlx::SqlitePool,
     user_id: &uuid::Uuid,
     media_id: &uuid::Uuid,

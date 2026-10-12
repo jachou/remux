@@ -1025,7 +1025,68 @@ impl StreamService {
     /// Skips probing if Candidate #1 is already cached with reusable probe data.
     /// Does not probe or rewrite any other candidates.
     pub async fn probe_primary_candidate(&self) -> anyhow::Result<Option<Uuid>> {
-        let sel = self.select_streams();
+        let mut sel = self.select_streams();
+
+        let probe_cfg = db::Settings::get_config_or_default(&self.ctx.db).await;
+        let sort_mode = probe_cfg.sort_media_sources.unwrap_or_default();
+
+        if sort_mode != remux_sdks::remux::SortMediaSourcesMode::Disabled && sel.candidates.len() > 1 {
+            let encoding_cfg = db::Settings::get_encoding_config(&self.ctx.db).await.unwrap_or_default();
+            let subtitle_mode = encoding_cfg.subtitle_mode.unwrap_or_default();
+
+            let (last_device, user) = if let Some(uid) = self.user_id {
+                let dev = db::auth::Device::get_last_active_for_user(&self.ctx.db, uid).await.ok().flatten();
+                let u = db::User::get_by_id(&self.ctx.db, &uid).await.ok().flatten();
+                (dev, u)
+            } else {
+                (None, None)
+            };
+
+            let (device_profile, is_4k) = if let Some(ref device) = last_device {
+                let dp = crate::jellyfin_client::merge_device_profile_subtitles(device, device.parsed_device_profile());
+                let is_4k = device.is_4k_capable == Some(true);
+                (dp, is_4k)
+            } else {
+                (None, true)
+            };
+
+            let user_cfg = user
+                .as_ref()
+                .and_then(|u| u.configuration.as_ref())
+                .map(|c| c.0.clone())
+                .unwrap_or_default();
+
+            let (saved_audio, saved_subtitle) = if let Some(uid) = self.user_id {
+                crate::api::playback::load_saved_selections(&self.ctx.db, &uid, &self.item_id).await
+            } else {
+                (None, None)
+            };
+
+            let ranking_prefs = DefaultStreamPrefs {
+                user_cfg: &user_cfg,
+                server_metadata_language: probe_cfg.preferred_metadata_language.as_deref(),
+                original_language: None,
+                requested_audio: None,
+                requested_subtitle: None,
+                remembered_audio: saved_audio,
+                remembered_subtitle: saved_subtitle,
+            };
+
+            let ranking = Some(crate::device_profile::SourceRankingContext {
+                mode: sort_mode,
+                device_profile: device_profile.as_ref(),
+                is_4k_capable: is_4k,
+                subtitle_mode,
+                explicit_subtitle_index: None,
+                max_bitrate: device_profile.as_ref().and_then(|p| p.max_streaming_bitrate),
+            });
+
+            let (ranked, _) = self
+                .rank_candidates(std::mem::take(&mut sel.candidates), ranking, ranking_prefs)
+                .await;
+            sel.candidates = ranked;
+        }
+
         let primary = sel.candidates.first().cloned();
 
         let Some(stream) = primary else {
@@ -1041,8 +1102,6 @@ impl StreamService {
                 return Ok(Some(stream.id));
             }
         }
-
-        let probe_cfg = db::Settings::get_config_or_default(&self.ctx.db).await;
         let timeout = probe_cfg.probe_timeout_secs.unwrap_or(20) as u64;
         let timeout_p2p = probe_cfg.probe_timeout_p2p_secs.unwrap_or(60) as u64;
         let auto_next = probe_cfg.auto_next_stream_on_probe_fail.unwrap_or(true);
@@ -1120,20 +1179,28 @@ pub fn spawn_preemptive_probe(
             return;
         }
 
-        // Fast path: if streams exist in DB and Candidate #1 already has reusable probe data, skip immediately!
+        // Fast path: if streams exist in DB, streams TTL is not expired, and Candidate #1 already has reusable probe data, skip immediately!
+        let is_stream_cache_fresh = {
+            let ttl_secs = crate::addons::AddonService::stream_cache_ttl_secs(&media);
+            media.streams_refreshed_at.is_some_and(|r| {
+                (chrono::Utc::now().naive_utc() - r).num_seconds() < ttl_secs
+            })
+        };
         let mut check_media = media.clone();
-        if let Ok(streams) = check_media.streams(&ctx.db).await {
-            if !streams.is_empty() {
-                let pool = quality_ordered_probe_pool(&streams);
-                if let Some(top) = pool.first() {
-                    if let Some(pd) = &top.probe_data {
-                        if is_reusable_probe_cache(pd) {
-                            tracing::info!(%item_id, stream_id = %top.id, "Candidate #1 already probed in DB; pre-warming liveness");
-                            if let Some(si) = &top.stream_info {
-                                si.descriptor.is_alive().await;
+        if is_stream_cache_fresh {
+            if let Ok(streams) = check_media.streams(&ctx.db).await {
+                if !streams.is_empty() {
+                    let pool = quality_ordered_probe_pool(&streams);
+                    if let Some(top) = pool.first() {
+                        if let Some(pd) = &top.probe_data {
+                            if is_reusable_probe_cache(pd) {
+                                tracing::info!(%item_id, stream_id = %top.id, "Candidate #1 already probed in DB; pre-warming liveness");
+                                if let Some(si) = &top.stream_info {
+                                    si.descriptor.is_alive().await;
+                                }
+                                prefetch_subtitles_for_media(&ctx, &media, user_id).await;
+                                return;
                             }
-                            prefetch_subtitles_for_media(&ctx, &media, user_id).await;
-                            return;
                         }
                     }
                 }
