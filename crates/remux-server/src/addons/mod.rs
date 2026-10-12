@@ -3500,13 +3500,18 @@ impl AddonService {
             if background {
                 debug!(item = %media.id, "segments cache hit");
             } else {
-                debug!(item = %media.id, "segments cache hit");
+                info!(item = %media.id, "segments cache hit");
             }
             return (*cached).clone();
         }
 
         let _guard = SEGMENT_LOCKS.lock(media.id).await;
         if let Some(cached) = ctx.store.get::<MediaSegments>(&cache_key) {
+            if background {
+                debug!(item = %media.id, "segments cache hit");
+            } else {
+                info!(item = %media.id, "segments cache hit");
+            }
             return (*cached).clone();
         }
 

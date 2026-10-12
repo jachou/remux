@@ -463,16 +463,25 @@ async fn items_playbackinfo_inner(
     let subtitle_media_hint = media_source_id
         .is_none()
         .then(|| media.clone());
-    let (probed, (subtitle_media, external_subtitles)) = tokio::join!(
+    let pbi_start = std::time::Instant::now();
+    let (probed_result, (subtitle_media, external_subtitles, subs_ms)) = tokio::join!(
         async {
+            let t_discovery = std::time::Instant::now();
             service
                 .load(media)
                 .await?;
-            service
+            let discovery_ms = t_discovery.elapsed().as_millis() as u64;
+
+            let t_probe = std::time::Instant::now();
+            let res = service
                 .probe_candidates(ranking, ranking_prefs)
-                .await
+                .await?;
+            let probe_ms = t_probe.elapsed().as_millis() as u64;
+
+            Ok::<_, anyhow::Error>((res, discovery_ms, probe_ms))
         },
         async {
+            let t_subs = std::time::Instant::now();
             // `id` is the top-level Movie/Episode UUID even when the request
             // targets a child source. Fetch subtitle addons while stream addons
             // load and their candidates are probed.
@@ -508,10 +517,11 @@ async fn items_playbackinfo_inner(
             } else {
                 Vec::new()
             };
-            (subtitle_media, external_subtitles)
+            let subs_ms = t_subs.elapsed().as_millis() as u64;
+            (subtitle_media, external_subtitles, subs_ms)
         }
     );
-    let probed = probed?;
+    let (probed, discovery_ms, probe_ms) = probed_result?;
     let item_runtime_seconds = subtitle_media
         .as_ref()
         .and_then(|item| item.runtime);
@@ -523,6 +533,12 @@ async fn items_playbackinfo_inner(
             .is_some_and(|item| item.is_track());
     let has_lyrics = is_track;
     let specific_stream_requested = probed.specific_requested;
+    let was_cached = probed.results.first().map_or(false, |r| {
+        r.stream
+            .probe_data
+            .as_ref()
+            .is_some_and(|pd| pd.video_stream().is_some() && !pd.is_filename_guess())
+    });
     let mut media_sources = Vec::with_capacity(
         probed
             .results
@@ -1063,10 +1079,23 @@ async fn items_playbackinfo_inner(
 
     let info = api::PlaybackInfoResponse {
         media_sources,
-        play_session_id: Some(play_session_id),
+        play_session_id: Some(play_session_id.clone()),
         // error_code,
         ..Default::default()
     };
+
+    let total_ms = pbi_start.elapsed().as_millis() as u64;
+    info!(
+        item_id = %id,
+        play_session_id = %play_session_id,
+        total_ms,
+        discovery_ms,
+        probe_ms,
+        subs_ms,
+        probed_cached = was_cached,
+        sources = info.media_sources.len(),
+        "playbackinfo resolved segments breakdown"
+    );
 
     trace!(?info, "items_playbackinfo_result");
     Ok(Json(info))

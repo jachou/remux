@@ -290,7 +290,7 @@ impl StreamDescriptor {
         };
 
         if let Some(alive) = STREAM_LIVENESS_CACHE.get(url) {
-            tracing::debug!(%url, alive, "liveness check cache hit");
+            tracing::info!(%url, alive, "liveness check cache hit");
             return alive;
         }
 
