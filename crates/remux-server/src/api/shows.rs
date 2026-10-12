@@ -116,21 +116,7 @@ pub async fn shows_episodes(
         .build();
 
     if q.start_index.unwrap_or(0) == 0 {
-        let unplayed: Vec<_> = result
-            .items
-            .iter()
-            .filter(|i| {
-                i.user_data
-                    .as_ref()
-                    .map_or(true, |u| !u.played)
-            })
-            .take(2)
-            .collect();
-        let targets = if unplayed.is_empty() {
-            result.items.iter().take(2).collect()
-        } else {
-            unplayed
-        };
+        let targets = select_preemptive_probe_targets(&result.items);
         for target in targets {
             crate::services::stream_service::spawn_preemptive_probe(
                 &state.ctx,
@@ -148,6 +134,35 @@ pub async fn shows_episodes(
             .unwrap_or(0),
         ..Default::default()
     }))
+}
+
+fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a api::BaseItemDto> {
+    let unplayed_regular: Vec<_> = items
+        .iter()
+        .filter(|i| {
+            let is_unplayed = i.user_data.as_ref().map_or(true, |u| !u.played);
+            let is_regular = i.parent_index_number.map_or(true, |s| s > 0);
+            is_unplayed && is_regular
+        })
+        .take(2)
+        .collect();
+
+    if !unplayed_regular.is_empty() {
+        unplayed_regular
+    } else {
+        // Fall back: if all regular episodes are played, or if the view contains only
+        // specials (e.g. user explicitly opened the Specials season), probe whatever is present.
+        let regular_items: Vec<_> = items
+            .iter()
+            .filter(|i| i.parent_index_number.map_or(true, |s| s > 0))
+            .take(2)
+            .collect();
+        if !regular_items.is_empty() {
+            regular_items
+        } else {
+            items.iter().take(2).collect()
+        }
+    }
 }
 
 fn is_unreleased_episode(ep: &db::Media, threshold: chrono::NaiveDateTime) -> bool {
@@ -2628,5 +2643,122 @@ pub(crate) mod test {
             "Future unreleased episode must NOT be in Next Up; items: {:?}",
             items
         );
+    }
+
+    #[test]
+    fn select_preemptive_probe_targets_prefers_regular_season_over_specials() {
+        let special_ep = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("Special Ep 1".to_string()),
+            parent_index_number: Some(0),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reg_ep1 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 1".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reg_ep2 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 2".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = vec![special_ep, reg_ep1.clone(), reg_ep2.clone()];
+        let targets = super::select_preemptive_probe_targets(&items);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].id, reg_ep1.id);
+        assert_eq!(targets[1].id, reg_ep2.id);
+    }
+
+    #[test]
+    fn select_preemptive_probe_targets_skips_played_regular_episodes() {
+        let special_ep = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("Special Ep 1".to_string()),
+            parent_index_number: Some(0),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reg_ep1 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 1".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reg_ep2 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 2".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reg_ep3 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 3".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = vec![special_ep, reg_ep1, reg_ep2.clone(), reg_ep3.clone()];
+        let targets = super::select_preemptive_probe_targets(&items);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].id, reg_ep2.id);
+        assert_eq!(targets[1].id, reg_ep3.id);
+    }
+
+    #[test]
+    fn select_preemptive_probe_targets_falls_back_when_only_specials_present() {
+        let special_ep1 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("Special Ep 1".to_string()),
+            parent_index_number: Some(0),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let special_ep2 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("Special Ep 2".to_string()),
+            parent_index_number: Some(0),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = vec![special_ep1.clone(), special_ep2.clone()];
+        let targets = super::select_preemptive_probe_targets(&items);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].id, special_ep1.id);
+        assert_eq!(targets[1].id, special_ep2.id);
     }
 }
