@@ -3492,6 +3492,24 @@ impl AddonService {
         ctx: &AppContext,
         background: bool,
     ) -> MediaSegments {
+        const SEGMENTS_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+        static SEGMENT_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
+
+        let cache_key = format!("addon-segments:{}", media.id);
+        if let Some(cached) = ctx.store.get::<MediaSegments>(&cache_key) {
+            if background {
+                debug!(item = %media.id, "segments cache hit");
+            } else {
+                debug!(item = %media.id, "segments cache hit");
+            }
+            return (*cached).clone();
+        }
+
+        let _guard = SEGMENT_LOCKS.lock(media.id).await;
+        if let Some(cached) = ctx.store.get::<MediaSegments>(&cache_key) {
+            return (*cached).clone();
+        }
+
         let addons: Vec<(String, Arc<dyn SegmentAddon>)> = self
             .inner
             .load()
@@ -3551,6 +3569,9 @@ impl AddonService {
         .iter()
         .filter(|s| s.is_some())
         .count();
+
+        ctx.store.save(cache_key, merged.clone(), SEGMENTS_TTL);
+
         if background {
             debug!(segments = found, addons = addon_count, elapsed = ?instant.elapsed(), "segments fetched");
         } else {

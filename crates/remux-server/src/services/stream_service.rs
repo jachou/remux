@@ -1251,10 +1251,14 @@ async fn prefetch_subtitles_for_media(
     user_id: Option<Uuid>,
 ) {
     let mut item_media = media.clone();
-    let subs = ctx
-        .addons
-        .fetch_subtitles(&mut item_media, ctx, true, user_id)
-        .await;
+    let mut seg_media = media.clone();
+    let (subs, _) = tokio::join!(
+        ctx.addons.fetch_subtitles(&mut item_media, ctx, true, user_id),
+        async {
+            let _ = seg_media.grandparent(&ctx.db).await;
+            ctx.addons.fetch_segments(&seg_media, ctx, true).await
+        }
+    );
     let cfg = db::Settings::get_config_or_default(&ctx.db).await;
     let sub_langs = cfg
         .subtitle_languages

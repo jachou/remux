@@ -290,9 +290,11 @@ impl StreamDescriptor {
         };
 
         if let Some(alive) = STREAM_LIVENESS_CACHE.get(url) {
+            tracing::debug!(%url, alive, "liveness check cache hit");
             return alive;
         }
 
+        let start = std::time::Instant::now();
         let mut request = AVAILABILITY_CLIENT.get(url);
         for (key, value) in request_headers {
             request = request.header(key.as_str(), value.as_str());
@@ -304,15 +306,22 @@ impl StreamDescriptor {
             .await
         {
             Ok(r) => {
-                let is_ok = r.status()
-                    .as_u16()
-                    < 400;
+                let status = r.status();
+                let is_ok = status.as_u16() < 400;
+                let elapsed = start.elapsed();
                 if is_ok {
+                    tracing::info!(%url, ?status, ?elapsed, "liveness check passed, cached");
                     STREAM_LIVENESS_CACHE.insert(url.clone(), true);
+                } else {
+                    tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
                 }
                 is_ok
             }
-            Err(_) => false,
+            Err(e) => {
+                let elapsed = start.elapsed();
+                tracing::warn!(%url, error = %e, ?elapsed, "liveness check request error");
+                false
+            }
         }
     }
 
