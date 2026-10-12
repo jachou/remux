@@ -176,25 +176,82 @@ fn ranked_external_subtitles<'a>(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum SubtitleKind {
+    Standard,
+    HearingImpaired,
+    Forced,
+}
+
+impl SubtitleKind {
+    fn from_sub(sub: &SubtitleInfo) -> Self {
+        if sub.is_forced {
+            Self::Forced
+        } else if sub.is_hi {
+            Self::HearingImpaired
+        } else {
+            Self::Standard
+        }
+    }
+}
+
 /// Returns the top `max_per_language` release-aware subtitle choices for each
 /// language (in rank order). Pass `1` for the pre-existing "one stable choice
-/// per language" behavior.
+/// per language" behavior. When `max_per_language > 1`, preserves variety across
+/// subtitle kinds (Standard, SDH/Hearing-Impaired, and Forced) so duplicates of
+/// standard subtitles do not crowd out SDH or Forced tracks, while still keeping
+/// a standard fallback when available.
 pub(crate) fn select_external_subtitles<'a>(
     subs: &'a [SubtitleInfo],
     preferred_languages: &[String],
     source_filename: Option<&str>,
     max_per_language: usize,
 ) -> Vec<&'a SubtitleInfo> {
-    let mut counts: std::collections::HashMap<String, usize> =
+    if max_per_language <= 1 {
+        let mut counts: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        return ranked_external_subtitles(subs, preferred_languages, source_filename)
+            .into_iter()
+            .filter(|sub| {
+                let count = counts
+                    .entry(language(sub))
+                    .or_insert(0);
+                if *count < max_per_language {
+                    *count += 1;
+                    true
+                } else {
+                    false
+                }
+            })
+            .collect();
+    }
+
+    let max_standard = 2.min(max_per_language.saturating_sub(1)).max(1);
+    let mut total_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
+    let mut kind_counts: std::collections::HashMap<(String, SubtitleKind), usize> =
+        std::collections::HashMap::new();
+
     ranked_external_subtitles(subs, preferred_languages, source_filename)
         .into_iter()
         .filter(|sub| {
-            let count = counts
-                .entry(language(sub))
-                .or_insert(0);
-            if *count < max_per_language {
-                *count += 1;
+            let lang = language(sub);
+            let total = total_counts.entry(lang.clone()).or_insert(0);
+            if *total >= max_per_language {
+                return false;
+            }
+
+            let kind = SubtitleKind::from_sub(sub);
+            let kind_count = kind_counts.entry((lang, kind)).or_insert(0);
+            let limit_for_kind = match kind {
+                SubtitleKind::Standard => max_standard,
+                SubtitleKind::HearingImpaired => 1,
+                SubtitleKind::Forced => 1,
+            };
+
+            if *kind_count < limit_for_kind {
+                *total += 1;
+                *kind_count += 1;
                 true
             } else {
                 false
@@ -343,4 +400,41 @@ mod tests {
         assert_eq!(sub.from_trusted, Some(true));
         assert_eq!(sub.ai_translated, Some(false));
     }
+
+    #[test]
+    fn select_external_subtitles_preserves_standard_fallback_and_sdh_and_forced() {
+        let std1 = sub("std1", "Movie.2026.1080p.WEB-DL.srt", "eng");
+        let mut std2 = sub("std2", "Movie.2026.WEBRip.srt", "eng");
+        std2.from_trusted = Some(true);
+        let std3 = sub("std3", "Movie.2026.TELESYNC.srt", "eng");
+
+        let mut sdh = sub("sdh", "Movie.2026.1080p.WEB-DL (SDH).srt", "eng");
+        sdh.is_hi = true;
+
+        let mut forced = sub("forced", "Movie.2026.1080p.WEB-DL.en.forced.srt", "eng");
+        forced.is_forced = true;
+
+        // With a language cap of 4, ensure we get:
+        // 1. Primary standard (std1)
+        // 2. Fallback standard (std2)
+        // 3. SDH (sdh)
+        // 4. Forced (forced)
+        // std3 must be skipped so that sdh and forced are not crowded out.
+        let subs = [std1, std2, std3, sdh, forced];
+        let selected = select_external_subtitles(
+            &subs,
+            &["en".into()],
+            Some("Movie.2026.1080p.WEB-DL.mkv"),
+            4,
+        );
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["std1", "std2", "sdh", "forced"]
+        );
+    }
 }
+
