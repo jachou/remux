@@ -2119,4 +2119,57 @@ mod tests {
             Some(alive.id)
         );
     }
+
+    #[tokio::test]
+    async fn probe_primary_candidate_skips_when_reusable_cache_exists() {
+        use crate::integration_test::{authenticated_server, insert_test_source, seed_movie};
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let owner = seed_movie(ctx).await;
+
+        let mut stream = insert_test_source(ctx).await;
+        let mut source_info = api::MediaSourceInfo::from(stream.clone());
+        source_info.media_streams = vec![api::MediaStream {
+            type_: Some(remux_sdks::remux::MediaStreamType::Video),
+            codec: Some("h264".into()),
+            width: Some(1920),
+            height: Some(1080),
+            ..Default::default()
+        }];
+        stream.probe_data = Some(source_info);
+
+        let mut service = StreamService::new(StreamServiceConfig {
+            ctx: ctx.clone(),
+            item_id: owner.id,
+            requested_id: None,
+            show_ungrouped: false,
+            stream_filter: None,
+            user_id: None,
+        });
+        service.streams = vec![stream.clone()];
+
+        let probed_id = service.probe_primary_candidate().await.unwrap();
+        assert_eq!(
+            probed_id,
+            Some(stream.id),
+            "Must return stream ID when reusable probe data exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_preemptive_probe_deduplicates_concurrent_spawns() {
+        use crate::integration_test::{authenticated_server, seed_movie};
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let owner = seed_movie(ctx).await;
+
+        assert!(super::PREEMPTIVE_PROBES.insert(owner.id));
+
+        super::spawn_preemptive_probe(ctx, owner.id, None);
+
+        super::PREEMPTIVE_PROBES.remove(&owner.id);
+        assert!(!super::PREEMPTIVE_PROBES.contains(&owner.id));
+    }
 }
