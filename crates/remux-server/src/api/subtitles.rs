@@ -634,18 +634,86 @@ pub async fn subtitles_stream_tickless(
     .await
 }
 
-/// Fetch the raw bytes of an external subtitle URL through our stream proxy.
-/// A refused/corrupt upstream response (flaky subtitle CDN) is treated as
-/// "subtitle unavailable", not a server error: the caller logs it and answers
-/// 404 to the client instead of aborting the request with a 500.
-async fn fetch_external_subtitle_bytes(
-    state: &AppState,
+/// Deterministic cache key for an external subtitle track, keyed on the
+/// upstream descriptor content (URL/path/etc) via UUIDv5.
+/// This ensures the subtitle cache is completely decoupled from ephemeral video
+/// stream URLs and persists across stream switches, replays, and container restarts.
+pub(crate) fn external_subtitle_cache_key(
+    descriptor: &crate::stream::StreamDescriptor,
+) -> String {
+    let raw = match descriptor {
+        crate::stream::StreamDescriptor::Http { url, .. } => url.clone(),
+        crate::stream::StreamDescriptor::Local(path) => path.to_string_lossy().into_owned(),
+        crate::stream::StreamDescriptor::Rtsp { url } => url.clone(),
+        crate::stream::StreamDescriptor::Opendal { addon_id, path } => {
+            format!("{addon_id}:{path}")
+        }
+        other => serde_json::to_string(other).unwrap_or_default(),
+    };
+    uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_URL, raw.as_bytes()).to_string()
+}
+
+pub(crate) fn external_subtitle_cache_path(
+    data_dir: &std::path::Path,
+    cache_key: &str,
+) -> std::path::PathBuf {
+    data_dir
+        .join("subtitle-cache")
+        .join(format!("ext_{cache_key}.bin"))
+}
+
+pub(crate) static EXTERNAL_SUBTITLE_MEM_CACHE: std::sync::LazyLock<
+    moka::sync::Cache<String, axum::body::Bytes>,
+> = std::sync::LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(1000)
+        .time_to_idle(std::time::Duration::from_secs(24 * 60 * 60))
+        .build()
+});
+
+type ExternalSubtitleOutcome = std::result::Result<axum::body::Bytes, String>;
+
+static EXTERNAL_SUBTITLE_INFLIGHT: std::sync::LazyLock<
+    dashmap::DashMap<
+        String,
+        tokio::sync::watch::Receiver<Option<ExternalSubtitleOutcome>>,
+    >,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+/// Raw fetch of external subtitle bytes through proxy / addon / local filesystem.
+async fn raw_fetch_external_subtitle_bytes(
+    ctx: &crate::AppContext,
     descriptor: &crate::stream::StreamDescriptor,
 ) -> anyhow::Result<axum::body::Bytes> {
-    let resp = match descriptor {
+    match descriptor {
+        crate::stream::StreamDescriptor::Http {
+            url,
+            request_headers,
+            ..
+        } => {
+            let mut req = crate::stream::STREAM_PROXY_CLIENT.get(url);
+            for (k, v) in request_headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| anyhow!("upstream HTTP request failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("upstream subtitle status {}", resp.status()));
+            }
+            resp.bytes()
+                .await
+                .map_err(|e| anyhow!("read subtitle bytes: {e}"))
+        }
+        crate::stream::StreamDescriptor::Local(path) => {
+            tokio::fs::read(path)
+                .await
+                .map(Into::into)
+                .map_err(|e| anyhow!("read local subtitle file: {e}"))
+        }
         crate::stream::StreamDescriptor::Opendal { addon_id, .. } => {
-            let addon = state
-                .ctx
+            let addon = ctx
                 .addons
                 .get(*addon_id)
                 .ok_or_else(|| anyhow!("addon not found for subtitle"))?;
@@ -653,27 +721,136 @@ async fn fetch_external_subtitle_bytes(
                 .stream
                 .as_ref()
                 .ok_or_else(|| anyhow!("addon has no stream capability"))?;
-            stream_cap
+            let resp = stream_cap
                 .serve_stream(descriptor, &axum::http::HeaderMap::new())
                 .await
-                .map_err(|e| anyhow!("upstream serve failed: {e:?}"))?
+                .map_err(|e| anyhow!("upstream serve failed: {e:?}"))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("upstream subtitle status {}", resp.status()));
+            }
+            axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .map_err(|e| anyhow!("read subtitle bytes: {e}"))
         }
-        _ => descriptor
-            .clone()
-            .into_source()
-            .serve(state, &axum::http::HeaderMap::new())
-            .await
-            .map_err(|e| anyhow!("upstream serve failed: {e:?}"))?,
-    };
-    if !resp
-        .status()
-        .is_success()
-    {
-        return Err(anyhow!("upstream subtitle status {}", resp.status()));
+        other => Err(anyhow!(
+            "unsupported external subtitle descriptor: {other:?}"
+        )),
     }
-    axum::body::to_bytes(resp.into_body(), usize::MAX)
-        .await
-        .map_err(|e| anyhow!("read subtitle bytes: {e}"))
+}
+
+/// Fetch the raw bytes of an external subtitle URL through our stream proxy,
+/// checking in-memory cache, on-disk cache, and coalescing concurrent fetches via single-flight.
+pub(crate) async fn fetch_external_subtitle_bytes(
+    ctx: &crate::AppContext,
+    descriptor: &crate::stream::StreamDescriptor,
+) -> anyhow::Result<axum::body::Bytes> {
+    let cache_key = external_subtitle_cache_key(descriptor);
+
+    // 1. Fast-path: In-memory cache hit (microsecond read)
+    if let Some(bytes) = EXTERNAL_SUBTITLE_MEM_CACHE.get(&cache_key) {
+        return Ok(bytes);
+    }
+
+    // 2. Persistent on-disk cache hit
+    let disk_path = external_subtitle_cache_path(&ctx.config.data_dir, &cache_key);
+    if let Ok(bytes) = tokio::fs::read(&disk_path).await {
+        let bytes = axum::body::Bytes::from(bytes);
+        EXTERNAL_SUBTITLE_MEM_CACHE.insert(cache_key, bytes.clone());
+        return Ok(bytes);
+    }
+
+    // 3. Cache miss: Single-flight upstream fetch
+    let mut rx = match EXTERNAL_SUBTITLE_INFLIGHT.entry(cache_key.clone()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => entry.get().clone(),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            let (tx, rx) = tokio::sync::watch::channel(None);
+            entry.insert(rx.clone());
+
+            let ctx = ctx.clone();
+            let descriptor = descriptor.clone();
+            let cache_key_clone = cache_key.clone();
+
+            tokio::spawn(async move {
+                let outcome = match raw_fetch_external_subtitle_bytes(&ctx, &descriptor).await {
+                    Ok(bytes) => {
+                        let cache_dir = ctx.config.data_dir.join("subtitle-cache");
+                        if let Err(e) = tokio::fs::create_dir_all(&cache_dir).await {
+                            warn!(%e, "failed to create subtitle cache dir");
+                        } else {
+                            let final_path = external_subtitle_cache_path(
+                                &ctx.config.data_dir,
+                                &cache_key_clone,
+                            );
+                            let tmp_path = cache_dir.join(format!(
+                                "ext_{cache_key_clone}.tmp.{}",
+                                uuid::Uuid::new_v4()
+                            ));
+                            if let Err(e) = tokio::fs::write(&tmp_path, &bytes).await {
+                                warn!(%e, "failed to write tmp subtitle cache file");
+                            } else if let Err(e) =
+                                tokio::fs::rename(&tmp_path, &final_path).await
+                            {
+                                warn!(%e, "failed to rename tmp subtitle cache file");
+                                let _ = tokio::fs::remove_file(&tmp_path).await;
+                            }
+                        }
+                        EXTERNAL_SUBTITLE_MEM_CACHE
+                            .insert(cache_key_clone.clone(), bytes.clone());
+                        Ok(bytes)
+                    }
+                    Err(e) => Err(e.to_string()),
+                };
+
+                let _ = tx.send(Some(outcome));
+                EXTERNAL_SUBTITLE_INFLIGHT.remove(&cache_key_clone);
+            });
+
+            rx
+        }
+    };
+
+    match rx.wait_for(|val| val.is_some()).await {
+        Ok(val_ref) => {
+            let outcome = val_ref
+                .as_ref()
+                .unwrap()
+                .clone();
+            outcome.map_err(|e| anyhow!("{e}"))
+        }
+        Err(_) => Err(anyhow!("subtitle fetch aborted")),
+    }
+}
+
+/// Spawns background task(s) to prefetch external subtitles to memory and disk cache.
+pub(crate) fn prefetch_external_subtitles(
+    ctx: crate::AppContext,
+    descriptors: Vec<crate::stream::StreamDescriptor>,
+) {
+    if descriptors.is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        let mut seen = std::collections::HashSet::new();
+        for descriptor in descriptors {
+            let key = external_subtitle_cache_key(&descriptor);
+            if !seen.insert(key.clone()) {
+                continue;
+            }
+            if EXTERNAL_SUBTITLE_MEM_CACHE.contains_key(&key) {
+                continue;
+            }
+            let disk_path = external_subtitle_cache_path(&ctx.config.data_dir, &key);
+            if tokio::fs::try_exists(&disk_path)
+                .await
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Err(e) = fetch_external_subtitle_bytes(&ctx, &descriptor).await {
+                debug!(%e, "prefetch external subtitle failed");
+            }
+        }
+    });
 }
 
 fn external_subtitle_response(
@@ -703,8 +880,8 @@ fn external_subtitle_response(
 
 #[derive(Clone)]
 pub(crate) struct SidecarSubtitleRoute {
-    index: i64,
-    subtitle: crate::addons::SubtitleInfo,
+    pub(crate) index: i64,
+    pub(crate) subtitle: crate::addons::SubtitleInfo,
 }
 
 fn sidecar_subtitle_routes_key(
@@ -801,7 +978,7 @@ async fn sidecar_subtitle_response(
         .as_ref()?;
 
     Some(
-        match fetch_external_subtitle_bytes(state, descriptor).await {
+        match fetch_external_subtitle_bytes(&state.ctx, descriptor).await {
             Ok(bytes) => {
                 external_subtitle_response(bytes, &format.to_ascii_lowercase())
             }
@@ -1040,7 +1217,7 @@ async fn subtitles_stream_inner(
                 if let Some(sub) = scored.get(i as usize) {
                     if let Some(ref descriptor) = sub.url {
                         let output_format = format.to_ascii_lowercase();
-                        match fetch_external_subtitle_bytes(&state, descriptor).await {
+                        match fetch_external_subtitle_bytes(&state.ctx, descriptor).await {
                             Ok(bytes) => {
                                 return Ok(external_subtitle_response(
                                     bytes,
@@ -1361,9 +1538,11 @@ pub(crate) fn append_external_subtitles(
     item_id: Uuid,
     api_key: &str,
     dedup: SubtitleDedupSettings,
-) {
+) -> Vec<Vec<crate::stream::StreamDescriptor>> {
+    let mut selected_descriptors = Vec::with_capacity(media_sources.len());
     for source in media_sources.iter_mut() {
         if !has_real_probe_data(source) {
+            selected_descriptors.push(Vec::new());
             continue;
         }
         let next_idx = source
@@ -1385,10 +1564,14 @@ pub(crate) fn append_external_subtitles(
             && source
                 .default_subtitle_stream_index
                 .is_none();
+        let mut source_descs = Vec::with_capacity(scored.len());
         for (i, sub) in scored
             .into_iter()
             .enumerate()
         {
+            if let Some(desc) = &sub.url {
+                source_descs.push(desc.clone());
+            }
             let mut stream = crate::conversions::subtitle_to_media_stream(sub);
             let idx = next_idx + i as i64;
             stream.index = idx;
@@ -1404,7 +1587,9 @@ pub(crate) fn append_external_subtitles(
                 .media_streams
                 .push(stream);
         }
+        selected_descriptors.push(source_descs);
     }
+    selected_descriptors
 }
 
 fn has_real_probe_data(source: &api::MediaSourceInfo) -> bool {
@@ -2641,5 +2826,152 @@ mod tests {
             !args.contains(&"-reconnect".to_string()),
             "a local path should not get http reconnect args: {args:?}"
         );
+    }
+
+    #[test]
+    fn external_subtitle_cache_key_is_deterministic_and_variant_aware() {
+        let http1 = crate::stream::StreamDescriptor::Http {
+            url: "https://example.com/subtitles/english.srt".to_string(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let http2 = crate::stream::StreamDescriptor::Http {
+            url: "https://example.com/subtitles/english.srt".to_string(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let http_diff = crate::stream::StreamDescriptor::Http {
+            url: "https://example.com/subtitles/spanish.srt".to_string(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let local = crate::stream::StreamDescriptor::Local(
+            std::path::PathBuf::from("/subtitles/local.srt"),
+        );
+        let opendal = crate::stream::StreamDescriptor::Opendal {
+            addon_id: Uuid::nil(),
+            path: "sub.srt".to_string(),
+        };
+
+        let key1 = external_subtitle_cache_key(&http1);
+        let key2 = external_subtitle_cache_key(&http2);
+        let key_diff = external_subtitle_cache_key(&http_diff);
+        let key_local = external_subtitle_cache_key(&local);
+        let key_opendal = external_subtitle_cache_key(&opendal);
+
+        assert_eq!(key1, key2, "Identical URLs must yield the identical cache key");
+        assert_ne!(key1, key_diff, "Different URLs must yield different cache keys");
+        assert_ne!(key1, key_local, "Local path must yield different key than HTTP");
+        assert_ne!(key1, key_opendal, "Opendal descriptor must yield different key than HTTP");
+
+        // Verify key format is a valid UUID
+        assert!(Uuid::parse_str(&key1).is_ok());
+        assert!(Uuid::parse_str(&key_local).is_ok());
+        assert!(Uuid::parse_str(&key_opendal).is_ok());
+    }
+
+    #[tokio::test]
+    async fn external_subtitle_disk_cache_loads_and_populates_memory_cache() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+
+        let descriptor = crate::stream::StreamDescriptor::Http {
+            url: "https://mock-cdn.invalid/test-sub.srt".to_string(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let key = external_subtitle_cache_key(&descriptor);
+        let disk_path = external_subtitle_cache_path(&ctx.config.data_dir, &key);
+
+        // Prepare cache dir and write mock subtitle file to disk
+        tokio::fs::create_dir_all(disk_path.parent().unwrap())
+            .await
+            .unwrap();
+        let expected_bytes = b"1\n00:00:01,000 --> 00:00:04,000\nHello from disk cache!\n";
+        tokio::fs::write(&disk_path, expected_bytes).await.unwrap();
+
+        // Ensure memory cache is cleared for this key before test
+        EXTERNAL_SUBTITLE_MEM_CACHE.remove(&key);
+
+        // 1. Fetch should hit on-disk cache
+        let bytes = fetch_external_subtitle_bytes(ctx, &descriptor)
+            .await
+            .expect("fetch should succeed from disk cache");
+        assert_eq!(bytes.as_ref(), expected_bytes);
+
+        // 2. Memory cache should now be populated
+        let mem_hit = EXTERNAL_SUBTITLE_MEM_CACHE.get(&key);
+        assert!(mem_hit.is_some(), "Memory cache must be populated after disk read");
+        assert_eq!(mem_hit.unwrap().as_ref(), expected_bytes);
+
+        // 3. Remove disk file — subsequent fetch must still succeed via memory cache
+        tokio::fs::remove_file(&disk_path).await.unwrap();
+        let bytes_mem = fetch_external_subtitle_bytes(ctx, &descriptor)
+            .await
+            .expect("fetch should succeed from memory cache even after disk file removed");
+        assert_eq!(bytes_mem.as_ref(), expected_bytes);
+    }
+
+    #[tokio::test]
+    async fn external_subtitle_fetch_local_file_caches_to_disk_and_memory() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+
+        // Create a temporary local subtitle file
+        let tmp_file = ctx.config.data_dir.join("source_sub.srt");
+        let content = b"1\n00:00:01,000 --> 00:00:02,000\nLocal test subtitle\n";
+        tokio::fs::write(&tmp_file, content).await.unwrap();
+
+        let descriptor = crate::stream::StreamDescriptor::Local(tmp_file);
+        let key = external_subtitle_cache_key(&descriptor);
+
+        // Ensure not in memory cache
+        EXTERNAL_SUBTITLE_MEM_CACHE.remove(&key);
+
+        let bytes = fetch_external_subtitle_bytes(ctx, &descriptor)
+            .await
+            .expect("local fetch should succeed");
+        assert_eq!(bytes.as_ref(), content);
+
+        // Verify written to disk cache
+        let disk_path = external_subtitle_cache_path(&ctx.config.data_dir, &key);
+        assert!(disk_path.exists(), "Cache file must exist on disk");
+        let disk_bytes = tokio::fs::read(&disk_path).await.unwrap();
+        assert_eq!(disk_bytes, content);
+
+        // Verify written to memory cache
+        assert_eq!(
+            EXTERNAL_SUBTITLE_MEM_CACHE.get(&key).unwrap().as_ref(),
+            content
+        );
+    }
+
+    #[tokio::test]
+    async fn external_subtitle_single_flight_coalesces_concurrent_fetches() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+
+        let tmp_file = ctx.config.data_dir.join("single_flight_sub.srt");
+        let content = b"1\n00:00:00,500 --> 00:00:02,500\nConcurrent subtitle test\n";
+        tokio::fs::write(&tmp_file, content).await.unwrap();
+
+        let descriptor = crate::stream::StreamDescriptor::Local(tmp_file);
+        let key = external_subtitle_cache_key(&descriptor);
+        EXTERNAL_SUBTITLE_MEM_CACHE.remove(&key);
+
+        // Spawn 10 concurrent fetches for the same descriptor
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let c = ctx.clone();
+            let d = descriptor.clone();
+            handles.push(tokio::spawn(async move {
+                fetch_external_subtitle_bytes(&c, &d).await
+            }));
+        }
+
+        for handle in handles {
+            let res = handle.await.unwrap().expect("concurrent fetch should succeed");
+            assert_eq!(res.as_ref(), content);
+        }
     }
 }

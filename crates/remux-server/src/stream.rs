@@ -485,7 +485,7 @@ static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .expect("failed to build availability client")
     });
 
-static STREAM_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
+pub(crate) static STREAM_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
             .user_agent("remux-server/1.0")

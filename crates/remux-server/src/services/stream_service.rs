@@ -1126,6 +1126,7 @@ pub fn spawn_preemptive_probe(
                     if let Some(pd) = &top.probe_data {
                         if is_reusable_probe_cache(pd) {
                             tracing::info!(%item_id, stream_id = %top.id, "Candidate #1 already probed in DB; skipping preemptive probe");
+                            prefetch_subtitles_for_media(&ctx, &media, user_id).await;
                             return;
                         }
                     }
@@ -1152,13 +1153,14 @@ pub fn spawn_preemptive_probe(
             }
         };
 
-        if let Err(e) = service.load(media).await {
+        if let Err(e) = service.load(media.clone()).await {
             tracing::warn!(%item_id, error = %e, "preemptive probe service.load failed");
             return;
         }
         match service.probe_primary_candidate().await {
             Ok(Some(stream_id)) => {
                 tracing::info!(%item_id, %stream_id, "preemptive probe finished successfully");
+                prefetch_subtitles_for_media(&ctx, &media, user_id).await;
             }
             Ok(None) => {
                 tracing::debug!(%item_id, "preemptive probe found no candidate streams");
@@ -1168,6 +1170,56 @@ pub fn spawn_preemptive_probe(
             }
         }
     });
+}
+
+async fn prefetch_subtitles_for_media(
+    ctx: &crate::AppContext,
+    media: &db::Media,
+    user_id: Option<Uuid>,
+) {
+    let mut item_media = media.clone();
+    let subs = ctx
+        .addons
+        .fetch_subtitles(&mut item_media, ctx, true, user_id)
+        .await;
+    let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+    let sub_langs = cfg
+        .subtitle_languages
+        .clone()
+        .unwrap_or_default();
+    let mut descriptors: Vec<crate::stream::StreamDescriptor> = subs
+        .into_iter()
+        .filter(|s| {
+            sub_langs.is_empty()
+                || s.lang
+                    .as_deref()
+                    .is_some_and(|l| sub_langs.iter().any(|lang| l.eq_ignore_ascii_case(lang)))
+        })
+        .filter_map(|s| s.url)
+        .collect();
+
+    if let Ok(streams) = item_media.streams(&ctx.db).await {
+        for stream in streams {
+            if let Some(si) = stream.stream_info.as_ref() {
+                for s in &si.subtitles {
+                    let info = crate::conversions::stremio_subtitle_to_subtitle_info(s);
+                    if (sub_langs.is_empty()
+                        || info
+                            .lang
+                            .as_deref()
+                            .is_some_and(|l| {
+                                sub_langs.iter().any(|lang| l.eq_ignore_ascii_case(lang))
+                            }))
+                        && let Some(url) = info.url
+                    {
+                        descriptors.push(url);
+                    }
+                }
+            }
+        }
+    }
+
+    crate::api::subtitles::prefetch_external_subtitles(ctx.clone(), descriptors);
 }
 
 /// Looks up the next episode in the series (e.g. S01E02 after S01E01, or S02E01 after S01 finale),

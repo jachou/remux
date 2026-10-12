@@ -836,7 +836,7 @@ async fn items_playbackinfo_inner(
 
     // Probe and subtitle lookup ran concurrently. Append only after the real
     // stream indexes are known.
-    append_external_subtitles(
+    let external_descriptors = append_external_subtitles(
         &mut media_sources,
         &external_subtitles,
         &probe_cfg
@@ -911,6 +911,22 @@ async fn items_playbackinfo_inner(
             &prefetch.delivery_format,
         );
     }
+
+    let mut external_to_prefetch = Vec::new();
+    if let Some(extras) = source_extras.get(selected_idx) {
+        for route in &extras.subtitle_routes.1 {
+            if let Some(desc) = &route.subtitle.url {
+                external_to_prefetch.push(desc.clone());
+            }
+        }
+    }
+    if let Some(descs) = external_descriptors.get(selected_idx) {
+        external_to_prefetch.extend(descs.iter().cloned());
+    }
+    crate::api::subtitles::prefetch_external_subtitles(
+        state.ctx.clone(),
+        external_to_prefetch,
+    );
 
     // Cache the group-resolved stream UUID so the stream endpoint can find it
     // without re-running filter_sources (which could pick a different candidate).
