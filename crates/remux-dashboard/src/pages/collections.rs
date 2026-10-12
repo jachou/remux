@@ -4,10 +4,53 @@ use remux_sdks::remux::{
     BaseItemDto, CollectionFilter, CollectionImageConfig, CollectionOverlay,
     CollectionPosterLayout, CollectionType, CreateVirtualFolder,
     CreateVirtualFolderPayload, DeleteVirtualFolder, FilterGroup, FilterMatchMode,
-    GetItems, GetItemsQuery, GetWatchProviders, HexColor, ItemSortBy, MediaType,
-    PatchItem, PatchItemPayload, SortOrder, WatchProviderItem,
+    FilterRule, GetItems, GetItemsQuery, GetWatchProviders, HexColor, ItemSortBy,
+    MediaType, PatchItem, PatchItemPayload, SortOrder, WatchProviderItem,
 };
-use std::collections::HashMap;
+
+/// Whether a smart collection's saved filter fits the flat "Collection Filters"
+/// list without changing what it matches: at most one non-empty group, and that
+/// group is all-AND (or has a single rule). Anything else keeps the grouped editor.
+fn is_flat_collection_filter(filter: Option<&CollectionFilter>) -> bool {
+    let Some(filter) = filter else { return true };
+    let mut non_empty = filter
+        .groups
+        .iter()
+        .filter(|g| {
+            !g.rules
+                .is_empty()
+        });
+    match (non_empty.next(), non_empty.next()) {
+        (None, _) => true,
+        (Some(group), None) => {
+            group.match_mode == FilterMatchMode::All
+                || group
+                    .rules
+                    .len()
+                    <= 1
+        }
+        _ => false,
+    }
+}
+
+/// The smart filter to save or preview. A flat collection list becomes one
+/// all-AND group; otherwise the grouped editor's state is used as is.
+fn smart_collection_filter(
+    flat: Option<Vec<FilterRule>>,
+    match_mode: FilterMatchMode,
+    groups: Vec<FilterGroup>,
+) -> CollectionFilter {
+    match flat {
+        Some(rules) => CollectionFilter {
+            match_mode: FilterMatchMode::All,
+            groups: vec![FilterGroup {
+                match_mode: FilterMatchMode::All,
+                rules,
+            }],
+        },
+        None => CollectionFilter { match_mode, groups },
+    }
+}
 
 fn is_group_container(item: &BaseItemDto) -> bool {
     item.collection_type
@@ -134,7 +177,6 @@ impl PartialEq for FormMode {
 #[component]
 pub fn CollectionsPage(app_state: AppState) -> Element {
     let mut collections: Signal<Vec<BaseItemDto>> = use_signal(Vec::new);
-    let mut collection_order: Signal<Vec<String>> = use_signal(Vec::new);
     let mut loading = use_signal(|| true);
     let mut error = use_signal(|| Option::<String>::None);
     let mut refresh = use_signal(|| 0_u32);
@@ -157,16 +199,6 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
                 .await
             {
                 Ok(result) => {
-                    collection_order.set(
-                        result
-                            .items
-                            .iter()
-                            .map(|item| {
-                                item.id
-                                    .to_string()
-                            })
-                            .collect(),
-                    );
                     collections.set(result.items);
                     error.set(None);
                 }
@@ -276,28 +308,28 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
                                     items,
                                     aria_label: "Collections",
                                     on_reorder: move |new_order: Vec<String>| {
-                                        let previous_positions: HashMap<String, usize> = collection_order
-                                            .peek()
+                                        let mut reordered_collections = collections.peek().clone();
+                                        reordered_collections.sort_by_key(|col| {
+                                            new_order.iter().position(|id| *id == col.id.to_string())
+                                        });
+                                        for (index, col) in reordered_collections.iter_mut().enumerate() {
+                                            col.remux
+                                                .get_or_insert_with(Default::default)
+                                                .sort_order = Some(index as i64 * 10);
+                                        }
+                                        let reorder_updates: Vec<(String, i64)> = reordered_collections
                                             .iter()
-                                            .enumerate()
-                                            .map(|(index, id)| (id.clone(), index))
-                                            .collect();
-                                        let updates: Vec<(String, i64)> = new_order
-                                            .iter()
-                                            .enumerate()
-                                            .filter_map(|(index, id)| {
-                                                (previous_positions.get(id).copied() != Some(index))
-                                                    .then(|| (id.clone(), index as i64 * 10))
+                                            .filter_map(|col| {
+                                                Some((col.id.to_string(), col.remux.as_ref()?.sort_order?))
                                             })
                                             .collect();
-
-                                        collection_order.set(new_order);
+                                        collections.set(reordered_collections);
 
                                         let app_state = app_state_reorder.clone();
                                         let mut reorder_error = error;
 
                                         spawn(async move {
-                                            for (id, so) in updates {
+                                            for (id, so) in reorder_updates {
                                                 if let Err(e) = app_state
                                                     .execute(PatchItem {
                                                         item_id: id,
@@ -326,10 +358,17 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
 
         if let Some(mode) = form_mode.read().clone() {
             div { class: "modal-backdrop",
-                div { class: "modal",
+                div { class: "modal modal--filters",
                     CollectionForm {
                         mode,
                         app_state: app_state.clone(),
+                        // New collections go to the top of the list.
+                        new_sort_order: collections
+                            .peek()
+                            .iter()
+                            .filter_map(|col| col.remux.as_ref()?.sort_order)
+                            .min()
+                            .map_or(0, |sort_order| sort_order.saturating_sub(10)),
                         on_done: move |_| {
                             form_mode.set(None);
                             let v = *refresh.peek() + 1;
@@ -347,6 +386,8 @@ pub fn CollectionsPage(app_state: AppState) -> Element {
 pub fn CollectionForm(
     mode: FormMode,
     app_state: AppState,
+    /// `sort_order` for a newly created collection; ignored when editing.
+    new_sort_order: i64,
     on_done: EventHandler,
     on_cancel: EventHandler,
 ) -> Element {
@@ -463,6 +504,31 @@ pub fn CollectionForm(
                     .clone()
             })
             .unwrap_or_else(|| vec![FilterGroup::default()])
+    });
+    // A smart collection of collections can only contain collections, so a
+    // simple filter is edited as a flat "Collection Filters" list.
+    let flat_collection_filter: bool = is_flat_collection_filter(
+        existing
+            .as_ref()
+            .and_then(|f| {
+                f.remux
+                    .as_ref()
+            })
+            .and_then(|r| {
+                r.smart_filter
+                    .as_ref()
+            }),
+    );
+    let cf_rules: Signal<Vec<FilterRule>> = use_signal(|| {
+        sf_groups
+            .peek()
+            .iter()
+            .flat_map(|g| {
+                g.rules
+                    .iter()
+                    .cloned()
+            })
+            .collect()
     });
     let tags: Signal<Vec<String>> = use_signal(|| {
         existing
@@ -800,14 +866,19 @@ pub fn CollectionForm(
             .peek()
             .clone();
         let smart_filter_payload = if ck == "smart" {
-            Some(CollectionFilter {
-                match_mode: sf_match
+            Some(smart_collection_filter(
+                (flat_collection_filter && is_group).then(|| {
+                    cf_rules
+                        .peek()
+                        .clone()
+                }),
+                sf_match
                     .peek()
                     .clone(),
-                groups: sf_groups
+                sf_groups
                     .peek()
                     .clone(),
-            })
+            ))
         } else {
             None
         };
@@ -913,7 +984,6 @@ pub fn CollectionForm(
                             smart_filter: smart_filter_payload,
                             promoted: Some(prm),
                             tags: Some(current_tags),
-                            sort_order: None,
                             latest_auto_unplayed: Some(if is_group {
                                 false
                             } else {
@@ -927,6 +997,7 @@ pub fn CollectionForm(
                             collection_default_sort: default_sort_payload,
                             collection_default_sort_order: default_sort_order_payload,
                             image_config: image_config_payload,
+                            ..Default::default()
                         },
                     })
                     .await;
@@ -953,7 +1024,7 @@ pub fn CollectionForm(
                             collection_type: Some(ct),
                             collection_kind: Some(ck),
                             promoted: Some(prm),
-                            sort_order: None,
+                            sort_order: Some(new_sort_order),
                         },
                     })
                     .await
@@ -968,13 +1039,8 @@ pub fn CollectionForm(
                     .execute(PatchItem {
                         item_id: new_id.clone(),
                         payload: PatchItemPayload {
-                            name: None,
-                            collection_type: None,
-                            collection_kind: None,
                             smart_filter: smart_filter_payload,
-                            promoted: None,
                             tags: Some(current_tags),
-                            sort_order: None,
                             latest_auto_unplayed: Some(if is_group {
                                 false
                             } else {
@@ -988,6 +1054,7 @@ pub fn CollectionForm(
                             collection_default_sort: default_sort_payload,
                             collection_default_sort_order: default_sort_order_payload,
                             image_config: image_config_payload,
+                            ..Default::default()
                         },
                     })
                     .await;
@@ -1216,10 +1283,13 @@ pub fn CollectionForm(
                                         move |_| {
                                             let ot = overlay_type.peek().clone();
                                             let smart_filter = if col_kind.peek().as_str() == "smart" {
-                                                Some(CollectionFilter {
-                                                    match_mode: sf_match.peek().clone(),
-                                                    groups: sf_groups.peek().clone(),
-                                                })
+                                                Some(smart_collection_filter(
+                                                    (flat_collection_filter
+                                                        && col_type.peek().as_str() == "collections")
+                                                        .then(|| cf_rules.peek().clone()),
+                                                    sf_match.peek().clone(),
+                                                    sf_groups.peek().clone(),
+                                                ))
                                             } else {
                                                 None
                                             };
@@ -1484,10 +1554,18 @@ pub fn CollectionForm(
 
             if col_kind.read().as_str() == "smart" {
                 if col_type.read().as_str() == "collections" {
-                    FilterRuleEditor {
-                        match_mode: sf_match,
-                        groups: sf_groups,
-                        allowed_fields: vec!["collection_id"],
+                    if flat_collection_filter {
+                        CollectionRuleEditor {
+                            rules: cf_rules,
+                            hint: "Choose which collections this smart collection contains.",
+                        }
+                    } else {
+                        FilterRuleEditor {
+                            match_mode: sf_match,
+                            groups: sf_groups,
+                            allowed_fields: vec!["collection_id"],
+                            title: "Collection Filters",
+                        }
                     }
                 } else {
                     FilterRuleEditor { match_mode: sf_match, groups: sf_groups }
@@ -1573,5 +1651,98 @@ pub fn CollectionForm(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod collection_filter_tests {
+    use super::*;
+    use remux_sdks::remux::SetOp;
+    use uuid::Uuid;
+
+    fn collection_rule(n: u128) -> FilterRule {
+        FilterRule::CollectionId {
+            op: SetOp::In,
+            ids: vec![Uuid::from_u128(n)],
+        }
+    }
+
+    fn group(match_mode: FilterMatchMode, rules: Vec<FilterRule>) -> FilterGroup {
+        FilterGroup { match_mode, rules }
+    }
+
+    fn filter(groups: Vec<FilterGroup>) -> CollectionFilter {
+        CollectionFilter {
+            match_mode: FilterMatchMode::All,
+            groups,
+        }
+    }
+
+    #[test]
+    fn simple_filters_use_the_flat_list() {
+        assert!(is_flat_collection_filter(None));
+        assert!(is_flat_collection_filter(Some(&filter(vec![]))));
+        assert!(is_flat_collection_filter(Some(&filter(vec![
+            FilterGroup::default()
+        ]))));
+        assert!(is_flat_collection_filter(Some(&filter(vec![group(
+            FilterMatchMode::All,
+            vec![collection_rule(1), collection_rule(2)],
+        )]))));
+        // A single rule means the same under AND and OR.
+        assert!(is_flat_collection_filter(Some(&filter(vec![group(
+            FilterMatchMode::Any,
+            vec![collection_rule(1)],
+        )]))));
+        // Empty groups don't count.
+        assert!(is_flat_collection_filter(Some(&filter(vec![
+            FilterGroup::default(),
+            group(FilterMatchMode::All, vec![collection_rule(1)]),
+        ]))));
+    }
+
+    #[test]
+    fn filters_the_flat_list_cannot_express_keep_the_grouped_editor() {
+        // OR across several rules.
+        assert!(!is_flat_collection_filter(Some(&filter(vec![group(
+            FilterMatchMode::Any,
+            vec![collection_rule(1), collection_rule(2)],
+        )]))));
+        // Several groups.
+        assert!(!is_flat_collection_filter(Some(&filter(vec![
+            group(FilterMatchMode::All, vec![collection_rule(1)]),
+            group(FilterMatchMode::All, vec![collection_rule(2)]),
+        ]))));
+    }
+
+    #[test]
+    fn a_flat_list_is_saved_as_one_all_group() {
+        let saved = smart_collection_filter(
+            Some(vec![collection_rule(1), collection_rule(2)]),
+            FilterMatchMode::Any,
+            vec![group(FilterMatchMode::Any, vec![collection_rule(9)])],
+        );
+        assert_eq!(saved.match_mode, FilterMatchMode::All);
+        assert_eq!(
+            saved.groups,
+            vec![group(
+                FilterMatchMode::All,
+                vec![collection_rule(1), collection_rule(2)]
+            )]
+        );
+    }
+
+    #[test]
+    fn the_grouped_editor_state_is_saved_unchanged() {
+        let groups = vec![
+            group(
+                FilterMatchMode::Any,
+                vec![collection_rule(1), collection_rule(2)],
+            ),
+            group(FilterMatchMode::All, vec![collection_rule(3)]),
+        ];
+        let saved = smart_collection_filter(None, FilterMatchMode::Any, groups.clone());
+        assert_eq!(saved.match_mode, FilterMatchMode::Any);
+        assert_eq!(saved.groups, groups);
     }
 }

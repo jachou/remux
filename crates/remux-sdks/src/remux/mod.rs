@@ -416,8 +416,16 @@ pub struct AddonDto {
     #[serde(default)]
     pub http_redirect_stream: bool,
     #[serde(default)]
+    pub subtitle_extraction: bool,
+    #[serde(default)]
+    pub probe_on_scan: bool,
+    #[serde(default)]
     pub service_filter: Vec<String>,
     pub description: Option<String>,
+    /// The addon's manifest could not be fetched when it was loaded, so the
+    /// supported resources/types shown are the static fallback.
+    #[serde(default)]
+    pub manifest_unreachable: bool,
     pub created_at: NaiveDateTime,
     pub updated_at: NaiveDateTime,
 }
@@ -451,6 +459,8 @@ pub struct UpdateAddonRequest {
     pub priority: Option<i64>,
     pub is_default: Option<bool>,
     pub http_redirect_stream: Option<bool>,
+    pub subtitle_extraction: Option<bool>,
+    pub probe_on_scan: Option<bool>,
     pub service_filter: Option<Vec<String>>,
 }
 
@@ -907,8 +917,9 @@ pub struct EncodingOptions {
     /// policy flag.
     #[default(Some(true))]
     pub enable_audio_transcoding: Option<bool>,
-    /// Allow container remuxing (video=copy, audio=copy). When false, only
-    /// direct play is served. Stacks AND with the per-user EnablePlaybackRemuxing
+    /// Allow container remuxing (video=copy, audio=copy). When false, a pure
+    /// remux request falls back to direct play; permitted audio/video re-encoding
+    /// remains available. Stacks AND with the per-user EnablePlaybackRemuxing
     /// policy flag.
     #[default(Some(true))]
     pub enable_remuxing: Option<bool>,
@@ -917,9 +928,12 @@ pub struct EncodingOptions {
     /// Defaults to false.
     #[default(Some(false))]
     pub normalize_audio_loudness: Option<bool>,
-    /// Controls how embedded subtitle streams unsupported by the client are handled.
-    /// Burn: encode into video (default). Extract: serve via Stream.js/VTT endpoint.
-    /// Strip: remove from media source so the client never sees them.
+    /// Fallback for an unsupported embedded subtitle when extraction isn't
+    /// attempted — extraction only ever happens for local sources, so this
+    /// always applies to remote ones, and to local ones when extraction
+    /// itself failed.
+    /// Burn: encode into video (default). Strip: remove from media source so
+    /// the client never sees them.
     #[default(Some(EmbeddedSubtitleHandling::Burn))]
     pub subtitle_mode: Option<EmbeddedSubtitleHandling>,
 }
@@ -942,13 +956,19 @@ pub struct EncodingOptions {
 #[strum(serialize_all = "PascalCase")]
 pub enum EmbeddedSubtitleHandling {
     /// Burn unsupported embedded subtitles into the video during transcoding.
+    /// This is the fallback when extraction isn't attempted — extraction
+    /// itself is no longer a chosen mode, it's attempted automatically for
+    /// local files and never for remote ones.
     #[default]
     Burn,
-    /// Extract and deliver unsupported embedded subtitles via the subtitle stream
-    /// endpoint (Stream.js / Stream.vtt). May be slow for remote sources.
-    Extract,
-    /// Remove unsupported embedded subtitle streams from the media source entirely.
-    /// No transcoding is triggered for subtitles; they simply won't be available.
+    /// Remove unsupported embedded subtitle streams from the media source
+    /// entirely when extraction isn't attempted. No transcoding is triggered
+    /// for subtitles; they simply won't be available.
+    ///
+    /// Accepts the removed `Extract` value as a legacy alias for existing
+    /// installs — closest original intent, since both mean "don't burn in".
+    #[serde(alias = "Extract")]
+    #[strum(to_string = "Strip", serialize = "Extract")]
     Strip,
 }
 
@@ -3776,7 +3796,7 @@ impl From<stremio::MediaType> for MediaKind {
             stremio::MediaType::Album => Self::Album,
             stremio::MediaType::Artist => Self::Artist,
             stremio::MediaType::Track => Self::Track,
-            stremio::MediaType::Events => Self::TvProgram,
+            stremio::MediaType::Events => Self::TvChannel,
             stremio::MediaType::Other(s) => match s.as_str() {
                 "episode" => Self::Episode,
                 "season" => Self::Season,
@@ -4123,6 +4143,8 @@ pub struct RemuxInfo {
     pub collection_default_sort: Option<Vec<ItemSortBy>>,
     pub collection_default_sort_order: Option<Vec<SortOrder>>,
     pub image_config: Option<CollectionImageConfig>,
+    /// Stored display order (`DisplayOrder` sort); `None` sorts last.
+    pub sort_order: Option<i64>,
 }
 
 #[dto]
@@ -7021,6 +7043,17 @@ pub fn language_label(code: &str) -> String {
         .unwrap_or_else(|| code.to_string())
 }
 
+/// Human-readable label for a [`StreamRule::Bitrate`] condition, e.g. `"> 8.00 Mbps"`.
+pub fn format_bitrate_rule(op: NumericOp, value: i64) -> String {
+    let sym = match op {
+        NumericOp::Eq => "=",
+        NumericOp::NotEq => "≠",
+        NumericOp::Gt => ">",
+        NumericOp::Lt => "<",
+    };
+    format!("{sym} {:.2} Mbps", value as f64 / 1_000_000.0)
+}
+
 /// Human-readable label for a [`StreamRule::Size`] condition, e.g. `"> 18.63 GiB"`.
 pub fn format_size_rule(op: NumericOp, value: i64) -> String {
     let sym = match op {
@@ -7073,6 +7106,27 @@ pub enum StreamRule {
     Addon {
         op: SetOp,
         values: Vec<Uuid>,
+    },
+    /// Subtitle track language (ISO 639-2/B code). Matches if any embedded
+    /// subtitle stream in `probe_data`, or any subtitle the stream itself
+    /// advertises, has a listed language. With neither a match nor probe data
+    /// the stream passes the rule so unprobed sources are not silently dropped.
+    SubtitleLanguage {
+        op: SetOp,
+        values: Vec<String>,
+    },
+    /// Overall bitrate in bits per second: the probed bitrate, or the stream's
+    /// size over its runtime. A stream whose bitrate can't be worked out passes
+    /// the rule so it isn't silently dropped.
+    Bitrate {
+        op: NumericOp,
+        value: i64,
+    },
+    /// Whether the upstream service confirmed the stream is cached (`true`), or
+    /// confirmed it is not (`false`). A stream with no cache information
+    /// passes the rule so it isn't silently dropped.
+    Cached {
+        value: bool,
     },
 }
 
@@ -7397,7 +7451,6 @@ mod tests {
     fn embedded_subtitle_handling_display_round_trips() {
         for (variant, expected) in [
             (EmbeddedSubtitleHandling::Burn, "Burn"),
-            (EmbeddedSubtitleHandling::Extract, "Extract"),
             (EmbeddedSubtitleHandling::Strip, "Strip"),
         ] {
             assert_eq!(variant.to_string(), expected);
@@ -7409,10 +7462,23 @@ mod tests {
     }
 
     #[test]
+    fn embedded_subtitle_handling_accepts_legacy_extract_alias() {
+        // Existing installs may have persisted "Extract" before it was
+        // removed as a mode — both the strum EnumString parse and serde
+        // deserialize paths must still accept it, landing on Strip.
+        let parsed: EmbeddedSubtitleHandling = "Extract"
+            .parse()
+            .unwrap();
+        assert_eq!(parsed, EmbeddedSubtitleHandling::Strip);
+        let back: EmbeddedSubtitleHandling =
+            serde_json::from_str("\"Extract\"").unwrap();
+        assert_eq!(back, EmbeddedSubtitleHandling::Strip);
+    }
+
+    #[test]
     fn embedded_subtitle_handling_serde_round_trips() {
         for variant in [
             EmbeddedSubtitleHandling::Burn,
-            EmbeddedSubtitleHandling::Extract,
             EmbeddedSubtitleHandling::Strip,
         ] {
             let json = serde_json::to_string(&variant).unwrap();
@@ -7618,6 +7684,40 @@ mod tests {
         assert_eq!(format_size_rule(NumericOp::Lt, v), "< 20.00 GiB");
         assert_eq!(format_size_rule(NumericOp::Eq, v), "= 20.00 GiB");
         assert_eq!(format_size_rule(NumericOp::NotEq, v), "≠ 20.00 GiB");
+    }
+
+    #[test]
+    fn format_bitrate_rule_shows_megabits() {
+        assert_eq!(format_bitrate_rule(NumericOp::Gt, 8_000_000), "> 8.00 Mbps");
+        assert_eq!(format_bitrate_rule(NumericOp::Lt, 2_500_000), "< 2.50 Mbps");
+    }
+
+    #[test]
+    fn new_stream_rules_round_trip_through_json() {
+        let rules = [
+            (
+                StreamRule::SubtitleLanguage {
+                    op: SetOp::In,
+                    values: vec!["por".to_string()],
+                },
+                serde_json::json!({"field": "subtitle_language", "op": "in", "values": ["por"]}),
+            ),
+            (
+                StreamRule::Bitrate {
+                    op: NumericOp::Lt,
+                    value: 8_000_000,
+                },
+                serde_json::json!({"field": "bitrate", "op": "lt", "value": 8_000_000}),
+            ),
+            (
+                StreamRule::Cached { value: true },
+                serde_json::json!({"field": "cached", "value": true}),
+            ),
+        ];
+        for (rule, json) in rules {
+            assert_eq!(serde_json::to_value(&rule).unwrap(), json);
+            assert_eq!(serde_json::from_value::<StreamRule>(json).unwrap(), rule);
+        }
     }
 
     #[test]
