@@ -29,6 +29,8 @@ use sqlx::SqlitePool;
 
 use super::{mock_items, stub_json};
 
+pub const VIRTUAL_ROOT_ID: Uuid = uuid!("f47ac10b-58cc-4372-a567-0e02b2c3d479");
+
 pub struct ItemsQueryResult {
     pub items: Vec<api::BaseItemDto>,
     pub total_count: i64,
@@ -262,6 +264,34 @@ pub async fn get_items(
     } else {
         None
     };
+
+    // In Emby/Jellyfin protocol, when a client queries the root library without a specific
+    // folder (ParentId is omitted or points to /items/root) and Recursive is false/omitted,
+    // the client is asking for the top-level user views / root media folders (Movies, Shows, etc.),
+    // not an unbounded dump of all items across the entire server.
+    let is_root_folder_id = q.parent_id == Some(VIRTUAL_ROOT_ID);
+    let is_root_views_query = (parent.is_none() || is_root_folder_id)
+        && !q.recursive
+        && q.search_term.is_none()
+        && q.include_item_types.is_none()
+        && q.ids.is_none()
+        && q.any_provider_id_equals.is_none()
+        && q.filters.is_none();
+
+    if is_root_views_query {
+        let items = crate::api::users::get_user_views_dtos(&state, &session, false).await?;
+        let count = items.len() as i64;
+        let start = q.start_index.unwrap_or(0) as usize;
+        let paged_items: Vec<_> = match q.limit {
+            Some(limit) => items.into_iter().skip(start).take(limit as usize).collect(),
+            None => items.into_iter().skip(start).collect(),
+        };
+        return Ok(ItemsQueryResultBuilder::with_dtos(
+            session,
+            paged_items,
+            count,
+        ));
+    }
 
     // Apply the collection's default sort override when the client sends no sort
     // preference or its built-in default sort (treated as "no preference").
@@ -766,6 +796,12 @@ pub async fn get_items(
         );
     }
 
+    // Safety cap: if an unbounded or top-level query omitted limit, default to 250
+    // so an unpaged query never triggers an unbounded full-table scan on hundreds of thousands of items.
+    if q.limit.is_none() {
+        q.limit = Some(250);
+    }
+
     let want_total = q
         .enable_total_record_count
         .unwrap_or(true);
@@ -951,7 +987,7 @@ pub async fn items_root(
     _session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
     Ok(Json(api::BaseItemDto {
-        id: uuid!("f47ac10b-58cc-4372-a567-0e02b2c3d479"),
+        id: VIRTUAL_ROOT_ID,
         name: Some("Media Library".to_string()),
         type_: api::MediaType::CollectionFolder,
         is_folder: true,
@@ -7228,6 +7264,27 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(people, vec![person.id], "the old People must survive");
+        }
+    }
+
+    #[tokio::test]
+    async fn items_without_parent_or_recursive_returns_user_views() {
+        let (server, _guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+
+        let resp = server
+            .get("/items")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert!(body["Items"].is_array());
+        for item in body["Items"].as_array().unwrap() {
+            assert_eq!(item["Type"], "CollectionFolder");
         }
     }
 }

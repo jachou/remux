@@ -1493,12 +1493,11 @@ async fn normalize_ordered_views(
     Ok(())
 }
 
-#[get("/userviews")]
-pub async fn userviews(
-    State(state): State<AppState>,
-    session: auth::AuthSession,
-    Query(q): Query<UserViewsQuery>,
-) -> Result<impl IntoResponse> {
+pub(crate) async fn get_user_views_dtos(
+    state: &AppState,
+    session: &auth::AuthSession,
+    include_hidden: bool,
+) -> Result<Vec<api::BaseItemDto>> {
     let config = session
         .user
         .configuration
@@ -1509,7 +1508,7 @@ pub async fn userviews(
         .as_deref();
 
     // Push hidden-view exclusions into the query so their children are never counted.
-    let excluded_view_ids: Option<Vec<Uuid>> = if q.include_hidden != Some(true) {
+    let excluded_view_ids: Option<Vec<Uuid>> = if !include_hidden {
         config.and_then(|cfg| {
             if !cfg
                 .my_media_excludes
@@ -1572,6 +1571,16 @@ pub async fn userviews(
         items.push(livetv_view_item());
     }
 
+    Ok(items)
+}
+
+#[get("/userviews")]
+pub async fn userviews(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Query(q): Query<UserViewsQuery>,
+) -> Result<impl IntoResponse> {
+    let items = get_user_views_dtos(&state, &session, q.include_hidden == Some(true)).await?;
     let count = items.len() as i64;
     let result = ItemsQueryResultBuilder::with_dtos(session, items, count)
         .with_client_patches()
