@@ -273,13 +273,24 @@ impl StreamDescriptor {
         }
     }
 
-    /// Returns `false` only for HTTP streams whose ranged GET yields a 4xx/5xx
-    /// status or a network/timeout error. Non-HTTP variants (local, torrent,
-    /// opendal) return `true` immediately.
-    ///
-    /// Results are cached in-memory in `STREAM_LIVENESS_CACHE` with a 1-hour TTL,
-    /// so pre-probing and repeated checks resolve in sub-microsecond memory lookups.
-    pub async fn is_alive(&self) -> bool {
+    pub const LIVENESS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    pub const LIVENESS_PREWARM_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+    /// Checks if this stream's liveness check is missing or expiring within 20 minutes of the 1-hour TTL.
+    pub fn is_liveness_expiring_soon(&self) -> bool {
+        let Self::Http { url, .. } = self else {
+            return false;
+        };
+        match STREAM_LIVENESS_CACHE.get(url) {
+            Some(entry) => {
+                entry.verified_at.elapsed() >= Self::LIVENESS_CACHE_TTL.saturating_sub(Self::LIVENESS_PREWARM_THRESHOLD)
+            }
+            None => true,
+        }
+    }
+
+    /// Performs a live check against the upstream URL and refreshes the cache entry with a fresh TTL.
+    pub async fn refresh_liveness(&self) -> bool {
         let Self::Http {
             url,
             request_headers,
@@ -288,11 +299,6 @@ impl StreamDescriptor {
         else {
             return true;
         };
-
-        if let Some(alive) = STREAM_LIVENESS_CACHE.get(url) {
-            tracing::info!(%url, alive, "liveness check cache hit");
-            return alive;
-        }
 
         let start = std::time::Instant::now();
         let mut request = AVAILABILITY_CLIENT.get(url);
@@ -311,7 +317,7 @@ impl StreamDescriptor {
                 let elapsed = start.elapsed();
                 if is_ok {
                     tracing::info!(%url, ?status, ?elapsed, "liveness check passed, cached");
-                    STREAM_LIVENESS_CACHE.insert(url.clone(), true);
+                    STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(true));
                 } else {
                     tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
                 }
@@ -323,6 +329,29 @@ impl StreamDescriptor {
                 false
             }
         }
+    }
+
+    /// Returns `false` only for HTTP streams whose ranged GET yields a 4xx/5xx
+    /// status or a network/timeout error. Non-HTTP variants (local, torrent,
+    /// opendal) return `true` immediately.
+    ///
+    /// Results are cached in-memory in `STREAM_LIVENESS_CACHE` with a 1-hour TTL,
+    /// so pre-probing and repeated checks resolve in sub-microsecond memory lookups.
+    pub async fn is_alive(&self) -> bool {
+        let Self::Http {
+            url,
+            ..
+        } = self
+        else {
+            return true;
+        };
+
+        if let Some(entry) = STREAM_LIVENESS_CACHE.get(url) {
+            tracing::info!(%url, alive = entry.alive, "liveness check cache hit");
+            return entry.alive;
+        }
+
+        self.refresh_liveness().await
     }
 
     /// Instantiate the runtime service for self-contained variants.
@@ -497,8 +526,23 @@ pub trait StreamSource: Send + Sync {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response>;
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LivenessEntry {
+    pub alive: bool,
+    pub verified_at: std::time::Instant,
+}
+
+impl LivenessEntry {
+    pub fn new(alive: bool) -> Self {
+        Self {
+            alive,
+            verified_at: std::time::Instant::now(),
+        }
+    }
+}
+
 pub(crate) static STREAM_LIVENESS_CACHE: std::sync::LazyLock<
-    moka::sync::Cache<String, bool>,
+    moka::sync::Cache<String, LivenessEntry>,
 > = std::sync::LazyLock::new(|| {
     moka::sync::Cache::builder()
         .max_capacity(1_000)
@@ -889,8 +933,8 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpSource, STREAM_LIVENESS_CACHE, STREAM_PROXY_CLIENT, StreamDescriptor, TrackerUrl,
-        is_tracker_url, mime_from_path,
+        HttpSource, LivenessEntry, STREAM_LIVENESS_CACHE, STREAM_PROXY_CLIENT, StreamDescriptor,
+        TrackerUrl, is_tracker_url, mime_from_path,
     };
     use std::path::Path;
 
@@ -1110,10 +1154,40 @@ mod tests {
         // First call: makes network request to mock server and caches result
         assert!(desc.is_alive().await);
         assert_eq!(mock.hits(), 1);
-        assert_eq!(STREAM_LIVENESS_CACHE.get(&test_url), Some(true));
+        assert_eq!(STREAM_LIVENESS_CACHE.get(&test_url).map(|e| e.alive), Some(true));
 
         // Second call: served directly from memory cache, 0 mock hits!
         assert!(desc.is_alive().await);
         assert_eq!(mock.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn stream_descriptor_liveness_expiring_soon_detects_threshold() {
+        let test_url = "http://example.com/test_expiring_threshold.mkv".to_string();
+        let desc = StreamDescriptor::Http {
+            url: test_url.clone(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+
+        // Missing from cache -> expiring soon is true
+        assert!(desc.is_liveness_expiring_soon());
+
+        // Fresh entry (0s old) -> expiring soon is false
+        STREAM_LIVENESS_CACHE.insert(
+            test_url.clone(),
+            LivenessEntry::new(true),
+        );
+        assert!(!desc.is_liveness_expiring_soon());
+
+        // Older entry (45m old, within 20m of 60m TTL) -> expiring soon is true
+        STREAM_LIVENESS_CACHE.insert(
+            test_url.clone(),
+            LivenessEntry {
+                alive: true,
+                verified_at: std::time::Instant::now() - std::time::Duration::from_secs(45 * 60),
+            },
+        );
+        assert!(desc.is_liveness_expiring_soon());
     }
 }

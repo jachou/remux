@@ -400,6 +400,13 @@ pub async fn report_playback_stopped(
                     "Trigger 2 (on playback stopped)",
                 );
             }
+            // Pre-warm the stopped item in the background if its liveness is expiring soon,
+            // so resuming or replaying is instant!
+            crate::services::stream_service::spawn_preemptive_probe(
+                &state.ctx,
+                item_id,
+                Some(session.user.id),
+            );
         }
     } else if !data
         .item_id
@@ -443,6 +450,11 @@ pub async fn report_playback_stopped(
                 "Trigger 2 (on playback stopped)",
             );
         }
+        crate::services::stream_service::spawn_preemptive_probe(
+            &state.ctx,
+            data.item_id,
+            Some(session.user.id),
+        );
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

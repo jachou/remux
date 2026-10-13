@@ -1097,7 +1097,11 @@ impl StreamService {
             if is_reusable_probe_cache(cached) {
                 tracing::info!(item = %self.item_id, stream = %stream.id, "Candidate #1 already has reusable probe data; pre-warming liveness");
                 if let Some(si) = &stream.stream_info {
-                    si.descriptor.is_alive().await;
+                    if si.descriptor.is_liveness_expiring_soon() {
+                        si.descriptor.refresh_liveness().await;
+                    } else {
+                        si.descriptor.is_alive().await;
+                    }
                 }
                 return Ok(Some(stream.id));
             }
@@ -1196,7 +1200,11 @@ pub fn spawn_preemptive_probe(
                             if is_reusable_probe_cache(pd) {
                                 tracing::info!(%item_id, stream_id = %top.id, "Candidate #1 already probed in DB; pre-warming liveness");
                                 if let Some(si) = &top.stream_info {
-                                    si.descriptor.is_alive().await;
+                                    if si.descriptor.is_liveness_expiring_soon() {
+                                        si.descriptor.refresh_liveness().await;
+                                    } else {
+                                        si.descriptor.is_alive().await;
+                                    }
                                 }
                                 prefetch_subtitles_for_media(&ctx, &media, user_id).await;
                                 return;
