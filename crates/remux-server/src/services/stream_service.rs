@@ -1148,10 +1148,36 @@ impl StreamService {
     }
 }
 
-static PREEMPTIVE_PROBES: std::sync::LazyLock<dashmap::DashSet<Uuid>> =
+pub(crate) static QUEUED_PROBES: std::sync::LazyLock<dashmap::DashSet<Uuid>> =
     std::sync::LazyLock::new(dashmap::DashSet::new);
+pub(crate) static ACTIVE_PROBES: std::sync::LazyLock<
+    dashmap::DashMap<Uuid, std::sync::Arc<tokio::sync::Notify>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
 static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
+/// If a preemptive probe is actively executing (holding a worker permit) for `item_id`,
+/// await its completion up to 3 seconds so foreground PlaybackInfo coalesces with it.
+/// If the probe is merely waiting in the queue (or not scheduled), returns immediately (0ms).
+pub async fn await_in_flight_probe(item_id: Uuid) -> bool {
+    let notify = ACTIVE_PROBES.get(&item_id).map(|e| e.value().clone());
+    if let Some(notify) = notify {
+        tracing::info!(%item_id, "foreground request awaiting actively running probe");
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(std::time::Duration::from_millis(3000), notify.notified()).await {
+            Ok(_) => {
+                tracing::info!(%item_id, elapsed = ?start.elapsed(), "active probe finished, coalesced");
+                true
+            }
+            Err(_) => {
+                tracing::warn!(%item_id, elapsed = ?start.elapsed(), "timed out waiting for active probe, falling through");
+                false
+            }
+        }
+    } else {
+        false
+    }
+}
 
 /// Spawns a background task to pre-emptively probe the primary stream candidate
 /// for the given Movie or Episode item.
@@ -1160,20 +1186,20 @@ pub fn spawn_preemptive_probe(
     item_id: Uuid,
     user_id: Option<Uuid>,
 ) {
-    if !PREEMPTIVE_PROBES.insert(item_id) {
-        tracing::debug!(%item_id, "preemptive probe already in flight, skipping duplicate spawn");
+    if !QUEUED_PROBES.insert(item_id) {
+        tracing::debug!(%item_id, "preemptive probe already in flight or queued, skipping duplicate spawn");
         return;
     }
     tracing::info!(%item_id, "spawning preemptive probe task");
     let ctx = ctx.clone();
     tokio::spawn(async move {
-        struct PreemptiveGuard(Uuid);
-        impl Drop for PreemptiveGuard {
+        struct QueuedGuard(Uuid);
+        impl Drop for QueuedGuard {
             fn drop(&mut self) {
-                PREEMPTIVE_PROBES.remove(&self.0);
+                QUEUED_PROBES.remove(&self.0);
             }
         }
-        let _guard = PreemptiveGuard(item_id);
+        let _queued_guard = QueuedGuard(item_id);
 
         let Ok(Some(media)) = db::Media::get_by_id(&ctx.db, &item_id).await else {
             return;
@@ -1226,13 +1252,31 @@ pub fn spawn_preemptive_probe(
             user_id,
         });
 
-        let _permit = match PREEMPTIVE_SEMAPHORE.try_acquire() {
-            Ok(p) => p,
-            Err(_) => {
-                tracing::debug!(%item_id, "preemptive probe concurrency limit reached (max 2), skipping");
+        let _permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            PREEMPTIVE_SEMAPHORE.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                tracing::debug!(%item_id, "preemptive probe timed out waiting for semaphore permit, skipping");
                 return;
             }
         };
+
+        // Acquired permit: mark as actively running so foreground PlaybackInfo can coalesce with it
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        ACTIVE_PROBES.insert(item_id, notify.clone());
+        struct ActiveGuard(Uuid);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                if let Some((_, notify)) = ACTIVE_PROBES.remove(&self.0) {
+                    notify.notify_waiters();
+                }
+            }
+        }
+        let _active_guard = ActiveGuard(item_id);
 
         if let Err(e) = service.load(media.clone()).await {
             tracing::warn!(%item_id, error = %e, "preemptive probe service.load failed");
@@ -2302,11 +2346,11 @@ mod tests {
         let ctx = &guard.0;
         let owner = seed_movie(ctx).await;
 
-        assert!(super::PREEMPTIVE_PROBES.insert(owner.id));
+        assert!(super::QUEUED_PROBES.insert(owner.id));
 
         super::spawn_preemptive_probe(ctx, owner.id, None);
 
-        super::PREEMPTIVE_PROBES.remove(&owner.id);
-        assert!(!super::PREEMPTIVE_PROBES.contains(&owner.id));
+        super::QUEUED_PROBES.remove(&owner.id);
+        assert!(!super::QUEUED_PROBES.contains(&owner.id));
     }
 }

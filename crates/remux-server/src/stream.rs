@@ -300,6 +300,17 @@ impl StreamDescriptor {
             return true;
         };
 
+        static LIVENESS_LOCKS: crate::keyed_lock::KeyedLock<String> =
+            crate::keyed_lock::KeyedLock::new();
+
+        // Singleflight: coalesce concurrent liveness checks on the same URL
+        let _guard = LIVENESS_LOCKS.lock(url.clone()).await;
+
+        // Re-check cache after acquiring lock in case another in-flight check just completed
+        if let Some(entry) = STREAM_LIVENESS_CACHE.get(url) {
+            return entry.alive;
+        }
+
         let start = std::time::Instant::now();
         let mut request = AVAILABILITY_CLIENT.get(url);
         for (key, value) in request_headers {
@@ -320,6 +331,7 @@ impl StreamDescriptor {
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(true));
                 } else {
                     tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
+                    STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
                 }
                 is_ok
             }

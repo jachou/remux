@@ -466,6 +466,8 @@ async fn items_playbackinfo_inner(
     let pbi_start = std::time::Instant::now();
     let (probed_result, (subtitle_media, external_subtitles, subs_ms)) = tokio::join!(
         async {
+            crate::services::stream_service::await_in_flight_probe(id).await;
+
             let t_discovery = std::time::Instant::now();
             service
                 .load(media)
