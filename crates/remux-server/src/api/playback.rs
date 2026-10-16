@@ -1414,6 +1414,14 @@ async fn videos_stream_inner(
         return Ok(no_streams_response().into_response());
     };
     let descriptor = si.descriptor;
+    if !descriptor.is_alive().await {
+        tracing::warn!(
+            item = %id,
+            media = %media.id,
+            "resolved stream is confirmed dead; serving no-streams placeholder"
+        );
+        return Ok(no_streams_response().into_response());
+    }
     let encoding_opts = crate::db::Settings::get_encoding_config(
         &state
             .ctx

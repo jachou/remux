@@ -377,6 +377,16 @@ impl StreamService {
                 // share one IMDB id). An item's id is never one of its stream
                 // ids, so matching it against `sources` can only fail; treat it
                 // as auto-play and fall through to preference / first source.
+                let is_not_known_dead = |s: &db::Media| {
+                    if let Some(si) = &s.stream_info {
+                        if let crate::stream::StreamDescriptor::Http { url, .. } = &si.descriptor {
+                            if crate::stream::STREAM_LIVENESS_CACHE.get(url).is_some_and(|e| !e.alive) {
+                                return false;
+                            }
+                        }
+                    }
+                    true
+                };
                 let specific_stream =
                     requested_id.filter(|&sid| sid != item_id && sid != media_id);
                 if let Some(sid) = specific_stream {
@@ -397,6 +407,12 @@ impl StreamService {
                     by_pref
                         .or_else(|| {
                             sources
+                                .iter()
+                                .find(|s| is_not_known_dead(s))
+                                .cloned()
+                        })
+                        .or_else(|| {
+                            sources
                                 .into_iter()
                                 .next()
                         })
@@ -405,8 +421,14 @@ impl StreamService {
                         })
                 } else {
                     sources
-                        .into_iter()
-                        .next()
+                        .iter()
+                        .find(|s| is_not_known_dead(s))
+                        .cloned()
+                        .or_else(|| {
+                            sources
+                                .into_iter()
+                                .next()
+                        })
                         .ok_or_else(|| {
                             anyhow::anyhow!("no playable sources for {}", item_id)
                         })
@@ -703,7 +725,7 @@ impl StreamService {
             } else {
                 timeout
             };
-            let (mut source, effective_stream) = probe_stream(
+            let (mut source, effective_stream) = match probe_stream(
                 &stream,
                 url_opt,
                 skip_probe,
@@ -718,7 +740,17 @@ impl StreamService {
                     .db,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::warn!(
+                        id = %stream.id,
+                        error = ?e,
+                        "probe failed for stream candidate; skipping to next candidate"
+                    );
+                    continue;
+                }
+            };
 
             // Use the StreamGroup UUID when this candidate is a group representative
             // (group_id is set by filter_sources). This ensures the client sends back
