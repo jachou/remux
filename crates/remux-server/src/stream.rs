@@ -366,6 +366,14 @@ impl StreamDescriptor {
         self.refresh_liveness().await
     }
 
+    /// Returns `true` if this stream has already been checked and confirmed dead in cache.
+    pub fn is_known_dead(&self) -> bool {
+        let Self::Http { url, .. } = self else {
+            return false;
+        };
+        STREAM_LIVENESS_CACHE.get(url).is_some_and(|e| !e.alive)
+    }
+
     /// Instantiate the runtime service for self-contained variants.
     /// Do **not** call this for `Opendal` — those must go through the addon.
     pub fn into_source(self) -> Box<dyn StreamSource> {

@@ -64,6 +64,9 @@ use axum_anyhow::ApiResult as Result;
 struct SourceExtras {
     /// The source id its DeliveryUrls were built with, and its sidecar routes.
     subtitle_routes: (Uuid, Vec<SidecarSubtitleRoute>),
+    /// Addon subtitles fetched for this source's release, before language
+    /// capping and dedup.
+    external_subtitles: Vec<crate::addons::SubtitleInfo>,
     /// The candidate stream as listed.
     stream_id: Uuid,
     /// The stream probed for the candidate; differs from `stream_id` after a
@@ -463,8 +466,10 @@ async fn items_playbackinfo_inner(
     let subtitle_media_hint = media_source_id
         .is_none()
         .then(|| media.clone());
+    // Addon subtitles are fetched per source inside `probe_candidates`,
+    // alongside that source's probe, so only the item itself is loaded here.
     let pbi_start = std::time::Instant::now();
-    let (probed_result, (subtitle_media, external_subtitles, subs_ms)) = tokio::join!(
+    let (probed_result, subtitle_media) = tokio::join!(
         async {
             crate::services::stream_service::await_in_flight_probe(id).await;
 
@@ -483,11 +488,9 @@ async fn items_playbackinfo_inner(
             Ok::<_, anyhow::Error>((res, discovery_ms, probe_ms))
         },
         async {
-            let t_subs = std::time::Instant::now();
             // `id` is the top-level Movie/Episode UUID even when the request
-            // targets a child source. Fetch subtitle addons while stream addons
-            // load and their candidates are probed.
-            let mut subtitle_media = match subtitle_media_hint {
+            // targets a child source.
+            match subtitle_media_hint {
                 Some(hint) => Some(hint),
                 None => db::Media::get_by_id(
                     &state
@@ -498,31 +501,10 @@ async fn items_playbackinfo_inner(
                 .await
                 .ok()
                 .flatten(),
-            };
-            let external_subtitles = if is_live {
-                Vec::new()
-            } else if let Some(ref mut sub_media) = subtitle_media {
-                state
-                    .ctx
-                    .addons
-                    .fetch_subtitles(
-                        sub_media,
-                        &state.ctx,
-                        false,
-                        Some(
-                            session
-                                .user
-                                .id,
-                        ),
-                    )
-                    .await
-            } else {
-                Vec::new()
-            };
-            let subs_ms = t_subs.elapsed().as_millis() as u64;
-            (subtitle_media, external_subtitles, subs_ms)
+            }
         }
     );
+    let subs_ms = 0u64;
     let (probed, discovery_ms, probe_ms) = probed_result?;
     let item_runtime_seconds = subtitle_media
         .as_ref()
@@ -557,6 +539,7 @@ async fn items_playbackinfo_inner(
         stream,
         effective_stream,
         allow_subtitle_extraction,
+        external_subtitles,
     } in probed.results
     {
         // Metadata-only torrent probes may not know the container duration yet.
@@ -845,6 +828,7 @@ async fn items_playbackinfo_inner(
 
         source_extras.push(SourceExtras {
             subtitle_routes: (subtitle_source_id, routes),
+            external_subtitles,
             stream_id: stream.id,
             effective_stream_id: effective_stream.id,
             subtitle_prefetch,
@@ -852,23 +836,31 @@ async fn items_playbackinfo_inner(
         media_sources.push(source);
     }
 
-    // Probe and subtitle lookup ran concurrently. Append only after the real
-    // stream indexes are known.
-    let external_descriptors = append_external_subtitles(
-        &mut media_sources,
-        &external_subtitles,
-        &probe_cfg
-            .subtitle_languages
-            .clone()
-            .unwrap_or_default(),
-        sort_device_profile.as_ref(),
-        id,
-        session
-            .device
-            .access_token
-            .expose(),
-        subtitle_dedup,
-    );
+    // Append only after the real stream indexes are known. Each source gets
+    // the subtitles fetched for its own release.
+    let mut external_descriptors = Vec::with_capacity(media_sources.len());
+    let subtitle_languages = probe_cfg
+        .subtitle_languages
+        .clone()
+        .unwrap_or_default();
+    for (source, extras) in media_sources
+        .iter_mut()
+        .zip(&source_extras)
+    {
+        let descs = append_external_subtitles(
+            std::slice::from_mut(source),
+            &extras.external_subtitles,
+            &subtitle_languages,
+            sort_device_profile.as_ref(),
+            id,
+            session
+                .device
+                .access_token
+                .expose(),
+            subtitle_dedup,
+        );
+        external_descriptors.push(descs.into_iter().next().unwrap_or_default());
+    }
 
     // Re-resolve defaults after external subtitles were injected so language
     // matching can also pick addon subtitles (same request context as the
@@ -970,6 +962,17 @@ async fn items_playbackinfo_inner(
         .zip(source_extras)
     {
         let (delivery_source_id, routes) = extras.subtitle_routes;
+        // Subtitle URLs carry this id and no PlaySessionId, so the device's
+        // selection must be findable under it, refreshed for this answer.
+        StreamService::save_device_selection(
+            &state.ctx,
+            &session
+                .device
+                .id,
+            id,
+            delivery_source_id,
+            extras.effective_stream_id,
+        );
         // DeliveryUrl contains the source ID from apply_subtitle_delivery, while
         // some clients construct the route from the final MediaSourceInfo ID.
         // Cache both keys when auto-play rewrites the first source ID.
@@ -1185,7 +1188,7 @@ pub async fn items_file(
 /// without a `PlaySessionId`/`DeviceId`, and must still work with no token at
 /// all. Resolve the caller's user and device best-effort from whatever
 /// `ApiKey`/`Token` is present (never rejecting the request) so per-device
-/// cache scoping (e.g. `recent_selected_stream_for`) still works when a valid
+/// cache scoping (e.g. `device_selected_stream_for`) still works when a valid
 /// token happens to be there. An API key resolves to the same synthetic
 /// `apikey-<token>` device `AuthSession` gives it, so a session-less stream
 /// request finds the selection PlaybackInfo saved under that device.
@@ -1414,7 +1417,7 @@ async fn videos_stream_inner(
         return Ok(no_streams_response().into_response());
     };
     let descriptor = si.descriptor;
-    if !descriptor.is_alive().await {
+    if descriptor.is_known_dead() {
         tracing::warn!(
             item = %id,
             media = %media.id,
