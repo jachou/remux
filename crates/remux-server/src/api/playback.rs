@@ -523,6 +523,31 @@ async fn items_playbackinfo_inner(
             .as_ref()
             .is_some_and(|pd| pd.video_stream().is_some() && !pd.is_filename_guess())
     });
+
+    // Fast-Start pre-warm: kickoff background download of the primary stream's 16 MB head buffer
+    // so it is downloading into RAM while the client processes the PlaybackInfo response.
+    if let Some(first) = probed.results.first() {
+        let stream_info = first
+            .effective_stream
+            .stream_info
+            .as_ref()
+            .or(first.stream.stream_info.as_ref());
+        if let Some(si) = stream_info {
+            if let crate::stream::StreamDescriptor::Http {
+                url,
+                request_headers,
+                ..
+            } = &si.descriptor
+            {
+                let url_clone = url.clone();
+                let headers_clone = request_headers.clone();
+                let item_id = id;
+                tokio::spawn(async move {
+                    crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
+                });
+            }
+        }
+    }
     let mut media_sources = Vec::with_capacity(
         probed
             .results
@@ -1577,7 +1602,7 @@ async fn videos_stream_inner(
         // directly to the stream URL instead of proxying bytes through remux —
         // unless the URL's host is only reachable from remux's own network, in
         // which case a client redirected there would just fail to connect.
-        if let (Some(addon_id), crate::stream::StreamDescriptor::Http { url, .. }) =
+        if let (Some(addon_id), crate::stream::StreamDescriptor::Http { url, request_headers, .. }) =
             (si.addon_id, &descriptor)
         {
             // Fail closed: a URL we can't parse, or one with no host, is not
@@ -1602,7 +1627,7 @@ async fn videos_stream_inner(
                     .unwrap_or(false)
             {
                 // Fast-Start acceleration: serve head/tail buffer from RAM, or redirect directly to CDN
-                if let Some(resp) = crate::fast_start::handle_playback_request(id, url, &headers).await {
+                if let Some(resp) = crate::fast_start::handle_playback_request(id, url, &headers, Some(request_headers)).await {
                     return Ok(resp);
                 }
 

@@ -274,13 +274,14 @@ pub async fn handle_playback_request(
     item_id: Uuid,
     url: &str,
     headers: &HeaderMap,
+    upstream_headers: Option<&HashMap<String, String>>,
 ) -> Option<Response> {
     // 1. Direct lookup by URL, or fallback to Item ID mapping
     let mut entry = FAST_START_CACHE
         .get(url)
         .or_else(|| ITEM_TO_STREAM_URL.get(&item_id).and_then(|u| FAST_START_CACHE.get(&u)));
 
-    // 2. If not cached, check if background pre-warm is currently in flight for this stream
+    // 2. If not cached, await in-flight prewarm up to 4000ms
     if entry.is_none() {
         let candidate_url = if PREWARM_LOCKS.contains_key(&url.to_string()) {
             Some(url.to_string())
@@ -289,9 +290,9 @@ pub async fn handle_playback_request(
         };
 
         if let Some(c_url) = candidate_url {
-            info!(%item_id, %c_url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 3000ms");
+            info!(%item_id, %c_url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 4000ms");
             let _ = tokio::time::timeout(
-                Duration::from_millis(3000),
+                Duration::from_millis(4000),
                 PREWARM_LOCKS.lock_if_exists(&c_url),
             )
             .await;
@@ -304,6 +305,15 @@ pub async fn handle_playback_request(
             if entry.is_some() {
                 info!(%item_id, "[FAST-START] In-flight pre-warm successfully coalesced into cache!");
             }
+        } else {
+            // Uncached and nothing in-flight: don't block this request.
+            // Spawn pre-warm in background so subsequent ranges/seeks benefit, but immediately fall through to 307 redirect.
+            info!(%item_id, %url, "[FAST-START] Uncached & not in-flight: spawning background pre-warm and immediately falling back to direct redirect");
+            let url_str = url.to_string();
+            let headers_clone = upstream_headers.cloned().unwrap_or_default();
+            tokio::spawn(async move {
+                prewarm_fast_start(Some(item_id), &url_str, &headers_clone).await;
+            });
         }
     }
 
