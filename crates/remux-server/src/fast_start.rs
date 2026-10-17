@@ -289,9 +289,9 @@ pub async fn handle_playback_request(
         };
 
         if let Some(c_url) = candidate_url {
-            debug!(%item_id, %c_url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 1500ms");
+            info!(%item_id, %c_url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 3000ms");
             let _ = tokio::time::timeout(
-                Duration::from_millis(1500),
+                Duration::from_millis(3000),
                 PREWARM_LOCKS.lock_if_exists(&c_url),
             )
             .await;
@@ -300,6 +300,10 @@ pub async fn handle_playback_request(
             entry = FAST_START_CACHE
                 .get(url)
                 .or_else(|| ITEM_TO_STREAM_URL.get(&item_id).and_then(|u| FAST_START_CACHE.get(&u)));
+
+            if entry.is_some() {
+                info!(%item_id, "[FAST-START] In-flight pre-warm successfully coalesced into cache!");
+            }
         }
     }
 
