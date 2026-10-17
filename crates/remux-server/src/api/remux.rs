@@ -610,6 +610,11 @@ pub async fn remux_metrics_status(
     }))
 }
 
+#[get("/remux/faststart/stats")]
+pub async fn remux_faststart_stats() -> Result<impl IntoResponse> {
+    Ok(Json(crate::fast_start::stats_json()))
+}
+
 #[get("/remux/streams/{id}")]
 pub async fn remux_streams(
     State(state): State<AppState>,

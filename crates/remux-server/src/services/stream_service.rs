@@ -1325,6 +1325,16 @@ impl StreamService {
                     true
                 };
                 if is_alive {
+                    if let Some(si) = &stream.stream_info {
+                        if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                            let url_clone = url.clone();
+                            let headers_clone = request_headers.clone();
+                            let item_id = self.item_id;
+                            tokio::spawn(async move {
+                                crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
+                            });
+                        }
+                    }
                     return Ok(Some(stream.id));
                 }
             }
@@ -1367,6 +1377,16 @@ impl StreamService {
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         tracing::info!(item = %self.item_id, effective = %effective.id, "preemptive probe of Candidate #1 completed");
+        if let Some(si) = &effective.stream_info {
+            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                let url_clone = url.clone();
+                let headers_clone = request_headers.clone();
+                let item_id = self.item_id;
+                tokio::spawn(async move {
+                    crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
+                });
+            }
+        }
         Ok(Some(effective.id))
     }
 }
@@ -1463,6 +1483,15 @@ pub fn spawn_preemptive_probe(
                                     true
                                 };
                                 if is_alive {
+                                    if let Some(si) = &candidate.stream_info {
+                                        if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                                            let url_clone = url.clone();
+                                            let headers_clone = request_headers.clone();
+                                            tokio::spawn(async move {
+                                                crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
+                                            });
+                                        }
+                                    }
                                     prefetch_subtitles_for_media(&ctx, &media, user_id).await;
                                     return;
                                 }

@@ -1601,6 +1601,11 @@ async fn videos_stream_inner(
                     })
                     .unwrap_or(false)
             {
+                // Fast-Start acceleration: serve head/tail buffer from RAM, or redirect directly to CDN
+                if let Some(resp) = crate::fast_start::handle_playback_request(id, url, &headers) {
+                    return Ok(resp);
+                }
+
                 tracing::info!(item = %id, redirect_url = %url, "redirecting client to upstream stream (307)");
                 return Ok(axum::response::Redirect::temporary(url).into_response());
             }
