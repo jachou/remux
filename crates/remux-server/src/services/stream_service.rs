@@ -113,13 +113,16 @@ pub(crate) struct StreamService {
     pub streams: Vec<db::Media>,
 }
 
-fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
+pub(crate) fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
     let mut pool = streams.to_vec();
     pool.sort_by_cached_key(|stream| std::cmp::Reverse(stream.quality_weight()));
     pool
 }
 
 impl StreamService {
+    pub fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
+        quality_ordered_probe_pool(streams)
+    }
     /// Capability-ranks `items` best-first. `describe` yields each item's
     /// `MediaSourceInfo` and whether on-demand subtitle extraction is
     /// feasible for it (only ever true for a local source) — the one place
@@ -185,6 +188,13 @@ impl StreamService {
                         .is_some()
                 })
         {
+            if sources.len() >= 2 {
+                sources.sort_by_key(|s| {
+                    s.stream_info
+                        .as_ref()
+                        .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
+                });
+            }
             return Default::default();
         }
         let extraction = Self::subtitle_extraction_by_id(db, sources).await;
@@ -214,6 +224,11 @@ impl StreamService {
                 prefs.remembered_subtitle,
             );
             (info, allow_subtitle_extraction)
+        });
+        sources.sort_by_key(|s| {
+            s.stream_info
+                .as_ref()
+                .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
         });
         extraction
     }
@@ -394,7 +409,15 @@ impl StreamService {
                         .await
                         .unwrap_or_default();
                 candidates.extend(cascade);
-                Ok(candidates.remove(0))
+                let best = candidates
+                    .iter()
+                    .position(|s| {
+                        !s.stream_info
+                            .as_ref()
+                            .map_or(false, |si| si.descriptor.is_known_dead())
+                    })
+                    .unwrap_or(0);
+                Ok(candidates.remove(best))
             }
             db::MediaKind::Movie
             | db::MediaKind::Episode
@@ -441,7 +464,7 @@ impl StreamService {
                     let by_pref = saved.and_then(|sid| {
                         sources
                             .iter()
-                            .find(|s| s.id == *sid)
+                            .find(|s| s.id == *sid && is_not_known_dead(s))
                             .cloned()
                     });
                     by_pref
@@ -504,6 +527,11 @@ impl StreamService {
         .await
         .unwrap_or_default();
         candidates.extend(cascade);
+        candidates.sort_by_key(|s| {
+            s.stream_info
+                .as_ref()
+                .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
+        });
         self.stream = Some(candidates[0].clone());
         self.group = Some((gid, gtitle, candidates));
         Ok(())
@@ -1062,6 +1090,28 @@ impl StreamService {
             );
     }
 
+    /// Records stream selection for both play session and device.
+    pub fn record_stream_selection(
+        ctx: &AppContext,
+        device_id: Option<&str>,
+        item_id: Uuid,
+        source_id: Uuid,
+        effective_stream_id: Uuid,
+        play_session_id: Option<&str>,
+    ) {
+        if let Some(psid) = play_session_id {
+            ctx.store.save(
+                Self::selected_stream_key(psid, source_id),
+                effective_stream_id,
+                std::time::Duration::from_secs(24 * 3600),
+            );
+        }
+        if let Some(dev_id) = device_id {
+            Self::save_device_selection(ctx, dev_id, item_id, source_id, effective_stream_id);
+            Self::save_device_selection(ctx, dev_id, item_id, item_id, effective_stream_id);
+        }
+    }
+
     /// The stream PlaybackInfo selected when it answered `play_session_id`
     /// with `source_id` (item, group, or stream ID), if any.
     pub fn selected_stream_for(
@@ -1399,11 +1449,11 @@ pub fn spawn_preemptive_probe(
                             .as_ref()
                             .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
                     });
-                    if let Some(top) = pool.first() {
-                        if let Some(pd) = &top.probe_data {
+                    for candidate in pool.iter() {
+                        if let Some(pd) = &candidate.probe_data {
                             if is_reusable_probe_cache(pd) {
-                                tracing::info!(%item_id, stream_id = %top.id, "Candidate #1 already probed in DB; pre-warming liveness");
-                                let is_alive = if let Some(si) = &top.stream_info {
+                                tracing::info!(%item_id, stream_id = %candidate.id, "Candidate already probed in DB; pre-warming liveness");
+                                let is_alive = if let Some(si) = &candidate.stream_info {
                                     if si.descriptor.is_liveness_expiring_soon() {
                                         si.descriptor.refresh_liveness().await
                                     } else {
@@ -2567,5 +2617,75 @@ mod tests {
 
         super::QUEUED_PROBES.remove(&owner.id);
         assert!(!super::QUEUED_PROBES.contains(&owner.id));
+    }
+
+    #[tokio::test]
+    async fn rank_media_sources_partitions_known_dead_streams_to_the_end() {
+        use crate::integration_test::authenticated_server;
+        use crate::stream::{HttpSource, LivenessEntry, STREAM_LIVENESS_CACHE};
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+
+        let dead_url = "http://dead.stream.test/video.mkv".to_string();
+        STREAM_LIVENESS_CACHE.insert(dead_url.clone(), LivenessEntry::new(false));
+
+        let dead_stream = db::Media {
+            id: Uuid::new_v4(),
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Http {
+                    url: dead_url.clone(),
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                },
+                filename: Some("Movie.2024.2160p.UHD.Remux.mkv".into()),
+                size: Some(50_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let alive_stream = db::Media {
+            id: Uuid::new_v4(),
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Http {
+                    url: "http://alive.stream.test/video.mkv".into(),
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                },
+                filename: Some("Movie.2024.1080p.mkv".into()),
+                size: Some(10_000_000_000),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut sources = vec![dead_stream.clone(), alive_stream.clone()];
+
+        StreamService::rank_media_sources(
+            &ctx.db,
+            &mut sources,
+            SourceRankingContext {
+                mode: remux_sdks::remux::SortMediaSourcesMode::Quality,
+                device_profile: None,
+                is_4k_capable: true,
+                subtitle_mode: Default::default(),
+                explicit_subtitle_index: None,
+                max_bitrate: None,
+            },
+            DefaultStreamPrefs {
+                user_cfg: &api::UserConfiguration::default(),
+                server_metadata_language: None,
+                original_language: None,
+                requested_audio: None,
+                requested_subtitle: None,
+                remembered_audio: None,
+                remembered_subtitle: None,
+            },
+        )
+        .await;
+
+        assert_eq!(sources[0].id, alive_stream.id, "Alive stream must be ranked first");
+        assert_eq!(sources[1].id, dead_stream.id, "Dead stream must be partitioned to the end");
     }
 }

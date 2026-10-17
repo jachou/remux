@@ -1394,7 +1394,7 @@ async fn videos_stream_inner(
 
     // Both fallthroughs serve the no-streams placeholder with HTTP 200 (the
     // client plays a blank clip). Log why, or the failure is invisible.
-    let media = match media {
+    let mut media = match media {
         Ok(m) => m,
         Err(e) => {
             tracing::warn!(
@@ -1405,7 +1405,7 @@ async fn videos_stream_inner(
             return Ok(no_streams_response().into_response());
         }
     };
-    let Some(si) = media
+    let Some(mut si) = media
         .stream_info
         .clone()
     else {
@@ -1416,14 +1416,58 @@ async fn videos_stream_inner(
         );
         return Ok(no_streams_response().into_response());
     };
-    let descriptor = si.descriptor;
+    let mut descriptor = si.descriptor.clone();
     if descriptor.is_known_dead() {
         tracing::warn!(
             item = %id,
             media = %media.id,
-            "resolved stream is confirmed dead; serving no-streams placeholder"
+            "resolved stream is confirmed dead; searching for healthy sibling candidate"
         );
-        return Ok(no_streams_response().into_response());
+        let parent_id = media.parent_id.unwrap_or(id);
+        let mut fallback = None;
+        if let Ok(Some(mut parent_media)) =
+            MediaResolveService::resolve_item(parent_id, &state.ctx).await
+        {
+            if let Ok(streams) = parent_media.streams(&state.ctx.db).await {
+                let mut pool = StreamService::quality_ordered_probe_pool(&streams);
+                pool.retain(|s| {
+                    s.id != media.id
+                        && !s
+                            .stream_info
+                            .as_ref()
+                            .map_or(false, |si| si.descriptor.is_known_dead())
+                });
+                if let Some(cand) = pool.into_iter().next() {
+                    fallback = Some(cand);
+                }
+            }
+        }
+        if let Some(cand) = fallback {
+            tracing::info!(
+                item = %id,
+                dead_stream = %media.id,
+                fallback_stream = %cand.id,
+                "seamlessly falling back to healthy sibling stream"
+            );
+            if let Some(new_si) = cand.stream_info.clone() {
+                descriptor = new_si.descriptor.clone();
+                si = new_si;
+                media = cand;
+                let source_id = q.media_source_id.unwrap_or(id);
+                StreamService::record_stream_selection(
+                    &state.ctx,
+                    device_id.as_deref(),
+                    id,
+                    source_id,
+                    media.id,
+                    q.play_session_id.as_deref(),
+                );
+            } else {
+                return Ok(no_streams_response().into_response());
+            }
+        } else {
+            return Ok(no_streams_response().into_response());
+        }
     }
     let encoding_opts = crate::db::Settings::get_encoding_config(
         &state

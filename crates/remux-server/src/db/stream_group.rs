@@ -286,10 +286,19 @@ impl StreamGroup {
             }
 
             if !group.hidden {
-                // Only the first (highest-priority) match is shown.
+                // Pick the first match that is not known to be dead.
                 // group_id marks it as a group representative; the real stream
                 // UUID stays in best.id so internal probe URLs stay correct.
-                let mut best = matching[0].clone();
+                let representative = matching
+                    .iter()
+                    .find(|s| {
+                        !s.stream_info
+                            .as_ref()
+                            .map_or(false, |si| si.descriptor.is_known_dead())
+                    })
+                    .copied()
+                    .unwrap_or(matching[0]);
+                let mut best = representative.clone();
                 best.title = group.display_name();
                 best.group_id = Some(group.id);
                 result.push(best);
