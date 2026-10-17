@@ -673,9 +673,16 @@ impl StreamService {
         prefs: DefaultStreamPrefs<'_>,
     ) -> anyhow::Result<ProbedStreams> {
         let mut sel = self.select_streams();
-        let (candidates, extraction) = self
+        let (mut candidates, extraction) = self
             .rank_candidates(std::mem::take(&mut sel.candidates), ranking, prefs)
             .await;
+        // Partition known-dead streams to the end so a dead candidate is never
+        // chosen as the primary auto-play candidate.
+        candidates.sort_by_key(|s| {
+            s.stream_info
+                .as_ref()
+                .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
+        });
         sel.candidates = candidates;
         let preferred_probe_id = if sel.specific_requested {
             None

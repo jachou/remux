@@ -338,6 +338,7 @@ impl StreamDescriptor {
             Err(e) => {
                 let elapsed = start.elapsed();
                 tracing::warn!(%url, error = %e, ?elapsed, "liveness check request error");
+                STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
                 false
             }
         }
@@ -1209,5 +1210,25 @@ mod tests {
             },
         );
         assert!(desc.is_liveness_expiring_soon());
+    }
+
+    #[tokio::test]
+    async fn stream_descriptor_is_alive_caches_failure_on_network_error() {
+        let test_url = format!("http://127.0.0.1:1/nonexistent_{}", uuid::Uuid::new_v4());
+        let desc = StreamDescriptor::Http {
+            url: test_url.clone(),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+
+        // Before check, not in cache
+        assert!(!desc.is_known_dead());
+
+        // is_alive() attempts connection, fails, returns false
+        assert!(!desc.is_alive().await);
+
+        // After failure, must be recorded as dead in cache
+        assert_eq!(STREAM_LIVENESS_CACHE.get(&test_url).map(|e| e.alive), Some(false));
+        assert!(desc.is_known_dead());
     }
 }

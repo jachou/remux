@@ -1281,6 +1281,7 @@ pub(crate) async fn probe_stream(
         .probe_data
         .as_ref()
         .is_some_and(can_fallback_to_stale_probe_cache);
+    let mut primary_alive = true;
     if let Some(cached) = &stream.probe_data {
         if is_reusable_probe_cache(cached) {
             let alive = match stream
@@ -1300,14 +1301,23 @@ pub(crate) async fn probe_stream(
                 apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
                 return Ok((info, stream.clone()));
             }
+            primary_alive = false;
             debug!(id = %stream.id, "probe cache hit but url dead, falling through to fallback");
         } else {
             debug!(id = %stream.id, "probe cache stale or filename-guess only, re-probing");
         }
     }
+    if stream
+        .stream_info
+        .as_ref()
+        .is_some_and(|si| si.descriptor.is_known_dead())
+    {
+        primary_alive = false;
+    }
+    let probe_primary_url = if primary_alive { url_opt } else { None };
     let result = probe_with_fallback(
         stream.clone(),
-        url_opt,
+        probe_primary_url,
         timeout_secs,
         auto_next_stream,
         max_retries,
@@ -1450,10 +1460,18 @@ where
         let url = match url_opt {
             Some(u) => u,
             None => {
-                warn!(id = %stream.id, "skipping stream with no URL");
+                warn!(id = %stream.id, "skipping dead or unconfigured stream with no URL");
                 continue;
             }
         };
+        if stream
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| si.descriptor.is_known_dead())
+        {
+            info!(id = %stream.id, %url, "skipping candidate known to be dead in liveness cache");
+            continue;
+        }
         attempts += 1;
         if is_retry {
             info!(
@@ -1462,6 +1480,31 @@ where
                 next_url = %url,
                 "probe failed, trying next matching stream"
             );
+        }
+
+        if is_retry && let Some(cached) = &stream.probe_data {
+            if is_reusable_probe_cache(cached) {
+                let alive = match stream
+                    .stream_info
+                    .as_ref()
+                    .map(|si| &si.descriptor)
+                {
+                    Some(d) => d.is_alive().await,
+                    None => true,
+                };
+                if alive {
+                    info!(
+                        failed_id = %primary.id,
+                        next_id = %stream.id,
+                        fallback_url = %url,
+                        attempt = attempts,
+                        "probe cache hit on fallback stream"
+                    );
+                    let mut info = api::MediaSourceInfo::from(stream.clone());
+                    apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+                    return Ok((info, stream));
+                }
+            }
         }
         let url2 = url.clone();
         let stream2 = stream.clone();
