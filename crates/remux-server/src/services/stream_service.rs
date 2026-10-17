@@ -1245,9 +1245,14 @@ impl StreamService {
                 max_bitrate: device_profile.as_ref().and_then(|p| p.max_streaming_bitrate),
             });
 
-            let (ranked, _) = self
+            let (mut ranked, _) = self
                 .rank_candidates(std::mem::take(&mut sel.candidates), ranking, ranking_prefs)
                 .await;
+            ranked.sort_by_key(|s| {
+                s.stream_info
+                    .as_ref()
+                    .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
+            });
             sel.candidates = ranked;
         }
 
@@ -1260,14 +1265,18 @@ impl StreamService {
         if let Some(cached) = &stream.probe_data {
             if is_reusable_probe_cache(cached) {
                 tracing::info!(item = %self.item_id, stream = %stream.id, "Candidate #1 already has reusable probe data; pre-warming liveness");
-                if let Some(si) = &stream.stream_info {
+                let is_alive = if let Some(si) = &stream.stream_info {
                     if si.descriptor.is_liveness_expiring_soon() {
-                        si.descriptor.refresh_liveness().await;
+                        si.descriptor.refresh_liveness().await
                     } else {
-                        si.descriptor.is_alive().await;
+                        si.descriptor.is_alive().await
                     }
+                } else {
+                    true
+                };
+                if is_alive {
+                    return Ok(Some(stream.id));
                 }
-                return Ok(Some(stream.id));
             }
         }
         let timeout = probe_cfg.probe_timeout_secs.unwrap_or(20) as u64;
@@ -1384,20 +1393,29 @@ pub fn spawn_preemptive_probe(
         if is_stream_cache_fresh {
             if let Ok(streams) = check_media.streams(&ctx.db).await {
                 if !streams.is_empty() {
-                    let pool = quality_ordered_probe_pool(&streams);
+                    let mut pool = quality_ordered_probe_pool(&streams);
+                    pool.sort_by_key(|s| {
+                        s.stream_info
+                            .as_ref()
+                            .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
+                    });
                     if let Some(top) = pool.first() {
                         if let Some(pd) = &top.probe_data {
                             if is_reusable_probe_cache(pd) {
                                 tracing::info!(%item_id, stream_id = %top.id, "Candidate #1 already probed in DB; pre-warming liveness");
-                                if let Some(si) = &top.stream_info {
+                                let is_alive = if let Some(si) = &top.stream_info {
                                     if si.descriptor.is_liveness_expiring_soon() {
-                                        si.descriptor.refresh_liveness().await;
+                                        si.descriptor.refresh_liveness().await
                                     } else {
-                                        si.descriptor.is_alive().await;
+                                        si.descriptor.is_alive().await
                                     }
+                                } else {
+                                    true
+                                };
+                                if is_alive {
+                                    prefetch_subtitles_for_media(&ctx, &media, user_id).await;
+                                    return;
                                 }
-                                prefetch_subtitles_for_media(&ctx, &media, user_id).await;
-                                return;
                             }
                         }
                     }
