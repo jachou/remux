@@ -327,20 +327,8 @@ impl StreamDescriptor {
                 let is_ok = status.as_u16() < 400;
                 let elapsed = start.elapsed();
                 if is_ok {
-                    let final_url = r.url().to_string();
-                    let redirected = final_url != *url;
-                    tracing::info!(
-                        %url,
-                        final_url = %final_url,
-                        redirected,
-                        ?status,
-                        ?elapsed,
-                        "liveness check passed, cached"
-                    );
-                    STREAM_LIVENESS_CACHE.insert(
-                        url.clone(),
-                        LivenessEntry::new_with_resolved(true, Some(final_url)),
-                    );
+                    tracing::info!(%url, ?status, ?elapsed, "liveness check passed, cached");
+                    STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(true));
                 } else {
                     tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
@@ -371,12 +359,7 @@ impl StreamDescriptor {
         };
 
         if let Some(entry) = STREAM_LIVENESS_CACHE.get(url) {
-            tracing::info!(
-                %url,
-                alive = entry.alive,
-                has_resolved = entry.resolved_url.is_some(),
-                "liveness check cache hit"
-            );
+            tracing::info!(%url, alive = entry.alive, "liveness check cache hit");
             return entry.alive;
         }
 
@@ -389,18 +372,6 @@ impl StreamDescriptor {
             return false;
         };
         STREAM_LIVENESS_CACHE.get(url).is_some_and(|e| !e.alive)
-    }
-
-    /// If this is an HTTP stream whose liveness check already confirmed a final redirected
-    /// URL (such as a direct debrid CDN download URL), returns that resolved URL.
-    pub fn resolved_url(&self) -> Option<String> {
-        let Self::Http { url, .. } = self else {
-            return None;
-        };
-        STREAM_LIVENESS_CACHE
-            .get(url)
-            .filter(|e| e.alive)
-            .and_then(|e| e.resolved_url.clone())
     }
 
     /// Instantiate the runtime service for self-contained variants.
@@ -575,10 +546,9 @@ pub trait StreamSource: Send + Sync {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response>;
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LivenessEntry {
     pub alive: bool,
-    pub resolved_url: Option<String>,
     pub verified_at: std::time::Instant,
 }
 
@@ -586,15 +556,6 @@ impl LivenessEntry {
     pub fn new(alive: bool) -> Self {
         Self {
             alive,
-            resolved_url: None,
-            verified_at: std::time::Instant::now(),
-        }
-    }
-
-    pub fn new_with_resolved(alive: bool, resolved_url: Option<String>) -> Self {
-        Self {
-            alive,
-            resolved_url,
             verified_at: std::time::Instant::now(),
         }
     }
@@ -1244,45 +1205,9 @@ mod tests {
             test_url.clone(),
             LivenessEntry {
                 alive: true,
-                resolved_url: None,
                 verified_at: std::time::Instant::now() - std::time::Duration::from_secs(45 * 60),
             },
         );
         assert!(desc.is_liveness_expiring_soon());
-    }
-
-    #[tokio::test]
-    async fn stream_descriptor_is_alive_caches_resolved_url_after_redirect() {
-        let server = httpmock::MockServer::start();
-
-        let final_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/cdn/direct.mkv")
-                .header("Range", "bytes=0-0");
-            then.status(206);
-        });
-
-        let redirect_mock = server.mock(|when, then| {
-            when.method(httpmock::Method::GET)
-                .path("/proxy/stream.mkv");
-            then.status(302)
-                .header("Location", format!("{}/cdn/direct.mkv", server.base_url()));
-        });
-
-        let initial_url = format!("{}/proxy/stream.mkv", server.base_url());
-        let expected_cdn_url = format!("{}/cdn/direct.mkv", server.base_url());
-
-        let desc = StreamDescriptor::Http {
-            url: initial_url.clone(),
-            request_headers: Default::default(),
-            response_headers: Default::default(),
-        };
-
-        assert!(desc.is_alive().await);
-        assert_eq!(redirect_mock.hits(), 1);
-        assert_eq!(final_mock.hits(), 1);
-
-        // Verify resolved_url returns the final CDN destination
-        assert_eq!(desc.resolved_url(), Some(expected_cdn_url));
     }
 }
