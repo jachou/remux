@@ -1602,7 +1602,7 @@ async fn videos_stream_inner(
                     .unwrap_or(false)
             {
                 // Fast-Start acceleration: serve head/tail buffer from RAM, or redirect directly to CDN
-                if let Some(resp) = crate::fast_start::handle_playback_request(id, url, &headers) {
+                if let Some(resp) = crate::fast_start::handle_playback_request(id, url, &headers).await {
                     return Ok(resp);
                 }
 

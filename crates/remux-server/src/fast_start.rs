@@ -11,8 +11,8 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Head buffer size in bytes: 64 MB.
-pub const FAST_START_HEAD_SIZE: usize = 64 * 1024 * 1024;
+/// Head buffer size in bytes: 16 MB.
+pub const FAST_START_HEAD_SIZE: usize = 16 * 1024 * 1024;
 
 /// Tail buffer size for MKV Cues / seekhead index: 128 KB.
 pub const FAST_START_TAIL_SIZE: usize = 128 * 1024;
@@ -105,6 +105,11 @@ pub async fn prewarm_fast_start(
     original_url: &str,
     request_headers: &HashMap<String, String>,
 ) -> bool {
+    // Record item -> stream mapping right away so concurrent requests can find it
+    if let Some(id) = item_id {
+        ITEM_TO_STREAM_URL.insert(id, original_url.to_string());
+    }
+
     // If already pre-warmed and cached, skip!
     if let Some(entry) = FAST_START_CACHE.get(original_url) {
         if let Some(id) = item_id {
@@ -265,44 +270,85 @@ fn head_resp_host(url: &str) -> &str {
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///
 /// Returns `Some(Response)` if handled, or `None` if the stream is not cached.
-pub fn handle_playback_request(
+pub async fn handle_playback_request(
     item_id: Uuid,
     url: &str,
     headers: &HeaderMap,
 ) -> Option<Response> {
-    // Lookup by URL, or fallback to Item ID mapping
-    let entry = FAST_START_CACHE
+    // 1. Direct lookup by URL, or fallback to Item ID mapping
+    let mut entry = FAST_START_CACHE
         .get(url)
-        .or_else(|| ITEM_TO_STREAM_URL.get(&item_id).and_then(|u| FAST_START_CACHE.get(&u)))?;
+        .or_else(|| ITEM_TO_STREAM_URL.get(&item_id).and_then(|u| FAST_START_CACHE.get(&u)));
+
+    // 2. If not cached, check if background pre-warm is currently in flight for this stream
+    if entry.is_none() {
+        let candidate_url = if PREWARM_LOCKS.contains_key(&url.to_string()) {
+            Some(url.to_string())
+        } else {
+            ITEM_TO_STREAM_URL.get(&item_id).filter(|u| PREWARM_LOCKS.contains_key(u))
+        };
+
+        if let Some(c_url) = candidate_url {
+            debug!(%item_id, %c_url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 1500ms");
+            let _ = tokio::time::timeout(
+                Duration::from_millis(1500),
+                PREWARM_LOCKS.lock_if_exists(&c_url),
+            )
+            .await;
+
+            // Re-check cache after lock release
+            entry = FAST_START_CACHE
+                .get(url)
+                .or_else(|| ITEM_TO_STREAM_URL.get(&item_id).and_then(|u| FAST_START_CACHE.get(&u)));
+        }
+    }
+
+    let entry = entry?;
 
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
     match range_header {
-        // Case 1: Initial probe / head request (Range: bytes=0- or bytes=0-X or no range)
+        // Case 1: Initial probe / head request (Range: bytes=0- or bytes=0-X)
         Some(rng) if rng.starts_with("bytes=0-") || rng == "bytes=0-" => {
             METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
             let head_len = entry.head_bytes.len();
-            METRICS.bytes_served_lan.fetch_add(head_len as u64, Ordering::Relaxed);
+
+            // Check if client requested a bounded sub-range of the head
+            let requested_end = rng[6..]
+                .split('-')
+                .nth(1)
+                .and_then(|s| s.parse::<usize>().ok());
+
+            let (slice, slice_len, end_offset) = match requested_end {
+                Some(end) if end < head_len => {
+                    let s = entry.head_bytes.slice(0..=end);
+                    let len = s.len();
+                    (s, len, end as u64)
+                }
+                _ => (entry.head_bytes.clone(), head_len, head_len.saturating_sub(1) as u64),
+            };
+
+            METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
 
             info!(
                 %item_id,
-                head_len,
+                slice_len,
                 total_size = entry.total_size,
                 "[FAST-START] Buffer hit (head): serving {} bytes locally over LAN",
-                head_len
+                slice_len
             );
 
-            let mut resp = Response::builder()
+            let resp = Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(header::CONTENT_TYPE, "video/x-matroska")
                 .header(
                     header::CONTENT_RANGE,
-                    format!("bytes 0-{}/{}", head_len.saturating_sub(1), entry.total_size),
+                    format!("bytes 0-{}/{}", end_offset, entry.total_size),
                 )
-                .header(header::CONTENT_LENGTH, head_len.to_string())
+                .header(header::CONTENT_LENGTH, slice_len.to_string())
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header("X-Remux-FastStart", "hit-head")
-                .body(Body::from(entry.head_bytes.clone()))
+                .body(Body::from(slice))
                 .unwrap();
 
             Some(resp)
