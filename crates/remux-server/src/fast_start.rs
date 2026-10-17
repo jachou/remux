@@ -32,6 +32,7 @@ pub struct FastStartEntry {
     pub total_size: u64,
     pub head_bytes: Bytes,
     pub tail_bytes: Option<Bytes>,
+    pub content_type: String,
     pub created_at: Instant,
 }
 
@@ -163,7 +164,10 @@ pub async fn prewarm_fast_start(
     };
 
     let status = head_resp.status();
-    if !status.is_success() && status != StatusCode::PARTIAL_CONTENT {
+    let is_partial = status == StatusCode::PARTIAL_CONTENT;
+    let is_ok = status == StatusCode::OK;
+
+    if !is_partial && !is_ok {
         METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
         warn!(%original_url, ?status, "[FAST-START] Pre-warm head request returned non-success status");
         return false;
@@ -172,7 +176,7 @@ pub async fn prewarm_fast_start(
     // Capture the direct CDN edge URL after Stremthru redirect
     let direct_cdn_url = head_resp.url().as_str().to_string();
 
-    // Parse total file size from Content-Range header: bytes 0-67108863/4694973563
+    // Parse total file size from Content-Range header: bytes 0-16777215/4694973563
     let total_size = head_resp
         .headers()
         .get(header::CONTENT_RANGE)
@@ -189,6 +193,26 @@ pub async fn prewarm_fast_start(
             return false;
         }
     };
+
+    // Safety guard against OOM: if upstream returned 200 OK (ignored Range), only allow if file is small (<= 16 MB)
+    if is_ok && total_size > (FAST_START_HEAD_SIZE + 1024) as u64 {
+        METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            %original_url,
+            total_size,
+            "[FAST-START] Upstream returned 200 OK instead of 206 Partial Content for large file; aborting to prevent OOM"
+        );
+        return false;
+    }
+
+    // Detect Content-Type from upstream response or file extension
+    let content_type = head_resp
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .filter(|ct| ct.starts_with("video/") || ct.starts_with("application/"))
+        .map(|ct| ct.to_string())
+        .unwrap_or_else(|| detect_content_type(original_url).to_string());
 
     // Read the head bytes
     let head_bytes = match head_resp.bytes().await {
@@ -211,11 +235,12 @@ pub async fn prewarm_fast_start(
         tail_req = tail_req.header(header::RANGE, tail_range);
 
         match tail_req.send().await {
-            Ok(r) if r.status().is_success() || r.status() == StatusCode::PARTIAL_CONTENT => {
+            // Tail fetch MUST be HTTP 206 Partial Content. If server returned 200 OK, it ignored Range!
+            Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
                 r.bytes().await.ok()
             }
             Ok(r) => {
-                warn!(%original_url, status = ?r.status(), "[FAST-START] Tail fetch returned non-200/206 status");
+                warn!(%original_url, status = ?r.status(), "[FAST-START] Tail fetch returned non-206 status (Range ignored or error)");
                 None
             }
             Err(e) => {
@@ -234,6 +259,7 @@ pub async fn prewarm_fast_start(
         total_size,
         head_bytes: head_bytes.clone(),
         tail_bytes: tail_bytes.clone(),
+        content_type,
         created_at: Instant::now(),
     };
 
@@ -276,38 +302,28 @@ pub async fn handle_playback_request(
     headers: &HeaderMap,
     upstream_headers: Option<&HashMap<String, String>>,
 ) -> Option<Response> {
-    // 1. Direct lookup by URL, or fallback to Item ID mapping
-    let mut entry = FAST_START_CACHE
-        .get(url)
-        .or_else(|| ITEM_TO_STREAM_URL.get(&item_id).and_then(|u| FAST_START_CACHE.get(&u)));
+    // 1. Direct lookup by exact URL to avoid stream hijacking if the user selected a different version/source
+    let mut entry = FAST_START_CACHE.get(url);
 
-    // 2. If not cached, await in-flight prewarm up to 4000ms
+    // 2. If not cached, await in-flight prewarm up to 4000ms for this exact URL
     if entry.is_none() {
-        let candidate_url = if PREWARM_LOCKS.contains_key(&url.to_string()) {
-            Some(url.to_string())
-        } else {
-            ITEM_TO_STREAM_URL.get(&item_id).filter(|u| PREWARM_LOCKS.contains_key(u))
-        };
-
-        if let Some(c_url) = candidate_url {
-            info!(%item_id, %c_url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 4000ms");
+        if PREWARM_LOCKS.contains_key(&url.to_string()) {
+            info!(%item_id, %url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 4000ms");
             let _ = tokio::time::timeout(
                 Duration::from_millis(4000),
-                PREWARM_LOCKS.lock_if_exists(&c_url),
+                PREWARM_LOCKS.lock_if_exists(&url.to_string()),
             )
             .await;
 
             // Re-check cache after lock release
-            entry = FAST_START_CACHE
-                .get(url)
-                .or_else(|| ITEM_TO_STREAM_URL.get(&item_id).and_then(|u| FAST_START_CACHE.get(&u)));
+            entry = FAST_START_CACHE.get(url);
 
             if entry.is_some() {
                 info!(%item_id, "[FAST-START] In-flight pre-warm successfully coalesced into cache!");
             }
         } else {
             // Uncached and nothing in-flight: don't block this request.
-            // Spawn pre-warm in background so subsequent ranges/seeks benefit, but immediately fall through to 307 redirect.
+            // Spawn pre-warm in background for this exact URL so subsequent seeks benefit, but immediately fall through to 307 redirect.
             info!(%item_id, %url, "[FAST-START] Uncached & not in-flight: spawning background pre-warm and immediately falling back to direct redirect");
             let url_str = url.to_string();
             let headers_clone = upstream_headers.cloned().unwrap_or_default();
@@ -354,7 +370,7 @@ pub async fn handle_playback_request(
 
             let resp = Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, "video/x-matroska")
+                .header(header::CONTENT_TYPE, &entry.content_type)
                 .header(
                     header::CONTENT_RANGE,
                     format!("bytes 0-{}/{}", end_offset, entry.total_size),
@@ -383,7 +399,7 @@ pub async fn handle_playback_request(
 
             let resp = Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, "video/x-matroska")
+                .header(header::CONTENT_TYPE, &entry.content_type)
                 .header(
                     header::CONTENT_RANGE,
                     format!("bytes 0-{}/{}", head_len.saturating_sub(1), entry.total_size),
@@ -402,42 +418,59 @@ pub async fn handle_playback_request(
             if let Some(ref tail) = entry.tail_bytes {
                 let tail_len = tail.len() as u64;
                 let tail_start = entry.total_size.saturating_sub(tail_len);
-                let req_start = parse_range_start(rng).unwrap_or(tail_start);
-                let offset = req_start.saturating_sub(tail_start) as usize;
+                if let Some(req_start) = parse_range_start(rng) {
+                    if req_start >= tail_start && req_start < entry.total_size {
+                        let offset = (req_start - tail_start) as usize;
+                        if offset < tail.len() {
+                            let requested_end = parse_range_end(rng);
+                            let max_end_offset = entry.total_size.saturating_sub(1);
+                            let (slice, slice_len, end_byte) = match requested_end {
+                                Some(req_end) if req_end >= req_start && req_end < max_end_offset => {
+                                    let end_in_tail = (req_end - tail_start) as usize;
+                                    let end_clamped = end_in_tail.min(tail.len() - 1);
+                                    let s = tail.slice(offset..=end_clamped);
+                                    let len = s.len();
+                                    (s, len, req_start + len as u64 - 1)
+                                }
+                                _ => {
+                                    let s = tail.slice(offset..);
+                                    let len = s.len();
+                                    (s, len, max_end_offset)
+                                }
+                            };
 
-                if offset < tail.len() {
-                    let slice = tail.slice(offset..);
-                    let slice_len = slice.len();
-                    METRICS.hits_tail.fetch_add(1, Ordering::Relaxed);
-                    METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
+                            METRICS.hits_tail.fetch_add(1, Ordering::Relaxed);
+                            METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
 
-                    info!(
-                        %item_id,
-                        req_start,
-                        slice_len,
-                        total_size = entry.total_size,
-                        "[FAST-START] Buffer hit (tail/cues): serving {} bytes locally over LAN",
-                        slice_len
-                    );
+                            info!(
+                                %item_id,
+                                req_start,
+                                slice_len,
+                                total_size = entry.total_size,
+                                "[FAST-START] Buffer hit (tail/cues): serving {} bytes locally over LAN",
+                                slice_len
+                            );
 
-                    let resp = Response::builder()
-                        .status(StatusCode::PARTIAL_CONTENT)
-                        .header(header::CONTENT_TYPE, "video/x-matroska")
-                        .header(
-                            header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}", req_start, entry.total_size - 1, entry.total_size),
-                        )
-                        .header(header::CONTENT_LENGTH, slice_len.to_string())
-                        .header(header::ACCEPT_RANGES, "bytes")
-                        .header("X-Remux-FastStart", "hit-tail")
-                        .body(Body::from(slice))
-                        .unwrap();
+                            let resp = Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(header::CONTENT_TYPE, &entry.content_type)
+                                .header(
+                                    header::CONTENT_RANGE,
+                                    format!("bytes {}-{}/{}", req_start, end_byte, entry.total_size),
+                                )
+                                .header(header::CONTENT_LENGTH, slice_len.to_string())
+                                .header(header::ACCEPT_RANGES, "bytes")
+                                .header("X-Remux-FastStart", "hit-tail")
+                                .body(Body::from(slice))
+                                .unwrap();
 
-                    return Some(resp);
+                            return Some(resp);
+                        }
+                    }
                 }
             }
 
-            // Fall through to direct CDN redirect if tail is missing
+            // Fall through to direct CDN redirect if tail is missing or sub-range not covered
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             info!(
                 %item_id,
@@ -477,13 +510,42 @@ fn parse_range_start(range_str: &str) -> Option<u64> {
     start_part.parse::<u64>().ok()
 }
 
+/// Helper to parse the ending byte from a Range header: "bytes=12345-67890" -> 67890
+fn parse_range_end(range_str: &str) -> Option<u64> {
+    if !range_str.starts_with("bytes=") {
+        return None;
+    }
+    let after_prefix = &range_str[6..];
+    let end_part = after_prefix.split('-').nth(1)?;
+    if end_part.is_empty() {
+        return None;
+    }
+    end_part.parse::<u64>().ok()
+}
+
 /// Determines whether a Range header is requesting the tail (MKV Cues / seekhead) region.
 fn is_tail_range(range_str: &str, total_size: u64) -> bool {
     let Some(start) = parse_range_start(range_str) else {
         return false;
     };
-    let tail_threshold = total_size.saturating_sub(FAST_START_TAIL_SIZE as u64 + 1024);
-    start >= tail_threshold
+    let tail_start = total_size.saturating_sub(FAST_START_TAIL_SIZE as u64);
+    start >= tail_start && start < total_size
+}
+
+/// Heuristically detects the MIME type from the file extension in a URL.
+fn detect_content_type(url: &str) -> &'static str {
+    let path = url.split('?').next().unwrap_or(url);
+    if path.ends_with(".mp4") || path.ends_with(".m4v") {
+        "video/mp4"
+    } else if path.ends_with(".webm") {
+        "video/webm"
+    } else if path.ends_with(".ts") {
+        "video/mp2t"
+    } else if path.ends_with(".avi") {
+        "video/x-msvideo"
+    } else {
+        "video/x-matroska"
+    }
 }
 
 /// Returns a JSON representation of all fast-start metrics and cached items.
