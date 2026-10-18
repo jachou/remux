@@ -266,8 +266,25 @@ pub fn db_state_to_dto(
     media: &db::Media,
 ) -> UserItemDataDto {
     use crate::common::ToRunTimeTicks;
-    let played_percentage = media
-        .runtime
+    let effective_runtime = media
+        .probe_data
+        .as_ref()
+        .and_then(|p| p.run_time_ticks)
+        .filter(|&t| t > 0)
+        .map(|t| t / 10_000_000)
+        .or_else(|| {
+            media
+                .sources
+                .as_deref()
+                .and_then(|s| s.first())
+                .and_then(|s| s.probe_data.as_ref())
+                .and_then(|p| p.run_time_ticks)
+                .filter(|&t| t > 0)
+                .map(|t| t / 10_000_000)
+        })
+        .or(media.runtime);
+
+    let played_percentage = effective_runtime
         .filter(|&r| r > 0)
         .map(|r| (state.playback_position as f32 / r as f32 * 100.0).clamp(0.0, 100.0));
     UserItemDataDto {
@@ -589,10 +606,23 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             ..Default::default()
         }),
         run_time_ticks: media
-            .runtime
-            .map(|r| {
-                r.to_ticks(common::TickUnit::Seconds)
-                    .unwrap()
+            .probe_data
+            .as_ref()
+            .and_then(|p| p.run_time_ticks)
+            .filter(|ticks| *ticks > 0)
+            .or_else(|| {
+                media
+                    .sources
+                    .as_deref()
+                    .and_then(|s| s.first())
+                    .and_then(|s| s.probe_data.as_ref())
+                    .and_then(|p| p.run_time_ticks)
+                    .filter(|ticks| *ticks > 0)
+            })
+            .or_else(|| {
+                media
+                    .runtime
+                    .and_then(|r| r.to_ticks(common::TickUnit::Seconds))
             })
             .or_else(|| {
                 if let (Some(start), Some(end)) = (media.live_start, media.live_end) {
@@ -1109,6 +1139,15 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             .as_ref()
             .and_then(|s| s.first())
             .and_then(|s| s.bitrate);
+        if let Some(source_ticks) = item
+            .media_sources
+            .as_ref()
+            .and_then(|s| s.first())
+            .and_then(|s| s.run_time_ticks)
+            .filter(|ticks| *ticks > 0)
+        {
+            item.run_time_ticks = Some(source_ticks);
+        }
         if media.kind != db::MediaKind::Track {
             item.video_type = Some(VideoType::VideoFile);
         }

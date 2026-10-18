@@ -1672,6 +1672,8 @@ async fn resume_items(
     }
     let result = get_items(state.clone(), session.clone(), query, true)
         .await?
+        .preload_playlist_runtimes(&state.ctx.db)
+        .await
         .with_permissions()
         .with_client_patches()
         .build();
@@ -1731,8 +1733,10 @@ async fn resume_items(
                     *term = format!("local:{term}");
                 }
             }
-            let next_up = get_items(state, session, query, false)
+            let next_up = get_items(state.clone(), session, query, false)
                 .await?
+                .preload_playlist_runtimes(&state.ctx.db)
+                .await
                 .with_permissions()
                 .with_client_patches()
                 .build()

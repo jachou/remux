@@ -37,6 +37,29 @@ pub async fn shows_seasons(
     ResolvedItem(item): ResolvedItem,
     Query(mut q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    let series_id = item.id;
+    let user_id = session.user.id;
+    let ctx = state.ctx.clone();
+    tokio::spawn(async move {
+        if let Ok(Some(next_ep_id)) = sqlx::query_scalar::<_, Uuid>(
+            "SELECT m.id FROM media m \
+             LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
+             WHERE m.grandparent_id = ?2 \
+               AND m.kind = 'episode' \
+               AND m.parent_idx > 0 \
+               AND COALESCE(ums.play_count, 0) = 0 \
+             ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(series_id)
+        .fetch_optional(&ctx.db)
+        .await
+        {
+            crate::services::stream_service::spawn_preemptive_probe(&ctx, next_ep_id, Some(user_id));
+        }
+    });
+
     q.parent_id = Some(item.id);
     q.include_item_types = Some(vec![api::MediaType::Season]);
     if q.sort_by

@@ -1325,26 +1325,33 @@ impl StreamService {
             .get::<Uuid>(format!("gitem:{}:{}", user_id, group_id))
             .map(|id| *id)
     }
-    /// Pre-emptively probe only the primary candidate (Candidate #1).
-    /// Skips probing if Candidate #1 is already cached with reusable probe data.
-    /// Does not probe or rewrite any other candidates.
-    pub async fn probe_primary_candidate(&self) -> anyhow::Result<Option<Uuid>> {
+    /// Resolves Candidate #1 for auto-play, matching the order PlaybackInfo presents to clients.
+    ///
+    /// Respects the user's last-active device profile, saved stream preferences (pstream),
+    /// subtitle configuration, and partitions known-dead streams to the end.
+    pub async fn resolve_primary_candidate(&self) -> anyhow::Result<(Option<db::Media>, StreamSelection)> {
         let mut sel = self.select_streams();
 
         let probe_cfg = db::Settings::get_config_or_default(&self.ctx.db).await;
         let sort_mode = probe_cfg.sort_media_sources.unwrap_or_default();
 
+        let (last_device, user) = if let Some(uid) = self.user_id {
+            let dev = db::auth::Device::get_last_active_for_user(&self.ctx.db, uid).await.ok().flatten();
+            let u = db::User::get_by_id(&self.ctx.db, &uid).await.ok().flatten();
+            (dev, u)
+        } else {
+            (None, None)
+        };
+
+        let saved_pref = if let Some(ref device) = last_device {
+            self.ctx.store.get::<Uuid>(&format!("pstream:{}:{}", self.item_id, device.id))
+        } else {
+            None
+        };
+
         if sort_mode != remux_sdks::remux::SortMediaSourcesMode::Disabled && sel.candidates.len() > 1 {
             let encoding_cfg = db::Settings::get_encoding_config(&self.ctx.db).await.unwrap_or_default();
             let subtitle_mode = encoding_cfg.subtitle_mode.unwrap_or_default();
-
-            let (last_device, user) = if let Some(uid) = self.user_id {
-                let dev = db::auth::Device::get_last_active_for_user(&self.ctx.db, uid).await.ok().flatten();
-                let u = db::User::get_by_id(&self.ctx.db, &uid).await.ok().flatten();
-                (dev, u)
-            } else {
-                (None, None)
-            };
 
             let (device_profile, is_4k) = if let Some(ref device) = last_device {
                 let dp = crate::jellyfin_client::merge_device_profile_subtitles(device, device.parsed_device_profile());
@@ -1396,9 +1403,20 @@ impl StreamService {
             sel.candidates = ranked;
         }
 
-        let primary = sel.candidates.first().cloned();
+        let primary = if let Some(pref_id) = saved_pref {
+            sel.candidates.iter().find(|s| s.id == *pref_id).cloned().or_else(|| sel.candidates.first().cloned())
+        } else {
+            sel.candidates.first().cloned()
+        };
 
-        let Some(stream) = primary else {
+        Ok((primary, sel))
+    }
+
+    /// Pre-emptively probe only the primary candidate (Candidate #1).
+    /// Skips probing if Candidate #1 is already cached with reusable probe data.
+    /// Does not probe or rewrite any other candidates.
+    pub async fn probe_primary_candidate(&self) -> anyhow::Result<Option<Uuid>> {
+        let (Some(stream), sel) = self.resolve_primary_candidate().await? else {
             return Ok(None);
         };
 
@@ -1429,6 +1447,7 @@ impl StreamService {
                 }
             }
         }
+        let probe_cfg = db::Settings::get_config_or_default(&self.ctx.db).await;
         let timeout = probe_cfg.probe_timeout_secs.unwrap_or(20) as u64;
         let timeout_p2p = probe_cfg.probe_timeout_p2p_secs.unwrap_or(60) as u64;
         let auto_next = probe_cfg.auto_next_stream_on_probe_fail.unwrap_or(true);
@@ -1542,56 +1561,6 @@ pub fn spawn_preemptive_probe(
             return;
         }
 
-        // Fast path: if streams exist in DB, streams TTL is not expired, and Candidate #1 already has reusable probe data, skip immediately!
-        let is_stream_cache_fresh = {
-            let ttl_secs = crate::addons::AddonService::stream_cache_ttl_secs(&media);
-            media.streams_refreshed_at.is_some_and(|r| {
-                (chrono::Utc::now().naive_utc() - r).num_seconds() < ttl_secs
-            })
-        };
-        let mut check_media = media.clone();
-        if is_stream_cache_fresh {
-            if let Ok(streams) = check_media.streams(&ctx.db).await {
-                if !streams.is_empty() {
-                    let mut pool = quality_ordered_probe_pool(&streams);
-                    pool.sort_by_key(|s| {
-                        s.stream_info
-                            .as_ref()
-                            .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
-                    });
-                    for candidate in pool.iter() {
-                        if let Some(pd) = &candidate.probe_data {
-                            if is_reusable_probe_cache(pd) {
-                                tracing::info!(%item_id, stream_id = %candidate.id, "Candidate already probed in DB; pre-warming liveness");
-                                let is_alive = if let Some(si) = &candidate.stream_info {
-                                    if si.descriptor.is_liveness_expiring_soon() {
-                                        si.descriptor.refresh_liveness().await
-                                    } else {
-                                        si.descriptor.is_alive().await
-                                    }
-                                } else {
-                                    true
-                                };
-                                if is_alive {
-                                    if let Some(si) = &candidate.stream_info {
-                                        if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                                            let url_clone = url.clone();
-                                            let headers_clone = request_headers.clone();
-                                            tokio::spawn(async move {
-                                                crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
-                                            });
-                                        }
-                                    }
-                                    prefetch_subtitles_for_media(&ctx, &media, user_id).await;
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let probe_cfg = db::Settings::get_config_or_default(&ctx.db).await;
         let show_ungrouped = probe_cfg.stream_groups_show_ungrouped.unwrap_or(true);
         let mut service = StreamService::new(StreamServiceConfig {
@@ -1602,6 +1571,42 @@ pub fn spawn_preemptive_probe(
             stream_filter: None,
             user_id,
         });
+
+        if let Err(e) = service.load(media.clone()).await {
+            tracing::warn!(%item_id, error = %e, "preemptive probe service.load failed");
+            return;
+        }
+
+        // Fast path: if Candidate #1 already has reusable probe data, pre-warm immediately without waiting for a semaphore permit!
+        if let Ok((Some(primary), _)) = service.resolve_primary_candidate().await {
+            if let Some(cached) = &primary.probe_data {
+                if is_reusable_probe_cache(cached) {
+                    tracing::info!(%item_id, stream_id = %primary.id, "Candidate #1 already probed in DB; pre-warming liveness");
+                    let is_alive = if let Some(si) = &primary.stream_info {
+                        if si.descriptor.is_liveness_expiring_soon() {
+                            si.descriptor.refresh_liveness().await
+                        } else {
+                            si.descriptor.is_alive().await
+                        }
+                    } else {
+                        true
+                    };
+                    if is_alive {
+                        if let Some(si) = &primary.stream_info {
+                            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                                let url_clone = url.clone();
+                                let headers_clone = request_headers.clone();
+                                tokio::spawn(async move {
+                                    crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
+                                });
+                            }
+                        }
+                        prefetch_subtitles_for_media(&ctx, &media, Some(&primary), user_id).await;
+                        return;
+                    }
+                }
+            }
+        }
 
         let _permit = match tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -1629,14 +1634,11 @@ pub fn spawn_preemptive_probe(
         }
         let _active_guard = ActiveGuard(item_id);
 
-        if let Err(e) = service.load(media.clone()).await {
-            tracing::warn!(%item_id, error = %e, "preemptive probe service.load failed");
-            return;
-        }
         match service.probe_primary_candidate().await {
             Ok(Some(stream_id)) => {
                 tracing::info!(%item_id, %stream_id, "preemptive probe finished successfully");
-                prefetch_subtitles_for_media(&ctx, &media, user_id).await;
+                let primary = service.streams.iter().find(|s| s.id == stream_id);
+                prefetch_subtitles_for_media(&ctx, &media, primary, user_id).await;
             }
             Ok(None) => {
                 tracing::debug!(%item_id, "preemptive probe found no candidate streams");
@@ -1651,6 +1653,7 @@ pub fn spawn_preemptive_probe(
 async fn prefetch_subtitles_for_media(
     ctx: &crate::AppContext,
     media: &db::Media,
+    primary_candidate: Option<&db::Media>,
     user_id: Option<Uuid>,
 ) {
     let mut item_media = media.clone();
@@ -1662,32 +1665,33 @@ async fn prefetch_subtitles_for_media(
         .clone()
         .unwrap_or_default();
 
+    let target_stream = primary_candidate.cloned().or_else(|| {
+        streams_res.as_ref().ok().and_then(|streams| {
+            quality_ordered_probe_pool(streams).first().cloned()
+        })
+    });
+
     // If Candidate #1 already has matching embedded subtitles in its probe data,
     // skip prefetching external subtitles!
-    if let Ok(ref streams) = streams_res {
-        if let Some(top) = quality_ordered_probe_pool(streams).first() {
-            if let Some(ref pd) = top.probe_data {
-                if has_matching_embedded_subtitles(pd, &sub_langs) {
-                    tracing::debug!(
-                        item_id = %media.id,
-                        "Candidate #1 already has matching embedded subtitles in DB; skipping external subtitle prefetch"
-                    );
-                    let _ = seg_media.grandparent(&ctx.db).await;
-                    ctx.addons.fetch_segments(&seg_media, ctx, true).await;
-                    return;
-                }
+    if let Some(ref target) = target_stream {
+        if let Some(ref pd) = target.probe_data {
+            if has_matching_embedded_subtitles(pd, &sub_langs) {
+                tracing::debug!(
+                    item_id = %media.id,
+                    stream_id = %target.id,
+                    "Candidate #1 already has matching embedded subtitles in DB; skipping external subtitle prefetch"
+                );
+                let _ = seg_media.grandparent(&ctx.db).await;
+                ctx.addons.fetch_segments(&seg_media, ctx, true).await;
+                return;
             }
         }
     }
 
-    let query = if let Ok(ref streams) = streams_res {
-        quality_ordered_probe_pool(streams)
-            .first()
-            .map(|s| subtitle_query_for(s))
-            .unwrap_or_default()
-    } else {
-        crate::addons::SubtitleQuery::default()
-    };
+    let query = target_stream
+        .as_ref()
+        .map(|s| subtitle_query_for(s))
+        .unwrap_or_default();
     let (subs, _) = tokio::join!(
         ctx.addons
             .fetch_subtitles(&mut item_media, &query, ctx, true, user_id),

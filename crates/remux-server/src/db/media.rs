@@ -2073,6 +2073,70 @@ impl Media {
         }
     }
 
+    /// Preload the primary probed stream runtime for Movies and Episodes where
+    /// `sources` have not been populated. Sets `media.probe_data.run_time_ticks`
+    /// and `media.runtime` so DTO conversion (e.g. Continue Watching) aligns with
+    /// the actual stream duration, preventing percentage-based resume scaling bugs.
+    pub async fn preload_stream_runtimes(db: &SqlitePool, records: &mut [Self]) {
+        let candidate_ids: Vec<Uuid> = records
+            .iter()
+            .filter(|m| {
+                matches!(m.kind, MediaKind::Movie | MediaKind::Episode)
+                    && m.sources.as_ref().map_or(true, |s| s.is_empty())
+            })
+            .map(|m| m.id)
+            .collect();
+        if candidate_ids.is_empty() {
+            return;
+        }
+
+        let mut runtime_map: std::collections::HashMap<Uuid, i64> = Default::default();
+
+        for chunk in candidate_ids.chunks(SQLITE_VAR_LIMIT) {
+            let mut qb = sqlx::QueryBuilder::new(
+                "SELECT parent_id, CAST(json_extract(probe_data, '$.RunTimeTicks') AS INTEGER) FROM media WHERE kind = 'stream' AND parent_id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            qb.push(") AND probe_data IS NOT NULL AND json_extract(probe_data, '$.RunTimeTicks') > 0 ORDER BY idx ASC");
+
+            match qb
+                .build()
+                .fetch_all(db)
+                .await
+            {
+                Ok(rows) => {
+                    for row in rows {
+                        let pid: Uuid = row.get(0);
+                        let ticks: Option<i64> = row.get(1);
+                        if let Some(ticks) = ticks {
+                            runtime_map.entry(pid).or_insert(ticks);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("failed to preload stream runtimes: {e}");
+                }
+            }
+        }
+
+        for media in records.iter_mut() {
+            if let Some(&ticks) = runtime_map.get(&media.id) {
+                media.runtime = Some(ticks / 10_000_000);
+                if let Some(ref mut p) = media.probe_data {
+                    p.run_time_ticks = Some(ticks);
+                } else {
+                    media.probe_data = Some(api::MediaSourceInfo {
+                        run_time_ticks: Some(ticks),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+    }
+
     /// Build a minimal Media stub with just id and title — used when preloaded
     /// parent/grandparent data is constructed inline rather than fetched from DB.
     pub fn stub(id: Uuid, title: impl Into<String>) -> Arc<Self> {

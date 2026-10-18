@@ -111,6 +111,7 @@ impl ItemsQueryResultBuilder {
     pub async fn preload_playlist_runtimes(mut self, db: &sqlx::SqlitePool) -> Self {
         if let ItemsSource::Raw(ref mut media) = self.items {
             db::Media::preload_playlist_runtimes(db, media).await;
+            db::Media::preload_stream_runtimes(db, media).await;
         }
         self
     }
@@ -2344,6 +2345,23 @@ async fn item_for_user(
         base_item.location_type = api::LocationType::Virtual;
         base_item.path = None;
         base_item.can_download = Some(false);
+    }
+
+    if let Some(source_ticks) = base_item
+        .media_sources
+        .as_ref()
+        .and_then(|s| s.first())
+        .and_then(|s| s.run_time_ticks)
+        .filter(|t| *t > 0)
+    {
+        base_item.run_time_ticks = Some(source_ticks);
+        if let Some(ref mut ud) = base_item.user_data {
+            let runtime_secs = source_ticks / 10_000_000;
+            if runtime_secs > 0 {
+                let pos_secs = ud.playback_position_ticks / 10_000_000;
+                ud.played_percentage = Some((pos_secs as f32 / runtime_secs as f32 * 100.0).clamp(0.0, 100.0)).filter(|&p| p > 0.0);
+            }
+        }
     }
 
     apply_permissions(&mut base_item, &session.user);
