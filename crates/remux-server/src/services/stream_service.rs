@@ -1506,7 +1506,7 @@ pub(crate) static ACTIVE_PROBES: std::sync::LazyLock<
     dashmap::DashMap<Uuid, std::sync::Arc<tokio::sync::Notify>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(3));
 
 /// If a preemptive probe is actively executing (holding a worker permit) for `item_id`,
 /// await its completion up to 3 seconds so foreground PlaybackInfo coalesces with it.
@@ -1552,6 +1552,20 @@ pub fn spawn_preemptive_probe(
             }
         }
         let _queued_guard = QueuedGuard(item_id);
+
+        // Mark as actively running from start so foreground PlaybackInfo coalesces
+        // with in-flight discovery, liveness, and ffprobe
+        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+        ACTIVE_PROBES.insert(item_id, notify.clone());
+        struct ActiveGuard(Uuid);
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                if let Some((_, notify)) = ACTIVE_PROBES.remove(&self.0) {
+                    notify.notify_waiters();
+                }
+            }
+        }
+        let _active_guard = ActiveGuard(item_id);
 
         let Ok(Some(media)) = db::Media::get_by_id(&ctx.db, &item_id).await else {
             return;
@@ -1620,19 +1634,6 @@ pub fn spawn_preemptive_probe(
                 return;
             }
         };
-
-        // Acquired permit: mark as actively running so foreground PlaybackInfo can coalesce with it
-        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        ACTIVE_PROBES.insert(item_id, notify.clone());
-        struct ActiveGuard(Uuid);
-        impl Drop for ActiveGuard {
-            fn drop(&mut self) {
-                if let Some((_, notify)) = ACTIVE_PROBES.remove(&self.0) {
-                    notify.notify_waiters();
-                }
-            }
-        }
-        let _active_guard = ActiveGuard(item_id);
 
         match service.probe_primary_candidate().await {
             Ok(Some(stream_id)) => {

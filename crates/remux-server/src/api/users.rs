@@ -1769,17 +1769,7 @@ async fn resume_items(
     }
 
     if start == 0 {
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(14);
-        for target in items
-            .iter()
-            .filter(|i| {
-                i.user_data
-                    .as_ref()
-                    .and_then(|u| u.last_played_date)
-                    .map_or(true, |d| d >= cutoff)
-            })
-            .take(8)
-        {
+        for target in items.iter().take(8) {
             crate::services::stream_service::spawn_preemptive_probe(
                 &ctx,
                 target.id,

@@ -1834,7 +1834,10 @@ async fn item_for_user(
                  WHERE m.parent_id = ?2 \
                    AND m.kind = 'episode' \
                    AND COALESCE(ums.play_count, 0) = 0 \
-                 ORDER BY COALESCE(m.idx, 9999) ASC \
+                   AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
+                 ORDER BY \
+                   CASE WHEN COALESCE(ums.playback_position, 0) > 0 THEN 0 ELSE 1 END ASC, \
+                   COALESCE(m.idx, 9999) ASC \
                  LIMIT 1",
             )
             .bind(user_id)

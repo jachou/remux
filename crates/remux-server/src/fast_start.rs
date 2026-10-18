@@ -78,6 +78,10 @@ pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStart
 static PREWARM_LOCKS: LazyLock<crate::keyed_lock::KeyedLock<String>> =
     LazyLock::new(crate::keyed_lock::KeyedLock::new);
 
+/// Global semaphore limiting concurrent background pre-warms to 3 simultaneous chunk downloads.
+pub static FAST_START_PREWARM_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(3));
+
 /// Dedicated reqwest client for pre-warming (follows HTTP 302/307 redirects to CDN).
 static PREWARM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
@@ -88,7 +92,7 @@ static PREWARM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build fast-start prewarm client")
 });
 
-/// Pre-warms the head buffer (64 MB) and tail index (128 KB) for an upstream stream.
+/// Pre-warms the head buffer (16 MB) and tail index (256 KB) for an upstream stream.
 ///
 /// Runs asynchronously in the background. Follows upstream redirects (e.g. Stremthru -> Torbox CDN),
 /// resolves the direct CDN edge URL, and caches the bytes in memory.
@@ -115,6 +119,19 @@ pub async fn prewarm_fast_start(
     if FAST_START_CACHE.get(original_url).is_some() {
         return true;
     }
+
+    let _permit = match tokio::time::timeout(
+        Duration::from_secs(60),
+        FAST_START_PREWARM_SEMAPHORE.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        _ => {
+            warn!(%original_url, "[FAST-START] Timed out waiting for pre-warm semaphore permit, skipping");
+            return false;
+        }
+    };
 
     METRICS.prewarms_started.fetch_add(1, Ordering::Relaxed);
     let start_time = Instant::now();
