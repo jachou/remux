@@ -306,9 +306,11 @@ impl StreamDescriptor {
         // Singleflight: coalesce concurrent liveness checks on the same URL
         let _guard = LIVENESS_LOCKS.lock(url.clone()).await;
 
-        // Re-check cache after acquiring lock in case another in-flight check just completed
+        // Re-check cache after acquiring lock in case another in-flight check just completed recently
         if let Some(entry) = STREAM_LIVENESS_CACHE.get(url) {
-            return entry.alive;
+            if entry.verified_at.elapsed() < std::time::Duration::from_secs(30) {
+                return entry.alive;
+            }
         }
 
         let start = std::time::Instant::now();

@@ -41,22 +41,94 @@ pub async fn shows_seasons(
     let user_id = session.user.id;
     let ctx = state.ctx.clone();
     tokio::spawn(async move {
-        if let Ok(Some(next_ep_id)) = sqlx::query_scalar::<_, Uuid>(
+        // 1. First, check if there is an in-progress episode
+        let in_progress_id = sqlx::query_scalar::<_, Uuid>(
             "SELECT m.id FROM media m \
-             LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
+             JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
              WHERE m.grandparent_id = ?2 \
                AND m.kind = 'episode' \
                AND m.parent_idx > 0 \
+               AND ums.playback_position > 0 \
                AND COALESCE(ums.play_count, 0) = 0 \
-             ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
+             ORDER BY ums.last_played_at DESC \
              LIMIT 1",
         )
         .bind(user_id)
         .bind(series_id)
         .fetch_optional(&ctx.db)
         .await
-        {
-            crate::services::stream_service::spawn_preemptive_probe(&ctx, next_ep_id, Some(user_id));
+        .ok()
+        .flatten();
+
+        let target_ep_id = if let Some(id) = in_progress_id {
+            Some(id)
+        } else {
+            // 2. Check for the most recently active episode in the show
+            let recent = sqlx::query_as::<_, (Option<i64>, Option<i64>, i64, Uuid)>(
+                "SELECT m.parent_idx, m.idx, COALESCE(ums.play_count, 0), m.id FROM media m \
+                 JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
+                 WHERE m.grandparent_id = ?2 \
+                   AND m.kind = 'episode' \
+                   AND m.parent_idx > 0 \
+                   AND ums.last_played_at IS NOT NULL \
+                 ORDER BY ums.last_played_at DESC \
+                 LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(series_id)
+            .fetch_optional(&ctx.db)
+            .await
+            .ok()
+            .flatten();
+
+            if let Some((Some(p_idx), Some(idx), play_count, ep_id)) = recent {
+                if play_count == 0 {
+                    Some(ep_id)
+                } else {
+                    // Next episode after recently completed
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT m.id FROM media m \
+                         LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
+                         WHERE m.grandparent_id = ?2 \
+                           AND m.kind = 'episode' \
+                           AND m.parent_idx > 0 \
+                           AND COALESCE(ums.play_count, 0) = 0 \
+                           AND ((m.parent_idx = ?3 AND m.idx > ?4) OR (m.parent_idx > ?3)) \
+                         ORDER BY m.parent_idx ASC, m.idx ASC \
+                         LIMIT 1",
+                    )
+                    .bind(user_id)
+                    .bind(series_id)
+                    .bind(p_idx)
+                    .bind(idx)
+                    .fetch_optional(&ctx.db)
+                    .await
+                    .ok()
+                    .flatten()
+                }
+            } else {
+                // 3. Fallback: first unplayed regular episode from Season 1+
+                sqlx::query_scalar::<_, Uuid>(
+                    "SELECT m.id FROM media m \
+                     LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
+                     WHERE m.grandparent_id = ?2 \
+                       AND m.kind = 'episode' \
+                       AND m.parent_idx > 0 \
+                       AND COALESCE(ums.play_count, 0) = 0 \
+                     ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
+                     LIMIT 1",
+                )
+                .bind(user_id)
+                .bind(series_id)
+                .fetch_optional(&ctx.db)
+                .await
+                .ok()
+                .flatten()
+            }
+        };
+
+        if let Some(ep_id) = target_ep_id {
+            crate::services::stream_service::spawn_preemptive_probe(&ctx, ep_id, Some(user_id));
         }
     });
 
@@ -161,40 +233,71 @@ pub async fn shows_episodes(
 
 fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a api::BaseItemDto> {
     let now = chrono::Utc::now();
-    let unplayed_regular: Vec<_> = items
+    let regular_released: Vec<&'a api::BaseItemDto> = items
         .iter()
         .filter(|i| {
-            let is_unplayed = i.user_data.as_ref().map_or(true, |u| !u.played);
             let is_regular = i.parent_index_number.map_or(true, |s| s > 0);
             let is_released = i.premiere_date.map_or(true, |d| d <= now);
-            is_unplayed && is_regular && is_released
+            is_regular && is_released
         })
-        .take(2)
         .collect();
 
-    if !unplayed_regular.is_empty() {
-        unplayed_regular
-    } else {
-        // Fall back: if all unplayed regular episodes are played/none exist,
-        // probe the first released regular episodes (e.g. user rewatching or browsing completed show).
-        let regular_items: Vec<_> = items
-            .iter()
-            .filter(|i| {
-                let is_regular = i.parent_index_number.map_or(true, |s| s > 0);
-                let is_released = i.premiere_date.map_or(true, |d| d <= now);
-                is_regular && is_released
-            })
-            .take(2)
-            .collect();
-        if !regular_items.is_empty() {
-            regular_items
-        } else {
-            items
-                .iter()
-                .filter(|i| i.premiere_date.map_or(true, |d| d <= now))
-                .take(2)
-                .collect()
+    if regular_released.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. Check for in-progress episode
+    if let Some(pos) = regular_released.iter().position(|i| {
+        i.user_data
+            .as_ref()
+            .map_or(false, |u| !u.played && u.playback_position_ticks > 0)
+    }) {
+        return regular_released[pos..].iter().take(2).copied().collect();
+    }
+
+    // 2. Check for most recently played episode
+    if let Some((_, last_played_item)) = regular_released
+        .iter()
+        .filter_map(|i| {
+            i.user_data
+                .as_ref()
+                .and_then(|u| u.last_played_date)
+                .map(|d| (d, *i))
+        })
+        .max_by_key(|(d, _)| *d)
+    {
+        if let Some(pos) = regular_released.iter().position(|i| i.id == last_played_item.id) {
+            let start = if last_played_item.user_data.as_ref().map_or(false, |u| u.played) {
+                pos + 1
+            } else {
+                pos
+            };
+            if start < regular_released.len() {
+                let targets: Vec<&'a api::BaseItemDto> = regular_released[start..]
+                    .iter()
+                    .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
+                    .take(2)
+                    .copied()
+                    .collect();
+                if !targets.is_empty() {
+                    return targets;
+                }
+            }
         }
+    }
+
+    // 3. Fallback: first unplayed regular episodes from the start
+    let unplayed: Vec<&'a api::BaseItemDto> = regular_released
+        .iter()
+        .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
+        .take(2)
+        .copied()
+        .collect();
+
+    if !unplayed.is_empty() {
+        unplayed
+    } else {
+        regular_released.iter().take(2).copied().collect()
     }
 }
 

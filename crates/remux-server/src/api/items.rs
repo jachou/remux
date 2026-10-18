@@ -1814,13 +1814,37 @@ async fn item_for_user(
             .await
             .log_err("failed to refresh sources");
 
-        if matches!(media.kind, db::MediaKind::Movie) {
+        if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
             crate::services::stream_service::spawn_preemptive_probe(
                 &state.ctx,
                 media.id,
                 Some(session.user.id),
             );
         }
+    }
+
+    if media.kind == db::MediaKind::Season {
+        let season_id = media.id;
+        let user_id = session.user.id;
+        let ctx = state.ctx.clone();
+        tokio::spawn(async move {
+            if let Ok(Some(next_ep_id)) = sqlx::query_scalar::<_, Uuid>(
+                "SELECT m.id FROM media m \
+                 LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
+                 WHERE m.parent_id = ?2 \
+                   AND m.kind = 'episode' \
+                   AND COALESCE(ums.play_count, 0) = 0 \
+                 ORDER BY COALESCE(m.idx, 9999) ASC \
+                 LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(season_id)
+            .fetch_optional(&ctx.db)
+            .await
+            {
+                crate::services::stream_service::spawn_preemptive_probe(&ctx, next_ep_id, Some(user_id));
+            }
+        });
     }
 
     let user_stream_filter = session
