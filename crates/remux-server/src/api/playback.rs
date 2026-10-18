@@ -1382,6 +1382,8 @@ async fn videos_stream_inner(
     id: Uuid,
     q: api::VideoStreamQuery,
 ) -> Result<impl IntoResponse> {
+    let user_id = user_id.or(q.user_id);
+    let device_id = device_id.or(q.device_id.clone());
     let user = if let Some(user_id) = user_id {
         db::User::get_by_id(
             &state
@@ -1411,8 +1413,7 @@ async fn videos_stream_inner(
         &state.ctx,
         id,
         requested_id,
-        q.device_id
-            .as_deref(),
+        device_id.as_deref(),
         user_id,
     )
     .await;

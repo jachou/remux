@@ -2042,6 +2042,7 @@ pub struct VideoStreamQuery {
     #[serde(alias = "mediaSourceId")]
     pub media_source_id: Option<Uuid>,
     pub device_id: Option<String>,
+    pub user_id: Option<Uuid>,
     pub audio_codec: Option<String>,
     pub video_codec: Option<String>,
     /// Sample-entry fourcc for an HEVC stream copy (`hvc1`/`hev1`), resolved

@@ -456,6 +456,14 @@ impl StreamService {
                 let sources = media
                     .streams(&ctx.db)
                     .await?;
+                // Always order candidate sources by quality matching quality_ordered_probe_pool
+                // so auto-play selects the exact same candidate that preemptive probing and PlaybackInfo prioritize!
+                let mut sources = quality_ordered_probe_pool(&sources);
+                sources.sort_by_key(|s| {
+                    s.stream_info
+                        .as_ref()
+                        .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
+                });
                 // Here `requested_id` resolved to a Movie/Episode/Track, so it
                 // is an *item* id (auto-play, or the PlaybackInfo rewrite of
                 // source[0].Id — the sibling item's UUID when duplicate items
@@ -1145,6 +1153,13 @@ impl StreamService {
                 effective_stream_id,
             );
         }
+        self.ctx
+            .store
+            .save(
+                format!("pstream:{}:{}", self.item_id, device_id),
+                effective_stream_id,
+                std::time::Duration::from_secs(24 * 3600),
+            );
     }
 
     /// The device-keyed mapping for `source_id`; see `save_selected_stream`.
@@ -1256,26 +1271,26 @@ impl StreamService {
     /// to the correct content item without a DB scan.
     /// No-op when this was not a group request.
     pub fn save_preference(&self, device_key: &str) {
-        let Some((gid, _, _)) = &self.group else {
-            return;
-        };
-        self.ctx
-            .store
-            .save(
-                format!("pstream:{}:{}", self.item_id, device_key),
-                self.candidate()
-                    .id,
-                std::time::Duration::from_secs(24 * 3600),
-            );
-        if let Some(uid) = self.user_id {
-            Self::save_group_item(
-                &self
-                    .ctx
-                    .store,
-                uid,
-                *gid,
-                self.item_id,
-            );
+        if let Some(candidate) = self.stream.as_ref() {
+            self.ctx
+                .store
+                .save(
+                    format!("pstream:{}:{}", self.item_id, device_key),
+                    candidate.id,
+                    std::time::Duration::from_secs(24 * 3600),
+                );
+        }
+        if let Some((gid, _, _)) = &self.group {
+            if let Some(uid) = self.user_id {
+                Self::save_group_item(
+                    &self
+                        .ctx
+                        .store,
+                    uid,
+                    *gid,
+                    self.item_id,
+                );
+            }
         }
     }
 
