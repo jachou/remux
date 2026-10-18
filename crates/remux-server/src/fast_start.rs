@@ -14,8 +14,8 @@ use uuid::Uuid;
 /// Head buffer size in bytes: 16 MB.
 pub const FAST_START_HEAD_SIZE: usize = 16 * 1024 * 1024;
 
-/// Tail buffer size for MKV Cues / seekhead index: 128 KB.
-pub const FAST_START_TAIL_SIZE: usize = 128 * 1024;
+/// Tail buffer size for MKV Cues / seekhead index: 256 KB.
+pub const FAST_START_TAIL_SIZE: usize = 256 * 1024;
 
 /// Maximum number of items held in memory simultaneously.
 pub const FAST_START_MAX_ITEMS: usize = 15;
@@ -74,15 +74,6 @@ pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStart
             .build()
     });
 
-/// Lookup mapping from Jellyfin Media/Item UUID to original stream URL.
-pub(crate) static ITEM_TO_STREAM_URL: LazyLock<moka::sync::Cache<Uuid, String>> =
-    LazyLock::new(|| {
-        moka::sync::Cache::builder()
-            .max_capacity(100)
-            .time_to_live(FAST_START_TTL)
-            .build()
-    });
-
 /// Keyed lock to prevent duplicate concurrent pre-warms for the same URL.
 static PREWARM_LOCKS: LazyLock<crate::keyed_lock::KeyedLock<String>> =
     LazyLock::new(crate::keyed_lock::KeyedLock::new);
@@ -106,16 +97,8 @@ pub async fn prewarm_fast_start(
     original_url: &str,
     request_headers: &HashMap<String, String>,
 ) -> bool {
-    // Record item -> stream mapping right away so concurrent requests can find it
-    if let Some(id) = item_id {
-        ITEM_TO_STREAM_URL.insert(id, original_url.to_string());
-    }
-
     // If already pre-warmed and cached, skip!
     if let Some(entry) = FAST_START_CACHE.get(original_url) {
-        if let Some(id) = item_id {
-            ITEM_TO_STREAM_URL.insert(id, original_url.to_string());
-        }
         debug!(
             %original_url,
             item = ?item_id,
@@ -130,9 +113,6 @@ pub async fn prewarm_fast_start(
 
     // Double check cache after acquiring lock
     if FAST_START_CACHE.get(original_url).is_some() {
-        if let Some(id) = item_id {
-            ITEM_TO_STREAM_URL.insert(id, original_url.to_string());
-        }
         return true;
     }
 
@@ -183,7 +163,7 @@ pub async fn prewarm_fast_start(
         .and_then(|v| v.to_str().ok())
         .and_then(|cr| cr.split('/').last())
         .and_then(|s| s.parse::<u64>().ok())
-        .or_else(|| head_resp.content_length());
+        .or_else(|| if is_ok { head_resp.content_length() } else { None });
 
     let total_size = match total_size {
         Some(s) => s,
@@ -205,12 +185,16 @@ pub async fn prewarm_fast_start(
         return false;
     }
 
-    // Detect Content-Type from upstream response or file extension
+    // Detect Content-Type from upstream response or file extension.
+    // Exclude generic application/octet-stream so it falls back to explicit video MIME detection.
     let content_type = head_resp
         .headers()
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
-        .filter(|ct| ct.starts_with("video/") || ct.starts_with("application/"))
+        .filter(|ct| {
+            (ct.starts_with("video/") || ct.starts_with("application/"))
+                && !ct.starts_with("application/octet-stream")
+        })
         .map(|ct| ct.to_string())
         .unwrap_or_else(|| detect_content_type(original_url).to_string());
 
@@ -264,9 +248,6 @@ pub async fn prewarm_fast_start(
     };
 
     FAST_START_CACHE.insert(original_url.to_string(), entry);
-    if let Some(id) = item_id {
-        ITEM_TO_STREAM_URL.insert(id, original_url.to_string());
-    }
 
     METRICS.prewarms_succeeded.fetch_add(1, Ordering::Relaxed);
     let elapsed = start_time.elapsed();
