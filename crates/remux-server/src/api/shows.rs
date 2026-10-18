@@ -252,7 +252,7 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
             .as_ref()
             .map_or(false, |u| !u.played && u.playback_position_ticks > 0)
     }) {
-        return regular_released[pos..].iter().take(2).copied().collect();
+        return regular_released[pos..].iter().take(1).copied().collect();
     }
 
     // 2. Check for most recently played episode
@@ -276,7 +276,7 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
                 let targets: Vec<&'a api::BaseItemDto> = regular_released[start..]
                     .iter()
                     .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
-                    .take(2)
+                    .take(1)
                     .copied()
                     .collect();
                 if !targets.is_empty() {
@@ -286,18 +286,18 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
         }
     }
 
-    // 3. Fallback: first unplayed regular episodes from the start
+    // 3. Fallback: first unplayed regular episode from the start
     let unplayed: Vec<&'a api::BaseItemDto> = regular_released
         .iter()
         .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
-        .take(2)
+        .take(1)
         .copied()
         .collect();
 
     if !unplayed.is_empty() {
         unplayed
     } else {
-        regular_released.iter().take(2).copied().collect()
+        regular_released.iter().take(1).copied().collect()
     }
 }
 

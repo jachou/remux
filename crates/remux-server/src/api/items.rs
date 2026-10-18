@@ -1814,7 +1814,7 @@ async fn item_for_user(
             .await
             .log_err("failed to refresh sources");
 
-        if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
+        if matches!(media.kind, db::MediaKind::Movie) {
             crate::services::stream_service::spawn_preemptive_probe(
                 &state.ctx,
                 media.id,
