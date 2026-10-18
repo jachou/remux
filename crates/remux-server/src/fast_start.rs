@@ -18,7 +18,7 @@ pub const FAST_START_HEAD_SIZE: usize = 16 * 1024 * 1024;
 pub const FAST_START_TAIL_SIZE: usize = 256 * 1024;
 
 /// Maximum number of items held in memory simultaneously.
-pub const FAST_START_MAX_ITEMS: usize = 15;
+pub const FAST_START_MAX_ITEMS: usize = 50;
 
 /// Cache TTL matching Remux's LIVENESS_CACHE_TTL (1 hour).
 pub const FAST_START_TTL: Duration = Duration::from_secs(60 * 60);

@@ -724,7 +724,7 @@ async fn shows_nextup_all(
         return Ok(Json(api::BaseItemDtoQueryResult::default()));
     }
 
-    for (media, _) in candidates.iter().take(4) {
+    for (media, _) in candidates.iter().take(8) {
         crate::services::stream_service::spawn_preemptive_probe(
             &state.ctx,
             media.id,

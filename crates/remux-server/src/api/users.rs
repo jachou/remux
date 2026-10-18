@@ -1778,7 +1778,7 @@ async fn resume_items(
                     .and_then(|u| u.last_played_date)
                     .map_or(true, |d| d >= cutoff)
             })
-            .take(4)
+            .take(8)
         {
             crate::services::stream_service::spawn_preemptive_probe(
                 &ctx,
