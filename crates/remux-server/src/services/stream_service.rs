@@ -42,6 +42,28 @@ fn subtitle_query_for(stream: &db::Media) -> crate::addons::SubtitleQuery {
     }
 }
 
+/// Checks whether a media source (or probed stream) already contains embedded subtitle
+/// tracks covering any of the user's preferred subtitle languages.
+/// If `preferred_languages` is empty, returns true if ANY embedded subtitle track exists.
+pub(crate) fn has_matching_embedded_subtitles(
+    source: &api::MediaSourceInfo,
+    preferred_languages: &[String],
+) -> bool {
+    source.media_streams.iter().any(|stream| {
+        if stream.type_ != Some(MediaStreamType::Subtitle) || stream.is_external {
+            return false;
+        }
+        if preferred_languages.is_empty() {
+            return true;
+        }
+        let stream_lang =
+            crate::subtitle_selection::normalized_language(stream.language.as_deref());
+        preferred_languages.iter().any(|pref| {
+            crate::subtitle_selection::normalized_language(Some(pref.as_str())) == stream_lang
+        })
+    })
+}
+
 impl StreamService {
     /// The add-on subtitles for one stream's release: what PlaybackInfo
     /// advertises and what the subtitle download endpoint resolves an index
@@ -763,6 +785,11 @@ impl StreamService {
         // download would rebuild a different menu than the one advertised.
         // The fetches start now, concurrently, so each overlaps the probe
         // loop below instead of adding to it.
+        let sub_langs = probe_cfg
+            .subtitle_languages
+            .clone()
+            .unwrap_or_default();
+
         let mut subtitle_fetches: std::collections::HashMap<
             Uuid,
             tokio::task::JoinHandle<Vec<crate::addons::SubtitleInfo>>,
@@ -780,7 +807,21 @@ impl StreamService {
                             .is_some()
                             && !pd.is_filename_guess()
                     });
-                probed || real_probe_data
+                if !probed && !real_probe_data {
+                    return false;
+                }
+                // Smart skip: if candidate is already probed in cache and has embedded subtitles
+                // covering the user's preferred languages, do not fetch external subtitles!
+                if let Some(ref pd) = stream.probe_data {
+                    if is_reusable_probe_cache(pd) && has_matching_embedded_subtitles(pd, &sub_langs) {
+                        tracing::debug!(
+                            stream_id = %stream.id,
+                            "Stream has matching embedded subtitles in DB cache; skipping external subtitle fetch"
+                        );
+                        return false;
+                    }
+                }
+                true
             })
             .filter_map(|stream| {
                 let mut media = item
@@ -875,11 +916,45 @@ impl StreamService {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            // The probe failed over to another release, whose subtitles are
-            // for a different file than the ones just fetched.
-            if effective_stream.id != stream.id
+
+            // Smart check:
+            // 1. If external subtitles were NOT fetched, and the probed source turns out
+            //    to have NO matching embedded subtitles, fetch on demand!
+            if external_subtitles.is_empty()
+                && !has_matching_embedded_subtitles(&source, &sub_langs)
+            {
+                if let Some(mut media) = item
+                    .clone()
+                    .filter(|it| !it.is_live())
+                {
+                    tracing::info!(
+                        id = %stream.id,
+                        "Probed stream has no matching embedded subtitles; fetching external subtitles on demand"
+                    );
+                    external_subtitles = Self::subtitles_for_stream(
+                        &self.ctx,
+                        &mut media,
+                        &effective_stream,
+                        false,
+                        self.user_id,
+                    )
+                    .await;
+                }
+            } else if !external_subtitles.is_empty()
+                && has_matching_embedded_subtitles(&source, &sub_langs)
+            {
+                // 2. If external subtitles were pre-fetched, but the probed source already contains
+                //    native embedded subtitles, discard external subtitles to keep the menu clean!
+                tracing::debug!(
+                    id = %stream.id,
+                    "Probed stream contains native embedded subtitles; discarding redundant external subtitles"
+                );
+                external_subtitles.clear();
+            } else if effective_stream.id != stream.id
                 && subtitle_query_for(&effective_stream) != subtitle_query_for(&stream)
             {
+                // The probe failed over to another release, whose subtitles are
+                // for a different file than the ones just fetched.
                 if let Some(mut media) = item
                     .clone()
                     .filter(|it| !it.is_live())
@@ -1566,6 +1641,30 @@ async fn prefetch_subtitles_for_media(
     let mut item_media = media.clone();
     let mut seg_media = media.clone();
     let streams_res = item_media.streams(&ctx.db).await;
+    let cfg = db::Settings::get_config_or_default(&ctx.db).await;
+    let sub_langs = cfg
+        .subtitle_languages
+        .clone()
+        .unwrap_or_default();
+
+    // If Candidate #1 already has matching embedded subtitles in its probe data,
+    // skip prefetching external subtitles!
+    if let Ok(ref streams) = streams_res {
+        if let Some(top) = quality_ordered_probe_pool(streams).first() {
+            if let Some(ref pd) = top.probe_data {
+                if has_matching_embedded_subtitles(pd, &sub_langs) {
+                    tracing::debug!(
+                        item_id = %media.id,
+                        "Candidate #1 already has matching embedded subtitles in DB; skipping external subtitle prefetch"
+                    );
+                    let _ = seg_media.grandparent(&ctx.db).await;
+                    ctx.addons.fetch_segments(&seg_media, ctx, true).await;
+                    return;
+                }
+            }
+        }
+    }
+
     let query = if let Ok(ref streams) = streams_res {
         quality_ordered_probe_pool(streams)
             .first()
@@ -1582,11 +1681,6 @@ async fn prefetch_subtitles_for_media(
             ctx.addons.fetch_segments(&seg_media, ctx, true).await
         }
     );
-    let cfg = db::Settings::get_config_or_default(&ctx.db).await;
-    let sub_langs = cfg
-        .subtitle_languages
-        .clone()
-        .unwrap_or_default();
     let mut descriptors: Vec<crate::stream::StreamDescriptor> = subs
         .into_iter()
         .filter(|s| {
@@ -2716,5 +2810,43 @@ mod tests {
 
         assert_eq!(sources[0].id, alive_stream.id, "Alive stream must be ranked first");
         assert_eq!(sources[1].id, dead_stream.id, "Dead stream must be partitioned to the end");
+    }
+
+    #[test]
+    fn has_matching_embedded_subtitles_detects_embedded_tracks() {
+        let mut source = api::MediaSourceInfo::default();
+        source.media_streams = vec![
+            remux_sdks::remux::MediaStream {
+                type_: Some(MediaStreamType::Video),
+                is_external: false,
+                language: None,
+                ..Default::default()
+            },
+            remux_sdks::remux::MediaStream {
+                type_: Some(MediaStreamType::Subtitle),
+                is_external: false,
+                language: Some("eng".into()),
+                ..Default::default()
+            },
+        ];
+
+        let eng_prefs = vec!["eng".to_string()];
+        assert!(has_matching_embedded_subtitles(&source, &eng_prefs));
+
+        let spa_prefs = vec!["spa".to_string()];
+        assert!(!has_matching_embedded_subtitles(&source, &spa_prefs));
+
+        let empty_prefs: Vec<String> = vec![];
+        assert!(has_matching_embedded_subtitles(&source, &empty_prefs));
+
+        // External stream does not count as embedded
+        let mut ext_source = api::MediaSourceInfo::default();
+        ext_source.media_streams = vec![remux_sdks::remux::MediaStream {
+            type_: Some(MediaStreamType::Subtitle),
+            is_external: true,
+            language: Some("eng".into()),
+            ..Default::default()
+        }];
+        assert!(!has_matching_embedded_subtitles(&ext_source, &eng_prefs));
     }
 }
