@@ -1503,7 +1503,7 @@ impl StreamService {
 pub(crate) static QUEUED_PROBES: std::sync::LazyLock<dashmap::DashSet<Uuid>> =
     std::sync::LazyLock::new(dashmap::DashSet::new);
 pub(crate) static ACTIVE_PROBES: std::sync::LazyLock<
-    dashmap::DashMap<Uuid, std::sync::Arc<tokio::sync::Notify>>,
+    dashmap::DashMap<Uuid, tokio::sync::watch::Receiver<bool>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(3));
@@ -1512,12 +1512,15 @@ static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
 /// await its completion up to 3 seconds so foreground PlaybackInfo coalesces with it.
 /// If the probe is merely waiting in the queue (or not scheduled), returns immediately (0ms).
 pub async fn await_in_flight_probe(item_id: Uuid) -> bool {
-    let notify = ACTIVE_PROBES.get(&item_id).map(|e| e.value().clone());
-    if let Some(notify) = notify {
+    let rx = ACTIVE_PROBES.get(&item_id).map(|e| e.value().clone());
+    if let Some(mut rx) = rx {
+        if *rx.borrow() {
+            return true;
+        }
         tracing::info!(%item_id, "foreground request awaiting actively running probe");
         let start = std::time::Instant::now();
-        match tokio::time::timeout(std::time::Duration::from_millis(3000), notify.notified()).await {
-            Ok(_) => {
+        match tokio::time::timeout(std::time::Duration::from_millis(3000), rx.wait_for(|&v| v)).await {
+            Ok(Ok(_)) | Ok(Err(_)) => {
                 tracing::info!(%item_id, elapsed = ?start.elapsed(), "active probe finished, coalesced");
                 true
             }
@@ -1552,20 +1555,6 @@ pub fn spawn_preemptive_probe(
             }
         }
         let _queued_guard = QueuedGuard(item_id);
-
-        // Mark as actively running from start so foreground PlaybackInfo coalesces
-        // with in-flight discovery, liveness, and ffprobe
-        let notify = std::sync::Arc::new(tokio::sync::Notify::new());
-        ACTIVE_PROBES.insert(item_id, notify.clone());
-        struct ActiveGuard(Uuid);
-        impl Drop for ActiveGuard {
-            fn drop(&mut self) {
-                if let Some((_, notify)) = ACTIVE_PROBES.remove(&self.0) {
-                    notify.notify_waiters();
-                }
-            }
-        }
-        let _active_guard = ActiveGuard(item_id);
 
         let Ok(Some(media)) = db::Media::get_by_id(&ctx.db, &item_id).await else {
             return;
@@ -1635,7 +1624,31 @@ pub fn spawn_preemptive_probe(
             }
         };
 
-        match service.probe_primary_candidate().await {
+        // Acquired permit: mark as actively running so foreground PlaybackInfo coalesces with it
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        ACTIVE_PROBES.insert(item_id, rx);
+        struct ActiveGuard {
+            id: Uuid,
+            tx: Option<tokio::sync::watch::Sender<bool>>,
+        }
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                ACTIVE_PROBES.remove(&self.id);
+                if let Some(tx) = self.tx.take() {
+                    let _ = tx.send(true);
+                }
+            }
+        }
+        let active_guard = ActiveGuard {
+            id: item_id,
+            tx: Some(tx),
+        };
+
+        let probe_result = service.probe_primary_candidate().await;
+        // Drop active guard immediately so foreground PlaybackInfo unblocks without waiting for subtitle prefetch
+        drop(active_guard);
+
+        match probe_result {
             Ok(Some(stream_id)) => {
                 tracing::info!(%item_id, %stream_id, "preemptive probe finished successfully");
                 let primary = service.streams.iter().find(|s| s.id == stream_id);
@@ -1757,7 +1770,7 @@ pub fn spawn_next_episode_probe(
             (current.grandparent_id, current.parent_idx, current.idx)
         {
             sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM media WHERE grandparent_id = ? AND ((parent_idx = ? AND idx > ?) OR (parent_idx > ?)) ORDER BY COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC LIMIT 1",
+                "SELECT id FROM media WHERE grandparent_id = ? AND ((parent_idx = ? AND idx > ?) OR (parent_idx > ?)) AND (released_at IS NULL OR released_at <= CURRENT_TIMESTAMP) ORDER BY COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC LIMIT 1",
             )
             .bind(gp_id)
             .bind(p_idx)
@@ -1769,7 +1782,7 @@ pub fn spawn_next_episode_probe(
             .flatten()
         } else if let (Some(p_id), Some(idx)) = (current.parent_id, current.idx) {
             sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM media WHERE parent_id = ? AND idx > ? ORDER BY COALESCE(idx, 9999) ASC LIMIT 1",
+                "SELECT id FROM media WHERE parent_id = ? AND idx > ? AND (released_at IS NULL OR released_at <= CURRENT_TIMESTAMP) ORDER BY COALESCE(idx, 9999) ASC LIMIT 1",
             )
             .bind(p_id)
             .bind(idx)

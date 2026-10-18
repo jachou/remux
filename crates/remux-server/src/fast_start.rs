@@ -416,26 +416,15 @@ pub async fn handle_playback_request(
             if let Some(ref tail) = entry.tail_bytes {
                 let tail_len = tail.len() as u64;
                 let tail_start = entry.total_size.saturating_sub(tail_len);
-                if let Some(req_start) = parse_range_start(rng) {
-                    if req_start >= tail_start && req_start < entry.total_size {
+                if let Some((req_start, req_end)) = parse_range_bounds(rng, entry.total_size) {
+                    if req_start >= tail_start && req_start < entry.total_size && req_end >= req_start {
                         let offset = (req_start - tail_start) as usize;
                         if offset < tail.len() {
-                            let requested_end = parse_range_end(rng);
-                            let max_end_offset = entry.total_size.saturating_sub(1);
-                            let (slice, slice_len, end_byte) = match requested_end {
-                                Some(req_end) if req_end >= req_start && req_end < max_end_offset => {
-                                    let end_in_tail = (req_end - tail_start) as usize;
-                                    let end_clamped = end_in_tail.min(tail.len() - 1);
-                                    let s = tail.slice(offset..=end_clamped);
-                                    let len = s.len();
-                                    (s, len, req_start + len as u64 - 1)
-                                }
-                                _ => {
-                                    let s = tail.slice(offset..);
-                                    let len = s.len();
-                                    (s, len, max_end_offset)
-                                }
-                            };
+                            let end_in_tail = (req_end - tail_start) as usize;
+                            let end_clamped = end_in_tail.min(tail.len() - 1);
+                            let slice = tail.slice(offset..=end_clamped);
+                            let slice_len = slice.len();
+                            let end_byte = req_start + slice_len as u64 - 1;
 
                             METRICS.hits_tail.fetch_add(1, Ordering::Relaxed);
                             METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
@@ -443,6 +432,7 @@ pub async fn handle_playback_request(
                             info!(
                                 %item_id,
                                 req_start,
+                                end_byte,
                                 slice_len,
                                 total_size = entry.total_size,
                                 "[FAST-START] Buffer hit (tail/cues): serving {} bytes locally over LAN",
@@ -498,32 +488,33 @@ pub async fn handle_playback_request(
     }
 }
 
-/// Helper to parse the starting byte from a Range header: "bytes=12345-" -> 12345
-fn parse_range_start(range_str: &str) -> Option<u64> {
+/// Helper to parse byte range bounds from a Range header.
+/// Supports both explicit ranges ("bytes=12345-67890", "bytes=12345-")
+/// and suffix ranges ("bytes=-262144").
+fn parse_range_bounds(range_str: &str, total_size: u64) -> Option<(u64, u64)> {
     if !range_str.starts_with("bytes=") {
         return None;
     }
     let after_prefix = &range_str[6..];
-    let start_part = after_prefix.split('-').next()?;
-    start_part.parse::<u64>().ok()
-}
-
-/// Helper to parse the ending byte from a Range header: "bytes=12345-67890" -> 67890
-fn parse_range_end(range_str: &str) -> Option<u64> {
-    if !range_str.starts_with("bytes=") {
-        return None;
+    if after_prefix.starts_with('-') {
+        let suffix_len = after_prefix[1..].parse::<u64>().ok()?;
+        let start = total_size.saturating_sub(suffix_len);
+        let end = total_size.saturating_sub(1);
+        Some((start, end))
+    } else {
+        let mut parts = after_prefix.split('-');
+        let start = parts.next()?.parse::<u64>().ok()?;
+        let end = parts
+            .next()
+            .and_then(|s| if s.is_empty() { None } else { s.parse::<u64>().ok() })
+            .unwrap_or(total_size.saturating_sub(1));
+        Some((start, end))
     }
-    let after_prefix = &range_str[6..];
-    let end_part = after_prefix.split('-').nth(1)?;
-    if end_part.is_empty() {
-        return None;
-    }
-    end_part.parse::<u64>().ok()
 }
 
 /// Determines whether a Range header is requesting the tail (MKV Cues / seekhead) region.
 fn is_tail_range(range_str: &str, total_size: u64) -> bool {
-    let Some(start) = parse_range_start(range_str) else {
+    let Some((start, _)) = parse_range_bounds(range_str, total_size) else {
         return false;
     };
     let tail_start = total_size.saturating_sub(FAST_START_TAIL_SIZE as u64);

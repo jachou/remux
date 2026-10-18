@@ -93,6 +93,7 @@ pub async fn shows_seasons(
                            AND m.kind = 'episode' \
                            AND m.parent_idx > 0 \
                            AND COALESCE(ums.play_count, 0) = 0 \
+                           AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
                            AND ((m.parent_idx = ?3 AND m.idx > ?4) OR (m.parent_idx > ?3)) \
                          ORDER BY m.parent_idx ASC, m.idx ASC \
                          LIMIT 1",
@@ -108,13 +109,14 @@ pub async fn shows_seasons(
                 }
             } else {
                 // 3. Fallback: first unplayed regular episode from Season 1+
-                sqlx::query_scalar::<_, Uuid>(
+                let ep = sqlx::query_scalar::<_, Uuid>(
                     "SELECT m.id FROM media m \
                      LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
                      WHERE m.grandparent_id = ?2 \
                        AND m.kind = 'episode' \
                        AND m.parent_idx > 0 \
                        AND COALESCE(ums.play_count, 0) = 0 \
+                       AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
                      ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
                      LIMIT 1",
                 )
@@ -123,7 +125,29 @@ pub async fn shows_seasons(
                 .fetch_optional(&ctx.db)
                 .await
                 .ok()
-                .flatten()
+                .flatten();
+
+                if ep.is_none() {
+                    // Fallback to specials (Season 0) if no regular episodes
+                    sqlx::query_scalar::<_, Uuid>(
+                        "SELECT m.id FROM media m \
+                         LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
+                         WHERE m.grandparent_id = ?2 \
+                           AND m.kind = 'episode' \
+                           AND COALESCE(ums.play_count, 0) = 0 \
+                           AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
+                         ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
+                         LIMIT 1",
+                    )
+                    .bind(user_id)
+                    .bind(series_id)
+                    .fetch_optional(&ctx.db)
+                    .await
+                    .ok()
+                    .flatten()
+                } else {
+                    ep
+                }
             }
         };
 
@@ -242,21 +266,30 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
         })
         .collect();
 
-    if regular_released.is_empty() {
+    let pool: Vec<&'a api::BaseItemDto> = if !regular_released.is_empty() {
+        regular_released
+    } else {
+        items
+            .iter()
+            .filter(|i| i.premiere_date.map_or(true, |d| d <= now))
+            .collect()
+    };
+
+    if pool.is_empty() {
         return Vec::new();
     }
 
     // 1. Check for in-progress episode
-    if let Some(pos) = regular_released.iter().position(|i| {
+    if let Some(pos) = pool.iter().position(|i| {
         i.user_data
             .as_ref()
             .map_or(false, |u| !u.played && u.playback_position_ticks > 0)
     }) {
-        return regular_released[pos..].iter().take(1).copied().collect();
+        return pool[pos..].iter().take(1).copied().collect();
     }
 
     // 2. Check for most recently played episode
-    if let Some((_, last_played_item)) = regular_released
+    if let Some((_, last_played_item)) = pool
         .iter()
         .filter_map(|i| {
             i.user_data
@@ -266,14 +299,14 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
         })
         .max_by_key(|(d, _)| *d)
     {
-        if let Some(pos) = regular_released.iter().position(|i| i.id == last_played_item.id) {
+        if let Some(pos) = pool.iter().position(|i| i.id == last_played_item.id) {
             let start = if last_played_item.user_data.as_ref().map_or(false, |u| u.played) {
                 pos + 1
             } else {
                 pos
             };
-            if start < regular_released.len() {
-                let targets: Vec<&'a api::BaseItemDto> = regular_released[start..]
+            if start < pool.len() {
+                let targets: Vec<&'a api::BaseItemDto> = pool[start..]
                     .iter()
                     .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
                     .take(1)
@@ -287,7 +320,7 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
     }
 
     // 3. Fallback: first unplayed regular episode from the start
-    let unplayed: Vec<&'a api::BaseItemDto> = regular_released
+    let unplayed: Vec<&'a api::BaseItemDto> = pool
         .iter()
         .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
         .take(1)
@@ -297,7 +330,7 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
     if !unplayed.is_empty() {
         unplayed
     } else {
-        regular_released.iter().take(1).copied().collect()
+        pool.iter().take(1).copied().collect()
     }
 }
 
@@ -2815,9 +2848,8 @@ pub(crate) mod test {
         };
         let items = vec![special_ep, reg_ep1.clone(), reg_ep2.clone()];
         let targets = super::select_preemptive_probe_targets(&items);
-        assert_eq!(targets.len(), 2);
+        assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id, reg_ep1.id);
-        assert_eq!(targets[1].id, reg_ep2.id);
     }
 
     #[test]
@@ -2864,9 +2896,8 @@ pub(crate) mod test {
         };
         let items = vec![special_ep, reg_ep1, reg_ep2.clone(), reg_ep3.clone()];
         let targets = super::select_preemptive_probe_targets(&items);
-        assert_eq!(targets.len(), 2);
+        assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id, reg_ep2.id);
-        assert_eq!(targets[1].id, reg_ep3.id);
     }
 
     #[test]
@@ -2893,8 +2924,7 @@ pub(crate) mod test {
         };
         let items = vec![special_ep1.clone(), special_ep2.clone()];
         let targets = super::select_preemptive_probe_targets(&items);
-        assert_eq!(targets.len(), 2);
+        assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].id, special_ep1.id);
-        assert_eq!(targets[1].id, special_ep2.id);
     }
 }
