@@ -764,6 +764,7 @@ impl StreamService {
                         let url_clone = url.clone();
                         let headers_clone = request_headers.clone();
                         let item_id = self.item_id;
+                        let resume_pos = crate::fast_start::lookup_resume_position(&self.ctx.db, self.user_id, Some(self.item_id)).await;
                         let head_size = crate::fast_start::calculate_fast_start_head_size(
                             url,
                             si.size.map(|s| s as u64),
@@ -776,6 +777,8 @@ impl StreamService {
                                 &headers_clone,
                                 crate::fast_start::PrewarmPriority::High,
                                 Some(head_size),
+                                resume_pos,
+                                None,
                             )
                             .await;
                         });
@@ -1476,6 +1479,8 @@ impl StreamService {
                                     &headers_clone,
                                     crate::fast_start::PrewarmPriority::Low,
                                     Some(head_size),
+                                    None,
+                                    None,
                                 )
                                 .await;
                             });
@@ -1537,6 +1542,8 @@ impl StreamService {
                             &headers_clone,
                             crate::fast_start::PrewarmPriority::Low,
                             Some(head_size),
+                            None,
+                            None,
                         )
                         .await;
                     });
@@ -1579,6 +1586,8 @@ impl StreamService {
                             &headers_clone,
                             crate::fast_start::PrewarmPriority::Low,
                             Some(head_size),
+                            None,
+                            None,
                         )
                         .await;
                     });
@@ -1692,6 +1701,8 @@ pub fn spawn_preemptive_probe(
                                         &headers_clone,
                                         crate::fast_start::PrewarmPriority::Low,
                                         Some(head_size),
+                                        None,
+                                        None,
                                     )
                                     .await;
                                 });
