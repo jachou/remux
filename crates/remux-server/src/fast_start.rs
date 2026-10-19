@@ -7,6 +7,7 @@ use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use bytes::Bytes;
+use futures_util::TryStreamExt;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -28,6 +29,9 @@ pub const FAST_START_DEFAULT_RESUME_SIZE: usize = 16 * 1024 * 1024;
 
 /// 4K / UHD / large stream resume buffer size: 32 MB.
 pub const FAST_START_4K_RESUME_SIZE: usize = 32 * 1024 * 1024;
+
+/// Maximum continuation bytes proxied while waiting for a resume seek before falling back to 307 redirect: 64 MB.
+pub const FAST_START_PROXY_BRIDGE_CAP: u64 = 64 * 1024 * 1024;
 
 /// Determines the ideal Fast-Start head buffer size based on URL clues, file size, or 4K flags.
 pub fn calculate_fast_start_head_size(
@@ -833,8 +837,44 @@ pub async fn handle_playback_request(
         }
 
         // Case 5: Video cluster stream / seek / continuous playback
-        // Issue 307 Temporary Redirect DIRECTLY to Debrid CDN edge
+        // Issue 307 Temporary Redirect DIRECTLY to Debrid CDN edge, unless a resume buffer is pending
         Some(rng) => {
+            let (req_start, _) = parse_range_bounds(rng, entry.total_size)
+                .unwrap_or((0, entry.total_size.saturating_sub(1)));
+            let head_len = entry.head_bytes.len() as u64;
+
+            // If a resume buffer is pending in RAM (the user is expected to resume from the middle),
+            // and this request is between the head buffer and the resume offset,
+            // this is speculative background read-ahead from the head buffer (e.g. req_start == head_len).
+            // Do NOT immediately issue a 307 redirect! A premature 307 redirect would bind the player
+            // to the CDN edge and bypass the 32 MB resume buffer in RAM when the player seeks a moment later.
+            //
+            // Instead, proxy up to FAST_START_PROXY_BRIDGE_CAP (64 MB) of continuation stream from the CDN.
+            // If the player seeks to the resume position (which happens in <1s), the player aborts this proxy
+            // stream and hits the RAM resume buffer.
+            // If the user actually chose "Play from Beginning", Remux streams up to 64 MB seamlessly,
+            // and once req_start reaches head_len + 64MB, Remux issues the 307 redirect to CDN.
+            if let Some((resume_start, _)) = entry.resume_buffer {
+                let bridge_cap = head_len + FAST_START_PROXY_BRIDGE_CAP;
+                if req_start < resume_start && req_start < bridge_cap {
+                    let bridge_end = (req_start + FAST_START_PROXY_BRIDGE_CAP - 1)
+                        .min(resume_start.saturating_sub(1))
+                        .min(entry.total_size.saturating_sub(1));
+                    let clamped_range = format!("bytes={}-{}", req_start, bridge_end);
+                    info!(
+                        %item_id,
+                        req_start,
+                        bridge_end,
+                        resume_start,
+                        bridge_cap,
+                        "[FAST-START] Proxying head continuation bridge (capped at 64 MB) to keep session anchored for resume seek"
+                    );
+                    if let Some(resp) = proxy_upstream_range(&entry.direct_cdn_url, &clamped_range, upstream_headers).await {
+                        return Some(resp);
+                    }
+                }
+            }
+
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             info!(
                 %item_id,
@@ -845,6 +885,42 @@ pub async fn handle_playback_request(
             let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
             redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static("redirect-direct-cdn"));
             Some(redirect)
+        }
+    }
+}
+
+/// Proxies a bounded byte range directly from the upstream CDN to keep the client session anchored to Remux.
+async fn proxy_upstream_range(
+    direct_cdn_url: &str,
+    range: &str,
+    upstream_headers: Option<&HashMap<String, String>>,
+) -> Option<Response> {
+    let mut req = PREWARM_CLIENT.get(direct_cdn_url).header(header::RANGE, range);
+    if let Some(hdrs) = upstream_headers {
+        for (k, v) in hdrs {
+            req = req.header(k.as_str(), v.as_str());
+        }
+    }
+    match req.send().await {
+        Ok(upstream_resp) => {
+            let status = upstream_resp.status();
+            let resp_headers = upstream_resp.headers().clone();
+            let stream = upstream_resp.bytes_stream().map_err(std::io::Error::other);
+            let mut builder = Response::builder().status(status);
+            for (k, v) in resp_headers.iter() {
+                if matches!(
+                    k.as_str(),
+                    "content-type" | "content-range" | "content-length" | "accept-ranges"
+                ) {
+                    builder = builder.header(k, v);
+                }
+            }
+            builder = builder.header("X-Remux-FastStart", "proxy-bridge");
+            Some(builder.body(Body::from_stream(stream)).unwrap())
+        }
+        Err(e) => {
+            warn!(error = %e, "[FAST-START] Failed to proxy upstream range, falling back to 307 redirect");
+            None
         }
     }
 }
