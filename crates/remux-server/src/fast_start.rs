@@ -180,13 +180,13 @@ pub async fn prewarm_fast_start(
                 } else {
                     FAST_START_DEFAULT_RESUME_SIZE
                 };
-                // Infuse and other demuxers seek backward by 3-5 seconds of pre-roll before the target keyframe
-                // to decode audio/subtitle packets before the first video frame (e.g. 11.9MB in Lioness 4K).
-                // Add 24MB (4K) / 12MB (1080p) pre-roll headroom so client seeks always hit the RAM buffer.
+                // Infuse and other demuxers seek backward by 5-10 seconds of pre-roll before the target keyframe
+                // to decode audio/subtitle packets before the first video frame (e.g. 26.8MB in Lioness 4K).
+                // Add 48MB (4K) / 24MB (1080p) pre-roll headroom so client seeks always land inside the RAM buffer.
                 let preroll_bytes: u64 = if is_4k {
-                    24 * 1024 * 1024
+                    48 * 1024 * 1024
                 } else {
-                    12 * 1024 * 1024
+                    24 * 1024 * 1024
                 };
                 let offset_opt = entry.tail_bytes.as_deref().and_then(|tb| find_mkv_cue_offset(&entry.head_bytes, tb, pos_secs))
                     .or_else(|| estimate_resume_byte_offset(pos_secs, total_duration_secs, entry.total_size));
@@ -424,13 +424,13 @@ pub async fn prewarm_fast_start(
     // Step 4: If resume position requested, find resume byte offset from Cues & fetch resume chunk!
     let resume_buffer = if let Some(pos_secs) = resume_position_secs {
         let is_4k = head_bytes.len() >= FAST_START_4K_HEAD_SIZE;
-        // Infuse and other demuxers seek backward by 3-5 seconds of pre-roll before the target keyframe
-        // to decode audio/subtitle packets before the first video frame (e.g. 11.9MB in Lioness 4K).
-        // Add 24MB (4K) / 12MB (1080p) pre-roll headroom so client seeks always hit the RAM buffer.
+        // Infuse and other demuxers seek backward by 5-10 seconds of pre-roll before the target keyframe
+        // to decode audio/subtitle packets before the first video frame (e.g. 26.8MB in Lioness 4K).
+        // Add 48MB (4K) / 24MB (1080p) pre-roll headroom so client seeks always land inside the RAM buffer.
         let preroll_bytes: u64 = if is_4k {
-            24 * 1024 * 1024
+            48 * 1024 * 1024
         } else {
-            12 * 1024 * 1024
+            24 * 1024 * 1024
         };
         let offset_opt = tail_bytes
             .as_deref()
