@@ -179,7 +179,7 @@ pub async fn prewarm_fast_start(
                 } else {
                     FAST_START_DEFAULT_RESUME_SIZE
                 };
-                let offset_opt = entry.tail_bytes.as_deref().and_then(|tb| find_mkv_cue_offset(tb, pos_secs))
+                let offset_opt = entry.tail_bytes.as_deref().and_then(|tb| find_mkv_cue_offset(&entry.head_bytes, tb, pos_secs))
                     .or_else(|| estimate_resume_byte_offset(pos_secs, total_duration_secs, entry.total_size));
                 if let Some(start_byte) = offset_opt {
                     let end_byte = (start_byte + target_resume_size as u64 - 1).min(entry.total_size - 1);
@@ -371,12 +371,10 @@ pub async fn prewarm_fast_start(
         .map(|ct| ct.to_string())
         .unwrap_or_else(|| detect_content_type(original_url).to_string());
 
-    // Steps 2 & 3: Read head body AND fetch tail cues + resume chunk in parallel!
+    // Steps 2 & 3: Fetch head body AND tail cues in parallel!
     let head_fut = head_resp.bytes();
-
-    let tail_and_resume_fut = async {
-        // Step 3: Fetch the 2 MB tail index (MKV Cues)
-        let tail_bytes = if total_size > FAST_START_TAIL_SIZE as u64 {
+    let tail_fut = async {
+        if total_size > FAST_START_TAIL_SIZE as u64 {
             let tail_start = total_size - FAST_START_TAIL_SIZE as u64;
             let tail_range = format!("bytes={}-{}", tail_start, total_size - 1);
             let mut tail_req = PREWARM_CLIENT.get(&direct_cdn_url);
@@ -399,63 +397,10 @@ pub async fn prewarm_fast_start(
             }
         } else {
             None
-        };
-
-        // Step 4: If resume position requested, find resume byte offset from Cues & fetch resume chunk!
-        let resume_buffer = if let Some(pos_secs) = resume_position_secs {
-            let offset_opt = tail_bytes
-                .as_deref()
-                .and_then(|tb| find_mkv_cue_offset(tb, pos_secs))
-                .or_else(|| estimate_resume_byte_offset(pos_secs, total_duration_secs, total_size));
-
-            if let Some(start_byte) = offset_opt {
-                let end_byte = (start_byte + target_resume_size as u64 - 1).min(total_size - 1);
-                let resume_range = format!("bytes={}-{}", start_byte, end_byte);
-                let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
-                for (k, v) in request_headers {
-                    res_req = res_req.header(k.as_str(), v.as_str());
-                }
-                res_req = res_req.header(header::RANGE, resume_range);
-
-                match res_req.send().await {
-                    Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
-                        match r.bytes().await {
-                            Ok(b) => {
-                                info!(
-                                    %original_url,
-                                    start_byte,
-                                    end_byte,
-                                    resume_size_bytes = b.len(),
-                                    "[FAST-START] Successfully pre-warmed resume chunk into RAM"
-                                );
-                                Some((start_byte, b))
-                            }
-                            Err(e) => {
-                                warn!(%original_url, error = %e, "[FAST-START] Failed reading resume chunk body");
-                                None
-                            }
-                        }
-                    }
-                    Ok(r) => {
-                        warn!(%original_url, status = ?r.status(), "[FAST-START] Resume fetch returned non-206 status");
-                        None
-                    }
-                    Err(e) => {
-                        warn!(%original_url, error = %e, "[FAST-START] Resume fetch request error");
-                        None
-                    }
-                }
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        (tail_bytes, resume_buffer)
+        }
     };
 
-    let (head_res, (tail_bytes, resume_buffer)) = tokio::join!(head_fut, tail_and_resume_fut);
+    let (head_res, tail_bytes) = tokio::join!(head_fut, tail_fut);
 
     let head_bytes = match head_res {
         Ok(b) => b,
@@ -464,6 +409,57 @@ pub async fn prewarm_fast_start(
             warn!(%original_url, error = %e, "[FAST-START] Failed reading head response body");
             return false;
         }
+    };
+
+    // Step 4: If resume position requested, find resume byte offset from Cues & fetch resume chunk!
+    let resume_buffer = if let Some(pos_secs) = resume_position_secs {
+        let offset_opt = tail_bytes
+            .as_deref()
+            .and_then(|tb| find_mkv_cue_offset(&head_bytes, tb, pos_secs))
+            .or_else(|| estimate_resume_byte_offset(pos_secs, total_duration_secs, total_size));
+
+        if let Some(start_byte) = offset_opt {
+            let end_byte = (start_byte + target_resume_size as u64 - 1).min(total_size - 1);
+            let resume_range = format!("bytes={}-{}", start_byte, end_byte);
+            let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
+            for (k, v) in request_headers {
+                res_req = res_req.header(k.as_str(), v.as_str());
+            }
+            res_req = res_req.header(header::RANGE, resume_range);
+
+            match res_req.send().await {
+                Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
+                    match r.bytes().await {
+                        Ok(b) => {
+                            info!(
+                                %original_url,
+                                start_byte,
+                                end_byte,
+                                resume_size_bytes = b.len(),
+                                "[FAST-START] Successfully pre-warmed resume chunk into RAM"
+                            );
+                            Some((start_byte, b))
+                        }
+                        Err(e) => {
+                            warn!(%original_url, error = %e, "[FAST-START] Failed reading resume chunk body");
+                            None
+                        }
+                    }
+                }
+                Ok(r) => {
+                    warn!(%original_url, status = ?r.status(), "[FAST-START] Resume fetch returned non-206 status");
+                    None
+                }
+                Err(e) => {
+                    warn!(%original_url, error = %e, "[FAST-START] Resume fetch request error");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    } else {
+        None
     };
 
     let entry = FastStartEntry {
@@ -981,11 +977,94 @@ fn is_resume_range(range_str: &str, resume_buf: Option<&(u64, Bytes)>, total_siz
     start >= *resume_start && start < resume_end
 }
 
-/// Extracts the cluster byte offset for a given timestamp (in seconds) from an MKV tail index (Cues).
-pub fn find_mkv_cue_offset(tail_bytes: &[u8], target_time_secs: f64) -> Option<u64> {
+/// Locates the Segment element (ID: 0x18538067) in the MKV header and returns
+/// the byte offset where Segment data starts (Segment ID + length vint).
+pub fn find_mkv_segment_data_offset(head_bytes: &[u8]) -> u64 {
+    let seg_id = [0x18u8, 0x53, 0x80, 0x67];
+    if let Some(pos) = head_bytes.windows(4).position(|w| w == seg_id) {
+        let cursor = pos + 4;
+        if let Some((_, vint_len)) = read_ebml_vint(&head_bytes[cursor..]) {
+            return (cursor + vint_len) as u64;
+        }
+    }
+    52 // Standard fallback for Matroska
+}
+
+/// Identifies the Video track number (TrackType == 1) from the Tracks header.
+/// If omitted or undetectable, defaults to track 1.
+pub fn find_mkv_video_track(head_bytes: &[u8]) -> u64 {
+    let tracks_id = [0x16u8, 0x54, 0xAE, 0x6B];
+    let mut pos = 0;
+    while pos < head_bytes.len() {
+        let Some(idx) = head_bytes[pos..].windows(4).position(|w| w == tracks_id) else {
+            break;
+        };
+        let actual_pos = pos + idx;
+        pos = actual_pos + 4;
+
+        let Some((tlen, vlen)) = read_ebml_vint(&head_bytes[pos..]) else {
+            continue;
+        };
+        let mut cursor = pos + vlen;
+        let end = (cursor + tlen as usize).min(head_bytes.len());
+
+        while cursor < end {
+            let Some((eid, eid_len)) = read_ebml_id(&head_bytes[cursor..]) else {
+                break;
+            };
+            cursor += eid_len;
+            let Some((elen, evlen)) = read_ebml_vint(&head_bytes[cursor..]) else {
+                break;
+            };
+            cursor += evlen;
+            let entry_end = (cursor + elen as usize).min(end);
+
+            if eid == 0xAE {
+                // TrackEntry
+                let mut sc = cursor;
+                let mut tnum = None;
+                let mut ttype = None;
+
+                while sc < entry_end {
+                    let Some((sub_id, se_len)) = read_ebml_id(&head_bytes[sc..]) else {
+                        break;
+                    };
+                    sc += se_len;
+                    let Some((slen, svlen)) = read_ebml_vint(&head_bytes[sc..]) else {
+                        break;
+                    };
+                    sc += svlen;
+                    let sub_end = (sc + slen as usize).min(entry_end);
+
+                    if sub_id == 0xD7 {
+                        // TrackNumber
+                        tnum = Some(read_ebml_uint(&head_bytes[sc..sub_end]));
+                    } else if sub_id == 0x83 {
+                        // TrackType: 1 = video, 2 = audio, 17 = subtitle
+                        ttype = Some(read_ebml_uint(&head_bytes[sc..sub_end]));
+                    }
+                    sc = sub_end;
+                }
+
+                if ttype == Some(1) && tnum.is_some() {
+                    return tnum.unwrap();
+                }
+            }
+
+            cursor = entry_end;
+        }
+    }
+    1
+}
+
+/// Extracts the cluster byte offset for a given timestamp (in seconds) from an MKV head and tail index (Cues).
+pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_secs: f64) -> Option<u64> {
     if tail_bytes.len() < 16 {
         return None;
     }
+    let seg_offset = find_mkv_segment_data_offset(head_bytes);
+    let vid_track = find_mkv_video_track(head_bytes);
+
     // Search for Cues element ID: [0x1C, 0x53, 0xBB, 0x6B]
     let cues_id = [0x1Cu8, 0x53, 0xBB, 0x6B];
     let cues_pos = tail_bytes.windows(4).position(|w| w == cues_id)?;
@@ -1013,6 +1092,7 @@ pub fn find_mkv_cue_offset(tail_bytes: &[u8], target_time_secs: f64) -> Option<u
         let mut sub_cursor = cursor;
         let mut cue_time_ms: Option<u64> = None;
         let mut cue_cluster_pos: Option<u64> = None;
+        let mut cue_track: Option<u64> = None;
 
         while sub_cursor < point_end {
             let elem_id = tail_bytes[sub_cursor];
@@ -1027,7 +1107,7 @@ pub fn find_mkv_cue_offset(tail_bytes: &[u8], target_time_secs: f64) -> Option<u
                 // CueTime
                 cue_time_ms = Some(read_ebml_uint(&tail_bytes[sub_cursor..elem_end]));
             } else if elem_id == 0xB7 {
-                // CueTrackPositions: scan inside for CueClusterPosition (0xF1)
+                // CueTrackPositions: scan inside for CueTrack (0xF7) and CueClusterPosition (0xF1)
                 let mut track_cursor = sub_cursor;
                 while track_cursor < elem_end {
                     let tid = tail_bytes[track_cursor];
@@ -1037,7 +1117,9 @@ pub fn find_mkv_cue_offset(tail_bytes: &[u8], target_time_secs: f64) -> Option<u
                     };
                     track_cursor += tvint_len;
                     let tend = (track_cursor + tlen as usize).min(elem_end);
-                    if tid == 0xF1 {
+                    if tid == 0xF7 {
+                        cue_track = Some(read_ebml_uint(&tail_bytes[track_cursor..tend]));
+                    } else if tid == 0xF1 {
                         cue_cluster_pos = Some(read_ebml_uint(&tail_bytes[track_cursor..tend]));
                     }
                     track_cursor = tend;
@@ -1046,27 +1128,46 @@ pub fn find_mkv_cue_offset(tail_bytes: &[u8], target_time_secs: f64) -> Option<u
             sub_cursor = elem_end;
         }
 
-        if let (Some(t), Some(c)) = (cue_time_ms, cue_cluster_pos) {
-            if t <= target_time_ms {
-                match best_cue {
-                    Some((best_t, _)) if t > best_t => {
-                        best_cue = Some((t, c));
+        // Only consider CuePoints belonging to the video track (or unspecified track)
+        if cue_track.is_none() || cue_track == Some(vid_track) {
+            if let (Some(t), Some(c)) = (cue_time_ms, cue_cluster_pos) {
+                if t <= target_time_ms {
+                    match best_cue {
+                        Some((best_t, _)) if t > best_t => {
+                            best_cue = Some((t, c));
+                        }
+                        None => {
+                            best_cue = Some((t, c));
+                        }
+                        _ => {}
                     }
-                    None => {
-                        best_cue = Some((t, c));
-                    }
-                    _ => {}
+                } else if best_cue.is_some() {
+                    break;
                 }
-            } else if best_cue.is_some() {
-                break;
             }
         }
 
         cursor = point_end;
     }
 
-    // In Matroska, CueClusterPosition is relative to Segment data offset (~64 bytes into file).
-    best_cue.map(|(_, pos)| pos + 64)
+    // CueClusterPosition is relative to Segment data offset.
+    best_cue.map(|(_, pos)| pos + seg_offset)
+}
+
+fn read_ebml_id(slice: &[u8]) -> Option<(u32, usize)> {
+    if slice.is_empty() {
+        return None;
+    }
+    let first = slice[0];
+    let num_bytes = first.leading_zeros() as usize + 1;
+    if num_bytes > 4 || slice.len() < num_bytes {
+        return None;
+    }
+    let mut val = 0u32;
+    for &b in &slice[..num_bytes] {
+        val = (val << 8) | (b as u32);
+    }
+    Some((val, num_bytes))
 }
 
 fn read_ebml_vint(slice: &[u8]) -> Option<(u64, usize)> {
@@ -1078,7 +1179,7 @@ fn read_ebml_vint(slice: &[u8]) -> Option<(u64, usize)> {
     if num_bytes > 8 || slice.len() < num_bytes {
         return None;
     }
-    let mask = 0xFF >> num_bytes;
+    let mask = if num_bytes >= 8 { 0 } else { (0xFFu8) >> num_bytes };
     let mut val = (first & mask) as u64;
     for &b in &slice[1..num_bytes] {
         val = (val << 8) | (b as u64);
@@ -1344,5 +1445,79 @@ mod tests {
         drop(p2);
         let low_ok = low_handle.await.unwrap();
         assert!(low_ok);
+    }
+
+    #[test]
+    fn mkv_cue_offset_matches_video_keyframe_and_segment_offset() {
+        // Construct a synthetic head buffer with Segment at offset 40 and 8-byte vint length
+        // Segment data starts at 40 + 4 + 8 = 52.
+        let mut head = vec![0u8; 40];
+        head.extend_from_slice(&[0x18, 0x53, 0x80, 0x67]); // Segment ID
+        head.extend_from_slice(&[0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00]); // 8-byte vint
+        assert_eq!(find_mkv_segment_data_offset(&head), 52);
+
+        // Construct a synthetic tail buffer with Cues element (0x1C53BB6B)
+        // Containing 2 CuePoints:
+        // CuePoint 1: time=2309474ms, Track 1 (video), ClusterPos=7389854564
+        // CuePoint 2: time=2311769ms, Track 3 (subtitle), ClusterPos=7398040070
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&[0x1C, 0x53, 0xBB, 0x6B]); // Cues ID
+        let mut cues_body = Vec::new();
+
+        // CuePoint 1: Track 1 (video), time 2309474, cluster 7389854564
+        let mut cp1 = Vec::new();
+        cp1.push(0xB3); // CueTime
+        let t1_bytes = 2309474u32.to_be_bytes();
+        cp1.push(0x84); // 4 bytes vint len
+        cp1.extend_from_slice(&t1_bytes);
+
+        cp1.push(0xB7); // CueTrackPositions
+        let mut ctp1 = Vec::new();
+        ctp1.push(0xF7); // CueTrack
+        ctp1.push(0x81); // 1 byte
+        ctp1.push(1); // Track 1
+        ctp1.push(0xF1); // CueClusterPosition
+        let c1_bytes = 7389854564u64.to_be_bytes();
+        ctp1.push(0x88); // 8 bytes
+        ctp1.extend_from_slice(&c1_bytes);
+        cp1.push(0x80 | (ctp1.len() as u8));
+        cp1.extend_from_slice(&ctp1);
+
+        cues_body.push(0xBB); // CuePoint
+        cues_body.push(0x80 | (cp1.len() as u8));
+        cues_body.extend_from_slice(&cp1);
+
+        // CuePoint 2: Track 3 (subtitle), time 2311769, cluster 7398040070
+        let mut cp2 = Vec::new();
+        cp2.push(0xB3); // CueTime
+        let t2_bytes = 2311769u32.to_be_bytes();
+        cp2.push(0x84); // 4 bytes vint len
+        cp2.extend_from_slice(&t2_bytes);
+
+        cp2.push(0xB7); // CueTrackPositions
+        let mut ctp2 = Vec::new();
+        ctp2.push(0xF7); // CueTrack
+        ctp2.push(0x81); // 1 byte
+        ctp2.push(3); // Track 3 (subtitle)
+        ctp2.push(0xF1); // CueClusterPosition
+        let c2_bytes = 7398040070u64.to_be_bytes();
+        ctp2.push(0x88); // 8 bytes
+        ctp2.extend_from_slice(&c2_bytes);
+        cp2.push(0x80 | (ctp2.len() as u8));
+        cp2.extend_from_slice(&ctp2);
+
+        cues_body.push(0xBB); // CuePoint
+        cues_body.push(0x80 | (cp2.len() as u8));
+        cues_body.extend_from_slice(&cp2);
+
+        tail.push(0x80 | (cues_body.len() as u8));
+        tail.extend_from_slice(&cues_body);
+
+        // For resume at 2312.0s:
+        // Even though CuePoint 2 is at 2311.769s (closer to 2312s), it is Track 3 (subtitle)!
+        // find_mkv_cue_offset MUST filter for Track 1 (video) and select CuePoint 1 (2309.474s)
+        // Offset must be 7389854564 + 52 = 7389854616!
+        let offset = find_mkv_cue_offset(&head, &tail, 2312.0);
+        assert_eq!(offset, Some(7389854616));
     }
 }
