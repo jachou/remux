@@ -522,12 +522,18 @@ async fn items_playbackinfo_inner(
                 let url_clone = url.clone();
                 let headers_clone = request_headers.clone();
                 let item_id = id;
+                let head_size = crate::fast_start::calculate_fast_start_head_size(
+                    url,
+                    si.size.map(|s| s as u64),
+                    None,
+                );
                 tokio::spawn(async move {
                     crate::fast_start::prewarm_fast_start(
                         Some(item_id),
                         &url_clone,
                         &headers_clone,
                         crate::fast_start::PrewarmPriority::High,
+                        Some(head_size),
                     )
                     .await;
                 });

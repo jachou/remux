@@ -11,11 +11,43 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Head buffer size in bytes: 16 MB.
-pub const FAST_START_HEAD_SIZE: usize = 16 * 1024 * 1024;
+/// Default head buffer size in bytes for standard 1080p / smaller streams: 16 MB.
+pub const FAST_START_DEFAULT_HEAD_SIZE: usize = 16 * 1024 * 1024;
 
-/// Tail buffer size for MKV Cues / seekhead index: 256 KB.
-pub const FAST_START_TAIL_SIZE: usize = 256 * 1024;
+/// 4K / UHD / large stream head buffer size in bytes: 32 MB.
+pub const FAST_START_4K_HEAD_SIZE: usize = 32 * 1024 * 1024;
+
+/// Backward-compatible alias for default head size.
+pub const FAST_START_HEAD_SIZE: usize = FAST_START_DEFAULT_HEAD_SIZE;
+
+/// Tail buffer size for MKV Cues / seekhead index: 2 MB.
+pub const FAST_START_TAIL_SIZE: usize = 2 * 1024 * 1024;
+
+/// Determines the ideal Fast-Start head buffer size based on URL clues, file size, or 4K flags.
+pub fn calculate_fast_start_head_size(
+    url: &str,
+    size_bytes: Option<u64>,
+    is_4k: Option<bool>,
+) -> usize {
+    if is_4k == Some(true) {
+        return FAST_START_4K_HEAD_SIZE;
+    }
+    if let Some(bytes) = size_bytes {
+        if bytes > 8 * 1024 * 1024 * 1024 {
+            return FAST_START_4K_HEAD_SIZE;
+        }
+    }
+    let lower = url.to_ascii_lowercase();
+    if lower.contains("2160p")
+        || lower.contains("4k")
+        || lower.contains("uhd")
+        || lower.contains("remux")
+    {
+        FAST_START_4K_HEAD_SIZE
+    } else {
+        FAST_START_DEFAULT_HEAD_SIZE
+    }
+}
 
 /// Maximum number of items held in memory simultaneously.
 pub const FAST_START_MAX_ITEMS: usize = 50;
@@ -121,6 +153,7 @@ pub async fn prewarm_fast_start(
     original_url: &str,
     request_headers: &HashMap<String, String>,
     priority: PrewarmPriority,
+    head_size: Option<usize>,
 ) -> bool {
     // If already pre-warmed and cached, skip!
     if let Some(entry) = FAST_START_CACHE.get(original_url) {
@@ -192,16 +225,18 @@ pub async fn prewarm_fast_start(
     };
     let start_time = Instant::now();
 
+    let target_head_size = head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, None));
+
     info!(
         %original_url,
         item = ?item_id,
         ?priority,
-        target_size_mb = FAST_START_HEAD_SIZE / (1024 * 1024),
+        target_size_mb = target_head_size / (1024 * 1024),
         "[FAST-START] Starting pre-warm download"
     );
 
-    // Step 1: Request the first 64 MB (bytes 0 to 67108863)
-    let head_range = format!("bytes=0-{}", FAST_START_HEAD_SIZE - 1);
+    // Step 1: Request the first N MB (16 MB for standard, 32 MB for 4K / large)
+    let head_range = format!("bytes=0-{}", target_head_size - 1);
     let mut head_req = PREWARM_CLIENT.get(original_url);
     for (k, v) in request_headers {
         head_req = head_req.header(k.as_str(), v.as_str());
@@ -254,8 +289,8 @@ pub async fn prewarm_fast_start(
         }
     };
 
-    // Safety guard against OOM: if upstream returned 200 OK (ignored Range), only allow if file is small (<= 16 MB)
-    if is_ok && total_size > (FAST_START_HEAD_SIZE + 1024) as u64 {
+    // Safety guard against OOM: if upstream returned 200 OK (ignored Range), only allow if file is small (<= target_head_size + 1024)
+    if is_ok && total_size > (target_head_size + 1024) as u64 {
         METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
         warn!(
             %original_url,
@@ -400,7 +435,7 @@ pub async fn resolve_fast_start_probe_url(url: &str) -> String {
     if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
         return url.to_string();
     }
-    if !prewarm_fast_start(None, url, &HashMap::new(), PrewarmPriority::High).await {
+    if !prewarm_fast_start(None, url, &HashMap::new(), PrewarmPriority::High, None).await {
         return url.to_string();
     }
     let Some(port) = ensure_local_probe_server().await else {
@@ -487,7 +522,7 @@ pub async fn handle_playback_request(
             let url_str = url.to_string();
             let headers_clone = upstream_headers.cloned().unwrap_or_default();
             tokio::spawn(async move {
-                prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High).await;
+                prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High, None).await;
             });
         }
     }
@@ -824,7 +859,7 @@ mod tests {
 
         // Spawn a Low-priority pre-warm; it must wait in the semaphore queue WITHOUT holding PREWARM_LOCKS
         let low_handle = tokio::spawn(async move {
-            prewarm_fast_start(None, &url_low, &HashMap::new(), PrewarmPriority::Low).await
+            prewarm_fast_start(None, &url_low, &HashMap::new(), PrewarmPriority::Low, None).await
         });
 
         // Give Low task a moment to enter the semaphore queue
@@ -838,7 +873,7 @@ mod tests {
         // Now run a High-priority pre-warm for the EXACT SAME URL while the semaphore is still 100% exhausted!
         let high_ok = tokio::time::timeout(
             Duration::from_millis(500),
-            prewarm_fast_start(None, &test_url, &HashMap::new(), PrewarmPriority::High),
+            prewarm_fast_start(None, &test_url, &HashMap::new(), PrewarmPriority::High, None),
         )
         .await
         .expect("High-priority pre-warm should not be blocked by exhausted background semaphore");
