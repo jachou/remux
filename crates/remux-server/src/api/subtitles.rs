@@ -1607,15 +1607,31 @@ pub(crate) fn append_external_subtitles(
 }
 
 fn has_real_probe_data(source: &api::MediaSourceInfo) -> bool {
-    matches!(
-        source
-            .remux
-            .as_ref()
-            .and_then(|remux| remux.source),
-        Some(api::ProbeOrigin::Ffprobe | api::ProbeOrigin::RemuxDb)
-    ) && !source
-        .media_streams
-        .is_empty()
+    let valid_origin = if !cfg!(test) && crate::playback::probe::SKIP_FFPROBE {
+        matches!(
+            source
+                .remux
+                .as_ref()
+                .and_then(|remux| remux.source),
+            Some(
+                api::ProbeOrigin::Ffprobe
+                    | api::ProbeOrigin::RemuxDb
+                    | api::ProbeOrigin::FilenameGuess
+            )
+        )
+    } else {
+        matches!(
+            source
+                .remux
+                .as_ref()
+                .and_then(|remux| remux.source),
+            Some(api::ProbeOrigin::Ffprobe | api::ProbeOrigin::RemuxDb)
+        )
+    };
+    valid_origin
+        && !source
+            .media_streams
+            .is_empty()
 }
 
 fn has_supported_embedded_subtitle(

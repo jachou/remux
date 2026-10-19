@@ -1248,6 +1248,12 @@ fn can_fallback_to_stale_probe_cache(cached: &api::MediaSourceInfo) -> bool {
                 .is_some())
 }
 
+/// When `true`, skips spawning `ffprobe` during stream selection and instead
+/// verifies candidate liveness via `is_alive()` (with automatic failover to
+/// fallback candidates if the primary URL is dead), populating metadata via
+/// `apply_filename_guess`.
+pub const SKIP_FFPROBE: bool = true;
+
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
 pub(crate) async fn probe_stream(
     stream: &db::Media,
@@ -1315,40 +1321,54 @@ pub(crate) async fn probe_stream(
         primary_alive = false;
     }
     let probe_primary_url = if primary_alive { url_opt } else { None };
-    let result = probe_with_fallback(
-        stream.clone(),
-        probe_primary_url,
-        timeout_secs,
-        auto_next_stream,
-        max_retries,
-        probe_pool,
-        restrict_resolution,
-        port,
-        db,
-        move |url| {
-            let effective_url = match tokio::runtime::Handle::try_current() {
-                Ok(handle) => {
-                    handle.block_on(crate::fast_start::resolve_fast_start_probe_url(&url))
-                }
-                Err(_) => url.clone(),
-            };
-            let res = probe_media_with(
-                &effective_url,
-                None,
-                Some(std::time::Duration::from_secs(timeout_secs)),
-            );
-            if res.is_err() && effective_url != url {
-                probe_media_with(
-                    &url,
+    let result = if SKIP_FFPROBE {
+        check_liveness_with_fallback(
+            stream.clone(),
+            probe_primary_url,
+            auto_next_stream,
+            max_retries,
+            probe_pool,
+            restrict_resolution,
+            port,
+            db,
+        )
+        .await
+    } else {
+        probe_with_fallback(
+            stream.clone(),
+            probe_primary_url,
+            timeout_secs,
+            auto_next_stream,
+            max_retries,
+            probe_pool,
+            restrict_resolution,
+            port,
+            db,
+            move |url| {
+                let effective_url = match tokio::runtime::Handle::try_current() {
+                    Ok(handle) => {
+                        handle.block_on(crate::fast_start::resolve_fast_start_probe_url(&url))
+                    }
+                    Err(_) => url.clone(),
+                };
+                let res = probe_media_with(
+                    &effective_url,
                     None,
                     Some(std::time::Duration::from_secs(timeout_secs)),
-                )
-            } else {
-                res
-            }
-        },
-    )
-    .await;
+                );
+                if res.is_err() && effective_url != url {
+                    probe_media_with(
+                        &url,
+                        None,
+                        Some(std::time::Duration::from_secs(timeout_secs)),
+                    )
+                } else {
+                    res
+                }
+            },
+        )
+        .await
+    };
 
     match result {
         Ok(result) => Ok(result),
@@ -1364,6 +1384,91 @@ pub(crate) async fn probe_stream(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Fast-path alternative to `probe_with_fallback` when `SKIP_FFPROBE` is `true`:
+/// verifies candidate liveness via `is_alive()` (with automatic failover to
+/// fallback candidates if the primary URL is dead) and populates metadata from
+/// the release filename without spawning `ffprobe`.
+async fn check_liveness_with_fallback(
+    primary: db::Media,
+    primary_url: Option<String>,
+    auto_next_stream: bool,
+    max_retries: usize,
+    probe_pool: &[db::Media],
+    restrict_resolution: bool,
+    port: u16,
+    db: &sqlx::SqlitePool,
+) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
+    let candidates = select_candidates(
+        &primary,
+        probe_pool,
+        auto_next_stream,
+        max_retries,
+        restrict_resolution,
+        port,
+    );
+
+    let all_to_try: Vec<_> = std::iter::once((primary.clone(), primary_url))
+        .chain(candidates.into_iter().map(|(m, u)| (m, Some(u))))
+        .collect();
+    let total_available = probe_pool.len();
+    let mut attempts = 0usize;
+
+    for (stream, url_opt) in all_to_try {
+        let is_retry = stream.id != primary.id;
+        let url = match url_opt {
+            Some(u) => u,
+            None => {
+                warn!(id = %stream.id, "skipping dead or unconfigured stream with no URL");
+                continue;
+            }
+        };
+        if stream
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| si.descriptor.is_known_dead())
+        {
+            info!(id = %stream.id, %url, "skipping candidate known to be dead in liveness cache");
+            continue;
+        }
+        attempts += 1;
+        let alive = match stream.stream_info.as_ref().map(|si| &si.descriptor) {
+            Some(d) => d.is_alive().await,
+            None => true,
+        };
+        if !alive {
+            warn!(
+                id = %stream.id,
+                url = %url,
+                attempt = attempts,
+                "liveness check failed (SKIP_FFPROBE=true), trying next candidate"
+            );
+            continue;
+        }
+
+        let mut info = api::MediaSourceInfo::from(stream.clone());
+        if apply_filename_guess(&mut info, &stream) {
+            let persisted = crate::conversions::filename_guess_persist_payload(&info);
+            if let Err(e) = db::Media::save_probe_data(db, &stream.id, &persisted).await {
+                warn!(id = %stream.id, error = %e, "failed to persist filename-guessed probe data");
+            }
+        }
+        apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+        info!(
+            id = %stream.id,
+            is_retry,
+            attempt = attempts,
+            "[FAST-START] SKIP_FFPROBE=true: candidate confirmed alive via HTTP liveness check (0ms ffprobe)"
+        );
+        return Ok((info, stream));
+    }
+
+    Err(anyhow!(
+        "all liveness attempts failed for '{}' (tried {attempts} of {total_available} streams)",
+        primary.full_title()
+    ))
+    .context_internal("stream liveness check failed — no usable streams found")
 }
 
 fn select_candidates(

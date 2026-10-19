@@ -415,6 +415,21 @@ pub async fn resolve_fast_start_probe_url(url: &str) -> String {
     format!("http://127.0.0.1:{port}/fast-start-probe?url={encoded}")
 }
 
+/// Returns true when the `/stream` request comes from a web browser HTML5 `<video>` element
+/// (e.g. Jellyfin Web). Chromium's `MultiBufferDataSource` enforces single-origin verification
+/// across byte-range requests: if `bytes=0-` is served as `206` from Remux (`Origin A`) and a
+/// subsequent seek/range returns `307` to the Debrid CDN (`Origin B`), the browser aborts playback.
+/// Native clients (`Infuse`, `Lavf`, `VLC`, `mpv`) have no browser CORS/single-origin restriction.
+fn is_browser_video_request(headers: &HeaderMap) -> bool {
+    if headers.contains_key("sec-fetch-dest") || headers.contains_key("sec-fetch-mode") {
+        return true;
+    }
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ua| ua.starts_with("Mozilla/"))
+}
+
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///
@@ -425,6 +440,27 @@ pub async fn handle_playback_request(
     headers: &HeaderMap,
     upstream_headers: Option<&HashMap<String, String>>,
 ) -> Option<Response> {
+    if is_browser_video_request(headers) {
+        if let Some(entry) = FAST_START_CACHE.get(url) {
+            info!(
+                %item_id,
+                direct_cdn = %entry.direct_cdn_url,
+                "[FAST-START] Browser <video> request detected; issuing consistent 307 to direct CDN from byte 0"
+            );
+            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
+            redirect.headers_mut().insert(
+                "X-Remux-FastStart",
+                HeaderValue::from_static("browser-direct-cdn"),
+            );
+            return Some(redirect);
+        }
+        info!(
+            %item_id,
+            "[FAST-START] Browser <video> request detected (uncached); falling back to standard 307 redirect"
+        );
+        return None;
+    }
+
     // 1. Direct lookup by exact URL to avoid stream hijacking if the user selected a different version/source
     let mut entry = FAST_START_CACHE.get(url);
 
