@@ -615,6 +615,35 @@ pub async fn remux_faststart_stats() -> Result<impl IntoResponse> {
     Ok(Json(crate::fast_start::stats_json()))
 }
 
+#[query]
+#[derive(Debug, Default)]
+pub struct FastStartModeQuery {
+    pub force_direct_307: Option<bool>,
+}
+
+#[get("/remux/faststart/mode")]
+pub async fn remux_faststart_mode(
+    Query(q): Query<FastStartModeQuery>,
+) -> Result<impl IntoResponse> {
+    if let Some(force) = q.force_direct_307 {
+        crate::fast_start::set_force_direct_307(force);
+        tracing::info!(force_direct_307 = force, "[FAST-START] Set FORCE_DIRECT_307 mode");
+    }
+    Ok(Json(json!({
+        "force_direct_307": crate::fast_start::is_force_direct_307()
+    })))
+}
+
+#[post("/remux/faststart/toggle")]
+pub async fn remux_faststart_toggle() -> Result<impl IntoResponse> {
+    let current = crate::fast_start::is_force_direct_307();
+    crate::fast_start::set_force_direct_307(!current);
+    tracing::info!(force_direct_307 = !current, "[FAST-START] Toggled FORCE_DIRECT_307 mode");
+    Ok(Json(json!({
+        "force_direct_307": !current
+    })))
+}
+
 #[get("/remux/streams/{id}")]
 pub async fn remux_streams(
     State(state): State<AppState>,

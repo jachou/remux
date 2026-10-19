@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
@@ -22,6 +22,25 @@ pub const FAST_START_HEAD_SIZE: usize = FAST_START_DEFAULT_HEAD_SIZE;
 
 /// Tail buffer size for MKV Cues / seekhead index: 2 MB.
 pub const FAST_START_TAIL_SIZE: usize = 2 * 1024 * 1024;
+
+/// Global toggle: when enabled, Remux does NOT buffer head/tail bytes in RAM.
+/// Instead, pre-warming only resolves the direct Debrid CDN edge URL, and playback requests
+/// (from byte 0 to any seek) immediately receive an HTTP 307 redirect directly to the Debrid CDN.
+pub static FORCE_DIRECT_307: LazyLock<AtomicBool> = LazyLock::new(|| {
+    let enabled = std::env::var("REMUX_FORCE_DIRECT_307")
+        .or_else(|_| std::env::var("FAST_START_FORCE_DIRECT_307"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    AtomicBool::new(enabled)
+});
+
+pub fn is_force_direct_307() -> bool {
+    FORCE_DIRECT_307.load(Ordering::Relaxed)
+}
+
+pub fn set_force_direct_307(val: bool) {
+    FORCE_DIRECT_307.store(val, Ordering::Relaxed);
+}
 
 /// Determines the ideal Fast-Start head buffer size based on URL clues, file size, or 4K flags.
 pub fn calculate_fast_start_head_size(
@@ -162,6 +181,66 @@ pub async fn prewarm_fast_start(
             item = ?item_id,
             head_bytes = entry.head_bytes.len(),
             "[FAST-START] Stream already cached; skipping prewarm"
+        );
+        return true;
+    }
+
+    // If FORCE_DIRECT_307 is enabled, do NOT download 32MB head or 2MB tail into RAM!
+    // Only resolve the redirect chain to capture the direct Debrid CDN edge URL in ~50ms (0 bytes buffered in RAM).
+    if is_force_direct_307() {
+        if FAST_START_CACHE.get(original_url).is_some() {
+            return true;
+        }
+        let _guard = PREWARM_LOCKS.lock(original_url.to_string()).await;
+        if FAST_START_CACHE.get(original_url).is_some() {
+            return true;
+        }
+
+        let mut head_req = PREWARM_CLIENT.get(original_url);
+        for (k, v) in request_headers {
+            head_req = head_req.header(k.as_str(), v.as_str());
+        }
+        head_req = head_req.header(header::RANGE, "bytes=0-0");
+        let head_resp = match head_req.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
+                warn!(%original_url, error = %e, "[FAST-START] Direct-307 resolution request failed");
+                return false;
+            }
+        };
+
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            original_url.to_string(),
+            crate::stream::LivenessEntry::new(true),
+        );
+
+        let direct_cdn_url = head_resp.url().as_str().to_string();
+        let total_size = head_resp
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cr| cr.split('/').last())
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let content_type = detect_content_type(original_url).to_string();
+
+        let entry = FastStartEntry {
+            item_id,
+            original_url: original_url.to_string(),
+            direct_cdn_url: direct_cdn_url.clone(),
+            total_size,
+            head_bytes: Bytes::new(),
+            tail_bytes: None,
+            content_type,
+            created_at: Instant::now(),
+        };
+        FAST_START_CACHE.insert(original_url.to_string(), entry);
+        info!(
+            %original_url,
+            item = ?item_id,
+            direct_cdn_host = head_resp_host(&direct_cdn_url),
+            "[FAST-START] Resolved direct Debrid CDN URL (0 bytes RAM buffered, FORCE_DIRECT_307=true)"
         );
         return true;
     }
@@ -475,6 +554,40 @@ pub async fn handle_playback_request(
     headers: &HeaderMap,
     upstream_headers: Option<&HashMap<String, String>>,
 ) -> Option<Response> {
+    if is_force_direct_307() {
+        if let Some(entry) = FAST_START_CACHE.get(url) {
+            METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            info!(
+                %item_id,
+                direct_cdn = %entry.direct_cdn_url,
+                "[FAST-START] FORCE_DIRECT_307=true: immediately issuing 307 directly to Debrid CDN from byte 0"
+            );
+            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
+            redirect.headers_mut().insert(
+                "X-Remux-FastStart",
+                HeaderValue::from_static("force-direct-307"),
+            );
+            return Some(redirect);
+        }
+        let url_str = url.to_string();
+        let headers_clone = upstream_headers.cloned().unwrap_or_default();
+        tokio::spawn(async move {
+            prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High, None).await;
+        });
+        METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+        info!(
+            %item_id,
+            %url,
+            "[FAST-START] FORCE_DIRECT_307=true (uncached): redirecting immediately to upstream stream (307)"
+        );
+        let mut redirect = Redirect::temporary(url).into_response();
+        redirect.headers_mut().insert(
+            "X-Remux-FastStart",
+            HeaderValue::from_static("force-direct-307-uncached"),
+        );
+        return Some(redirect);
+    }
+
     if is_browser_video_request(headers) {
         if let Some(entry) = FAST_START_CACHE.get(url) {
             info!(
@@ -777,6 +890,7 @@ pub fn stats_json() -> serde_json::Value {
             "bytes_served_lan_mb": (METRICS.bytes_served_lan.load(Ordering::Relaxed) as f64) / (1024.0 * 1024.0),
         },
         "cache": {
+            "force_direct_307": is_force_direct_307(),
             "max_items": FAST_START_MAX_ITEMS,
             "cached_items_count": cached_items.len(),
             "total_ram_bytes": total_ram_bytes,
@@ -791,8 +905,12 @@ pub fn stats_json() -> serde_json::Value {
 mod tests {
     use super::*;
 
+    static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
     #[tokio::test]
     async fn head_subrange_requests_served_from_ram() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
         let test_url = "http://127.0.0.1:9999/shogun-subrange-test.mkv";
         let head_data: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
         FAST_START_CACHE.insert(
@@ -889,5 +1007,46 @@ mod tests {
         drop(p2);
         let low_ok = low_handle.await.unwrap();
         assert!(low_ok);
+    }
+
+    #[tokio::test]
+    async fn force_direct_307_bypasses_ram_buffer() {
+        let _lock = TEST_LOCK.lock().await;
+        let test_url = "http://127.0.0.1:9999/force-307-test.mkv";
+        let cdn_url = "http://cdn.example.com/direct-debrid.mkv";
+        FAST_START_CACHE.insert(
+            test_url.to_string(),
+            FastStartEntry {
+                item_id: Some(Uuid::nil()),
+                original_url: test_url.to_string(),
+                direct_cdn_url: cdn_url.to_string(),
+                head_bytes: Bytes::from(vec![0xAA; 1024]),
+                tail_bytes: None,
+                total_size: 1_000_000,
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+
+        // When FORCE_DIRECT_307 is enabled, even a request for byte 0 gets a 307 redirect
+        set_force_direct_307(true);
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+        let resp = handle_playback_request(Uuid::nil(), test_url, &headers, None)
+            .await
+            .expect("should handle request");
+
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get("X-Remux-FastStart").unwrap(),
+            "force-direct-307"
+        );
+        assert_eq!(
+            resp.headers().get(header::LOCATION).unwrap(),
+            cdn_url
+        );
+
+        // Reset to false
+        set_force_direct_307(false);
     }
 }
