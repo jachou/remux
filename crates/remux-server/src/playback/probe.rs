@@ -1326,11 +1326,26 @@ pub(crate) async fn probe_stream(
         port,
         db,
         move |url| {
-            probe_media_with(
-                &url,
+            let effective_url = match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    handle.block_on(crate::fast_start::resolve_fast_start_probe_url(&url))
+                }
+                Err(_) => url.clone(),
+            };
+            let res = probe_media_with(
+                &effective_url,
                 None,
                 Some(std::time::Duration::from_secs(timeout_secs)),
-            )
+            );
+            if res.is_err() && effective_url != url {
+                probe_media_with(
+                    &url,
+                    None,
+                    Some(std::time::Duration::from_secs(timeout_secs)),
+                )
+            } else {
+                res
+            }
         },
     )
     .await;

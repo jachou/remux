@@ -278,42 +278,43 @@ pub async fn prewarm_fast_start(
         .map(|ct| ct.to_string())
         .unwrap_or_else(|| detect_content_type(original_url).to_string());
 
-    // Read the head bytes
-    let head_bytes = match head_resp.bytes().await {
+    // Step 2: Read the 16 MB head body AND fetch the 256 KB tail index (MKV Cues) in parallel!
+    let tail_fut = async {
+        if total_size > FAST_START_TAIL_SIZE as u64 {
+            let tail_start = total_size - FAST_START_TAIL_SIZE as u64;
+            let tail_range = format!("bytes={}-{}", tail_start, total_size - 1);
+            let mut tail_req = PREWARM_CLIENT.get(&direct_cdn_url);
+            for (k, v) in request_headers {
+                tail_req = tail_req.header(k.as_str(), v.as_str());
+            }
+            tail_req = tail_req.header(header::RANGE, tail_range);
+
+            match tail_req.send().await {
+                // Tail fetch MUST be HTTP 206 Partial Content. If server returned 200 OK, it ignored Range!
+                Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => r.bytes().await.ok(),
+                Ok(r) => {
+                    warn!(%original_url, status = ?r.status(), "[FAST-START] Tail fetch returned non-206 status (Range ignored or error)");
+                    None
+                }
+                Err(e) => {
+                    warn!(%original_url, error = %e, "[FAST-START] Tail fetch request error");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    let (head_res, tail_bytes) = tokio::join!(head_resp.bytes(), tail_fut);
+
+    let head_bytes = match head_res {
         Ok(b) => b,
         Err(e) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
             warn!(%original_url, error = %e, "[FAST-START] Failed reading head response body");
             return false;
         }
-    };
-
-    // Step 2: Fetch the tail index (last 128 KB for MKV Cues), if file is larger than head
-    let tail_bytes = if total_size > FAST_START_TAIL_SIZE as u64 {
-        let tail_start = total_size - FAST_START_TAIL_SIZE as u64;
-        let tail_range = format!("bytes={}-{}", tail_start, total_size - 1);
-        let mut tail_req = PREWARM_CLIENT.get(&direct_cdn_url);
-        for (k, v) in request_headers {
-            tail_req = tail_req.header(k.as_str(), v.as_str());
-        }
-        tail_req = tail_req.header(header::RANGE, tail_range);
-
-        match tail_req.send().await {
-            // Tail fetch MUST be HTTP 206 Partial Content. If server returned 200 OK, it ignored Range!
-            Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
-                r.bytes().await.ok()
-            }
-            Ok(r) => {
-                warn!(%original_url, status = ?r.status(), "[FAST-START] Tail fetch returned non-206 status (Range ignored or error)");
-                None
-            }
-            Err(e) => {
-                warn!(%original_url, error = %e, "[FAST-START] Tail fetch request error");
-                None
-            }
-        }
-    } else {
-        None
     };
 
     let entry = FastStartEntry {
@@ -351,6 +352,67 @@ fn head_resp_host(url: &str) -> &str {
         .nth(1)
         .and_then(|s| s.split('/').next())
         .unwrap_or(url)
+}
+
+static LOCAL_PROBE_PORT: tokio::sync::OnceCell<u16> = tokio::sync::OnceCell::const_new();
+
+async fn ensure_local_probe_server() -> Option<u16> {
+    LOCAL_PROBE_PORT
+        .get_or_try_init(|| async {
+            let app = axum::Router::new().route(
+                "/fast-start-probe",
+                axum::routing::get(
+                    |axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+                     headers: HeaderMap| async move {
+                        let Some(url) = params.get("url") else {
+                            return StatusCode::BAD_REQUEST.into_response();
+                        };
+                        if let Some(resp) =
+                            handle_playback_request(Uuid::nil(), url, &headers, None).await
+                        {
+                            resp
+                        } else {
+                            Redirect::temporary(url).into_response()
+                        }
+                    },
+                ),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let port = listener.local_addr()?.port();
+            tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            Ok::<u16, std::io::Error>(port)
+        })
+        .await
+        .ok()
+        .copied()
+}
+
+/// Ensures the given HTTP URL is pre-warmed in `FAST_START_CACHE` and returns a localhost
+/// Fast-Start URL (`http://127.0.0.1:{port}/fast-start-probe?url=...`) so `ffprobe` can read
+/// the 16 MB head and 256 KB tail cues directly from RAM in ~15ms instead of making multiple
+/// round-trips through upstream resolvers. Falls back to the original URL if uncached.
+pub async fn resolve_fast_start_probe_url(url: &str) -> String {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return url.to_string();
+    }
+    if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
+        return url.to_string();
+    }
+    if !prewarm_fast_start(None, url, &HashMap::new(), PrewarmPriority::High).await {
+        return url.to_string();
+    }
+    let Some(port) = ensure_local_probe_server().await else {
+        return url.to_string();
+    };
+    let encoded: String = url::form_urlencoded::byte_serialize(url.as_bytes()).collect();
+    info!(
+        %url,
+        local_port = port,
+        "[FAST-START] Routing ffprobe through local RAM buffer"
+    );
+    format!("http://127.0.0.1:{port}/fast-start-probe?url={encoded}")
 }
 
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)

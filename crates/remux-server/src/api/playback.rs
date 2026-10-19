@@ -282,24 +282,6 @@ async fn items_playbackinfo_inner(
             )
         });
 
-    let probe_cfg = db::Settings::get_config_or_default(
-        &state
-            .ctx
-            .db,
-    )
-    .await;
-    let subtitle_dedup = SubtitleDedupSettings::from_config(&probe_cfg);
-    let show_ungrouped = probe_cfg
-        .stream_groups_show_ungrouped
-        .unwrap_or(true);
-    let encoding_cfg = db::Settings::get_encoding_config(
-        &state
-            .ctx
-            .db,
-    )
-    .await
-    .unwrap_or_default();
-
     if session
         .user
         .policy
@@ -310,10 +292,18 @@ async fn items_playbackinfo_inner(
             .context_forbidden("media playback is disabled"));
     }
 
-    let media =
-        MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx)
-            .await?
-            .context_not_found("not found")?;
+    let (probe_cfg, encoding_cfg_res, media_res, (saved_audio, saved_subtitle)) = tokio::join!(
+        db::Settings::get_config_or_default(&state.ctx.db),
+        db::Settings::get_encoding_config(&state.ctx.db),
+        MediaResolveService::resolve_item(media_source_id.unwrap_or(id), &state.ctx),
+        load_saved_selections(&state.ctx.db, &session.user.id, &id),
+    );
+    let subtitle_dedup = SubtitleDedupSettings::from_config(&probe_cfg);
+    let show_ungrouped = probe_cfg
+        .stream_groups_show_ungrouped
+        .unwrap_or(true);
+    let encoding_cfg = encoding_cfg_res.unwrap_or_default();
+    let media = media_res?.context_not_found("not found")?;
 
     let mut service = StreamService::new(StreamServiceConfig {
         ctx: state
@@ -431,16 +421,6 @@ async fn items_playbackinfo_inner(
     let server_subtitle_lang = probe_cfg
         .preferred_metadata_language
         .as_deref();
-    let (saved_audio, saved_subtitle) = load_saved_selections(
-        &state
-            .ctx
-            .db,
-        &session
-            .user
-            .id,
-        &id,
-    )
-    .await;
     // The top-level item's language is only known after the subtitle fetch
     // below; the resolved media's own is the same item whenever ranking has
     // more than one candidate to order (no specific stream requested).
