@@ -870,24 +870,22 @@ pub async fn handle_playback_request(
             // stream and hits the RAM resume buffer.
             // If the user actually chose "Play from Beginning", Remux streams up to 64 MB seamlessly,
             // and once req_start reaches head_len + 64MB, Remux issues the 307 redirect to CDN.
-            if let Some((resume_start, _)) = entry.resume_buffer {
-                let bridge_cap = head_len + FAST_START_PROXY_BRIDGE_CAP;
-                if req_start < resume_start && req_start < bridge_cap {
-                    let bridge_end = (req_start + FAST_START_PROXY_BRIDGE_CAP - 1)
-                        .min(resume_start.saturating_sub(1))
-                        .min(entry.total_size.saturating_sub(1));
-                    let clamped_range = format!("bytes={}-{}", req_start, bridge_end);
-                    info!(
-                        %item_id,
-                        req_start,
-                        bridge_end,
-                        resume_start,
-                        bridge_cap,
-                        "[FAST-START] Proxying head continuation bridge (capped at 64 MB) to keep session anchored for resume seek"
-                    );
-                    if let Some(resp) = proxy_upstream_range(&entry.direct_cdn_url, &clamped_range, upstream_headers).await {
-                        return Some(resp);
-                    }
+            let bridge_cap = head_len + FAST_START_PROXY_BRIDGE_CAP;
+            let resume_start_limit = entry.resume_buffer.as_ref().map(|(s, _)| *s).unwrap_or(u64::MAX);
+            if req_start >= head_len && req_start < bridge_cap && req_start < resume_start_limit {
+                let bridge_end = (req_start + FAST_START_PROXY_BRIDGE_CAP - 1)
+                    .min(resume_start_limit.saturating_sub(1))
+                    .min(entry.total_size.saturating_sub(1));
+                let clamped_range = format!("bytes={}-{}", req_start, bridge_end);
+                info!(
+                    %item_id,
+                    req_start,
+                    bridge_end,
+                    bridge_cap,
+                    "[FAST-START] Proxying head continuation bridge (capped at 64 MB) to keep session anchored for resume seek"
+                );
+                if let Some(resp) = proxy_upstream_range(&entry.direct_cdn_url, &clamped_range, upstream_headers).await {
+                    return Some(resp);
                 }
             }
 
