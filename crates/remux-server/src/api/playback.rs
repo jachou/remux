@@ -527,12 +527,6 @@ async fn items_playbackinfo_inner(
                     si.size.map(|s| s as u64),
                     None,
                 );
-                let resume_pos = if let Some(ticks) = q.start_time_ticks.filter(|t| *t > 0) {
-                    Some((ticks / 10_000_000) as f64)
-                } else {
-                    crate::fast_start::lookup_resume_position(&state.ctx.db, Some(session.user.id), Some(id)).await
-                };
-                let duration_secs = item_runtime_seconds.map(|s| s as f64);
                 tokio::spawn(async move {
                     crate::fast_start::prewarm_fast_start(
                         Some(item_id),
@@ -540,8 +534,6 @@ async fn items_playbackinfo_inner(
                         &headers_clone,
                         crate::fast_start::PrewarmPriority::High,
                         Some(head_size),
-                        resume_pos,
-                        duration_secs,
                     )
                     .await;
                 });
