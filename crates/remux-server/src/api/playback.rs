@@ -543,7 +543,13 @@ async fn items_playbackinfo_inner(
                 let headers_clone = request_headers.clone();
                 let item_id = id;
                 tokio::spawn(async move {
-                    crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
+                    crate::fast_start::prewarm_fast_start(
+                        Some(item_id),
+                        &url_clone,
+                        &headers_clone,
+                        crate::fast_start::PrewarmPriority::High,
+                    )
+                    .await;
                 });
             }
         }

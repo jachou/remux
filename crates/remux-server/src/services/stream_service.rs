@@ -749,6 +749,34 @@ impl StreamService {
                 .first()
                 .map(|s| s.id)
         };
+
+        // Kick off High-priority Fast-Start pre-warm in parallel with probing
+        // so the 16 MB head buffer downloads concurrently while liveness / ffprobe runs.
+        if let Some(first) = sel.candidates.first() {
+            if let Some(si) = &first.stream_info {
+                if !si.descriptor.is_known_dead() {
+                    if let crate::stream::StreamDescriptor::Http {
+                        url,
+                        request_headers,
+                        ..
+                    } = &si.descriptor
+                    {
+                        let url_clone = url.clone();
+                        let headers_clone = request_headers.clone();
+                        let item_id = self.item_id;
+                        tokio::spawn(async move {
+                            crate::fast_start::prewarm_fast_start(
+                                Some(item_id),
+                                &url_clone,
+                                &headers_clone,
+                                crate::fast_start::PrewarmPriority::High,
+                            )
+                            .await;
+                        });
+                    }
+                }
+            }
+        }
         let probe_cfg = db::Settings::get_config_or_default(
             &self
                 .ctx
@@ -1422,7 +1450,25 @@ impl StreamService {
 
         if let Some(cached) = &stream.probe_data {
             if is_reusable_probe_cache(cached) {
-                tracing::info!(item = %self.item_id, stream = %stream.id, "Candidate #1 already has reusable probe data; pre-warming liveness");
+                tracing::info!(item = %self.item_id, stream = %stream.id, "Candidate #1 already has reusable probe data; pre-warming liveness & fast-start in parallel");
+                if let Some(si) = &stream.stream_info {
+                    if !si.descriptor.is_known_dead() {
+                        if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                            let url_clone = url.clone();
+                            let headers_clone = request_headers.clone();
+                            let item_id = self.item_id;
+                            tokio::spawn(async move {
+                                crate::fast_start::prewarm_fast_start(
+                                    Some(item_id),
+                                    &url_clone,
+                                    &headers_clone,
+                                    crate::fast_start::PrewarmPriority::Low,
+                                )
+                                .await;
+                            });
+                        }
+                    }
+                }
                 let is_alive = if let Some(si) = &stream.stream_info {
                     if si.descriptor.is_liveness_expiring_soon() {
                         si.descriptor.refresh_liveness().await
@@ -1433,16 +1479,6 @@ impl StreamService {
                     true
                 };
                 if is_alive {
-                    if let Some(si) = &stream.stream_info {
-                        if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                            let url_clone = url.clone();
-                            let headers_clone = request_headers.clone();
-                            let item_id = self.item_id;
-                            tokio::spawn(async move {
-                                crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
-                            });
-                        }
-                    }
                     return Ok(Some(stream.id));
                 }
             }
@@ -1469,6 +1505,26 @@ impl StreamService {
             timeout
         };
 
+        // Start Low-priority Fast-Start pre-warm for Candidate #1 in parallel with ffprobe
+        if let Some(si) = &stream.stream_info {
+            if !si.descriptor.is_known_dead() {
+                if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                    let url_clone = url.clone();
+                    let headers_clone = request_headers.clone();
+                    let item_id = self.item_id;
+                    tokio::spawn(async move {
+                        crate::fast_start::prewarm_fast_start(
+                            Some(item_id),
+                            &url_clone,
+                            &headers_clone,
+                            crate::fast_start::PrewarmPriority::Low,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
+
         tracing::info!(item = %self.item_id, stream = %stream.id, "probing Candidate #1 preemptively");
         let (_info, effective) = probe_stream(
             &stream,
@@ -1486,14 +1542,22 @@ impl StreamService {
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         tracing::info!(item = %self.item_id, effective = %effective.id, "preemptive probe of Candidate #1 completed");
-        if let Some(si) = &effective.stream_info {
-            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                let url_clone = url.clone();
-                let headers_clone = request_headers.clone();
-                let item_id = self.item_id;
-                tokio::spawn(async move {
-                    crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
-                });
+        if effective.id != stream.id {
+            if let Some(si) = &effective.stream_info {
+                if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                    let url_clone = url.clone();
+                    let headers_clone = request_headers.clone();
+                    let item_id = self.item_id;
+                    tokio::spawn(async move {
+                        crate::fast_start::prewarm_fast_start(
+                            Some(item_id),
+                            &url_clone,
+                            &headers_clone,
+                            crate::fast_start::PrewarmPriority::Low,
+                        )
+                        .await;
+                    });
+                }
             }
         }
         Ok(Some(effective.id))
@@ -1580,11 +1644,28 @@ pub fn spawn_preemptive_probe(
             return;
         }
 
-        // Fast path: if Candidate #1 already has reusable probe data, pre-warm immediately without waiting for a semaphore permit!
+        // Fast path: if Candidate #1 already has reusable probe data, pre-warm immediately in parallel without waiting for a semaphore permit!
         if let Ok((Some(primary), _)) = service.resolve_primary_candidate().await {
             if let Some(cached) = &primary.probe_data {
                 if is_reusable_probe_cache(cached) {
-                    tracing::info!(%item_id, stream_id = %primary.id, "Candidate #1 already probed in DB; pre-warming liveness");
+                    tracing::info!(%item_id, stream_id = %primary.id, "Candidate #1 already probed in DB; pre-warming liveness & fast-start in parallel");
+                    if let Some(si) = &primary.stream_info {
+                        if !si.descriptor.is_known_dead() {
+                            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                                let url_clone = url.clone();
+                                let headers_clone = request_headers.clone();
+                                tokio::spawn(async move {
+                                    crate::fast_start::prewarm_fast_start(
+                                        Some(item_id),
+                                        &url_clone,
+                                        &headers_clone,
+                                        crate::fast_start::PrewarmPriority::Low,
+                                    )
+                                    .await;
+                                });
+                            }
+                        }
+                    }
                     let is_alive = if let Some(si) = &primary.stream_info {
                         if si.descriptor.is_liveness_expiring_soon() {
                             si.descriptor.refresh_liveness().await
@@ -1595,15 +1676,6 @@ pub fn spawn_preemptive_probe(
                         true
                     };
                     if is_alive {
-                        if let Some(si) = &primary.stream_info {
-                            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                                let url_clone = url.clone();
-                                let headers_clone = request_headers.clone();
-                                tokio::spawn(async move {
-                                    crate::fast_start::prewarm_fast_start(Some(item_id), &url_clone, &headers_clone).await;
-                                });
-                            }
-                        }
                         prefetch_subtitles_for_media(&ctx, &media, Some(&primary), user_id).await;
                         return;
                     }

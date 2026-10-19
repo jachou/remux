@@ -36,6 +36,17 @@ pub struct FastStartEntry {
     pub created_at: Instant,
 }
 
+/// Priority lane for Fast-Start pre-warming.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PrewarmPriority {
+    /// Interactive / foreground user action (`PlaybackInfo`, direct `/stream` hit).
+    /// Bypasses `FAST_START_PREWARM_SEMAPHORE` so the download starts in 0ms.
+    High,
+    /// Speculative background pre-warm (home screen, season browsing, next-episode).
+    /// Waits for a permit from `FAST_START_PREWARM_SEMAPHORE` before locking `PREWARM_LOCKS`.
+    Low,
+}
+
 /// Global metrics for fast-start acceleration.
 pub struct FastStartMetrics {
     pub hits_head: AtomicU64,
@@ -43,6 +54,8 @@ pub struct FastStartMetrics {
     pub redirects_issued: AtomicU64,
     pub misses: AtomicU64,
     pub prewarms_started: AtomicU64,
+    pub prewarms_high_started: AtomicU64,
+    pub prewarms_low_started: AtomicU64,
     pub prewarms_succeeded: AtomicU64,
     pub prewarms_failed: AtomicU64,
     pub bytes_served_lan: AtomicU64,
@@ -56,6 +69,8 @@ impl FastStartMetrics {
             redirects_issued: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             prewarms_started: AtomicU64::new(0),
+            prewarms_high_started: AtomicU64::new(0),
+            prewarms_low_started: AtomicU64::new(0),
             prewarms_succeeded: AtomicU64::new(0),
             prewarms_failed: AtomicU64::new(0),
             bytes_served_lan: AtomicU64::new(0),
@@ -74,13 +89,18 @@ pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStart
             .build()
     });
 
-/// Keyed lock to prevent duplicate concurrent pre-warms for the same URL.
+/// Tracks URLs currently queued or running in the low-priority background lane to prevent duplicate spawns.
+static QUEUED_PREWARMS: LazyLock<dashmap::DashSet<String>> =
+    LazyLock::new(dashmap::DashSet::new);
+
+/// Keyed lock held ONLY while actively downloading a URL (after any background semaphore permit is acquired).
 static PREWARM_LOCKS: LazyLock<crate::keyed_lock::KeyedLock<String>> =
     LazyLock::new(crate::keyed_lock::KeyedLock::new);
 
-/// Global semaphore limiting concurrent background pre-warms to 3 simultaneous chunk downloads.
+/// Global semaphore limiting concurrent low-priority background pre-warms to 2 simultaneous chunk downloads,
+/// leaving bandwidth headroom for high-priority interactive playback requests.
 pub static FAST_START_PREWARM_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
-    LazyLock::new(|| tokio::sync::Semaphore::new(3));
+    LazyLock::new(|| tokio::sync::Semaphore::new(2));
 
 /// Dedicated reqwest client for pre-warming (follows HTTP 302/307 redirects to CDN).
 static PREWARM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
@@ -100,6 +120,7 @@ pub async fn prewarm_fast_start(
     item_id: Option<Uuid>,
     original_url: &str,
     request_headers: &HashMap<String, String>,
+    priority: PrewarmPriority,
 ) -> bool {
     // If already pre-warmed and cached, skip!
     if let Some(entry) = FAST_START_CACHE.get(original_url) {
@@ -112,35 +133,71 @@ pub async fn prewarm_fast_start(
         return true;
     }
 
-    // Coalesce concurrent prewarms for the same stream URL
-    let _guard = PREWARM_LOCKS.lock(original_url.to_string()).await;
+    struct QueuedPrewarmGuard(Option<String>);
+    impl Drop for QueuedPrewarmGuard {
+        fn drop(&mut self) {
+            if let Some(ref url) = self.0 {
+                QUEUED_PREWARMS.remove(url);
+            }
+        }
+    }
 
-    // Double check cache after acquiring lock
+    // Low-priority tasks deduplicate via QUEUED_PREWARMS and wait for a background semaphore permit
+    // BEFORE acquiring PREWARM_LOCKS so they never block foreground playback requests or High-priority prewarms.
+    let (_queued_guard, _permit) = match priority {
+        PrewarmPriority::Low => {
+            if !QUEUED_PREWARMS.insert(original_url.to_string()) {
+                debug!(
+                    %original_url,
+                    item = ?item_id,
+                    "[FAST-START] Low-priority pre-warm already queued or in-flight; skipping duplicate"
+                );
+                return false;
+            }
+            let q_guard = QueuedPrewarmGuard(Some(original_url.to_string()));
+            let permit = match tokio::time::timeout(
+                Duration::from_secs(60),
+                FAST_START_PREWARM_SEMAPHORE.acquire(),
+            )
+            .await
+            {
+                Ok(Ok(p)) => p,
+                _ => {
+                    warn!(%original_url, "[FAST-START] Timed out waiting for low-priority pre-warm semaphore permit, skipping");
+                    return false;
+                }
+            };
+            (q_guard, Some(permit))
+        }
+        PrewarmPriority::High => (QueuedPrewarmGuard(None), None),
+    };
+
+    // Re-check cache before acquiring active lock (in case a High-priority task finished while Low was queued)
     if FAST_START_CACHE.get(original_url).is_some() {
         return true;
     }
 
-    let _permit = match tokio::time::timeout(
-        Duration::from_secs(60),
-        FAST_START_PREWARM_SEMAPHORE.acquire(),
-    )
-    .await
-    {
-        Ok(Ok(p)) => p,
-        _ => {
-            warn!(%original_url, "[FAST-START] Timed out waiting for pre-warm semaphore permit, skipping");
-            return false;
-        }
-    };
+    // Coalesce concurrent active downloads for the same stream URL
+    let _guard = PREWARM_LOCKS.lock(original_url.to_string()).await;
+
+    // Double check cache after acquiring active lock
+    if FAST_START_CACHE.get(original_url).is_some() {
+        return true;
+    }
 
     METRICS.prewarms_started.fetch_add(1, Ordering::Relaxed);
+    match priority {
+        PrewarmPriority::High => METRICS.prewarms_high_started.fetch_add(1, Ordering::Relaxed),
+        PrewarmPriority::Low => METRICS.prewarms_low_started.fetch_add(1, Ordering::Relaxed),
+    };
     let start_time = Instant::now();
 
     info!(
         %original_url,
         item = ?item_id,
+        ?priority,
         target_size_mb = FAST_START_HEAD_SIZE / (1024 * 1024),
-        "[FAST-START] Starting background pre-warm"
+        "[FAST-START] Starting pre-warm download"
     );
 
     // Step 1: Request the first 64 MB (bytes 0 to 67108863)
@@ -169,6 +226,12 @@ pub async fn prewarm_fast_start(
         warn!(%original_url, ?status, "[FAST-START] Pre-warm head request returned non-success status");
         return false;
     }
+
+    // Stream responded with 200/206: populate STREAM_LIVENESS_CACHE immediately so liveness checks are instant
+    crate::stream::STREAM_LIVENESS_CACHE.insert(
+        original_url.to_string(),
+        crate::stream::LivenessEntry::new(true),
+    );
 
     // Capture the direct CDN edge URL after Stremthru redirect
     let direct_cdn_url = head_resp.url().as_str().to_string();
@@ -326,7 +389,7 @@ pub async fn handle_playback_request(
             let url_str = url.to_string();
             let headers_clone = upstream_headers.cloned().unwrap_or_default();
             tokio::spawn(async move {
-                prewarm_fast_start(Some(item_id), &url_str, &headers_clone).await;
+                prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High).await;
             });
         }
     }
@@ -567,6 +630,8 @@ pub fn stats_json() -> serde_json::Value {
             "redirects_issued": METRICS.redirects_issued.load(Ordering::Relaxed),
             "misses": METRICS.misses.load(Ordering::Relaxed),
             "prewarms_started": METRICS.prewarms_started.load(Ordering::Relaxed),
+            "prewarms_high_started": METRICS.prewarms_high_started.load(Ordering::Relaxed),
+            "prewarms_low_started": METRICS.prewarms_low_started.load(Ordering::Relaxed),
             "prewarms_succeeded": METRICS.prewarms_succeeded.load(Ordering::Relaxed),
             "prewarms_failed": METRICS.prewarms_failed.load(Ordering::Relaxed),
             "bytes_served_lan": METRICS.bytes_served_lan.load(Ordering::Relaxed),
@@ -581,4 +646,69 @@ pub fn stats_json() -> serde_json::Value {
             "items": cached_items,
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn high_priority_prewarm_overtakes_queued_low_priority_on_same_url() {
+        // Exhaust all 2 permits of the background semaphore
+        let p1 = FAST_START_PREWARM_SEMAPHORE.acquire().await.unwrap();
+        let p2 = FAST_START_PREWARM_SEMAPHORE.acquire().await.unwrap();
+
+        let server = axum::Router::new().route(
+            "/video.mkv",
+            axum::routing::get(|| async {
+                Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(header::CONTENT_TYPE, "video/x-matroska")
+                    .header(header::CONTENT_RANGE, "bytes 0-15/16")
+                    .body(Body::from(vec![0x42u8; 16]))
+                    .unwrap()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, server).await.unwrap();
+        });
+
+        let test_url = format!("http://{}/video.mkv", addr);
+        let url_low = test_url.clone();
+
+        // Spawn a Low-priority pre-warm; it must wait in the semaphore queue WITHOUT holding PREWARM_LOCKS
+        let low_handle = tokio::spawn(async move {
+            prewarm_fast_start(None, &url_low, &HashMap::new(), PrewarmPriority::Low).await
+        });
+
+        // Give Low task a moment to enter the semaphore queue
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(QUEUED_PREWARMS.contains(&test_url));
+        assert!(
+            !PREWARM_LOCKS.contains_key(&test_url),
+            "Queued Low-priority task must NOT hold PREWARM_LOCKS before acquiring semaphore permit"
+        );
+
+        // Now run a High-priority pre-warm for the EXACT SAME URL while the semaphore is still 100% exhausted!
+        let high_ok = tokio::time::timeout(
+            Duration::from_millis(500),
+            prewarm_fast_start(None, &test_url, &HashMap::new(), PrewarmPriority::High),
+        )
+        .await
+        .expect("High-priority pre-warm should not be blocked by exhausted background semaphore");
+        assert!(high_ok);
+        assert!(FAST_START_CACHE.get(&test_url).is_some());
+        assert_eq!(
+            crate::stream::STREAM_LIVENESS_CACHE.get(&test_url).map(|e| e.alive),
+            Some(true)
+        );
+
+        // Release background permits; Low task wakes up, sees cache populated, and returns true immediately
+        drop(p1);
+        drop(p2);
+        let low_ok = low_handle.await.unwrap();
+        assert!(low_ok);
+    }
 }
