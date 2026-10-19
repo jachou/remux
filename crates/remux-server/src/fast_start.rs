@@ -461,30 +461,25 @@ pub async fn handle_playback_request(
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
     match range_header {
-        // Case 1: Initial probe / head request (Range: bytes=0- or bytes=0-X)
-        Some(rng) if rng.starts_with("bytes=0-") || rng == "bytes=0-" => {
+        // Case 1: Initial probe / head sub-range request (any Range starting inside the cached head buffer)
+        Some(rng) if is_head_range(rng, entry.head_bytes.len(), entry.total_size) => {
             METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
             let head_len = entry.head_bytes.len();
+            let (req_start, req_end) =
+                parse_range_bounds(rng, entry.total_size).unwrap_or((0, entry.total_size.saturating_sub(1)));
 
-            // Check if client requested a bounded sub-range of the head
-            let requested_end = rng[6..]
-                .split('-')
-                .nth(1)
-                .and_then(|s| s.parse::<usize>().ok());
-
-            let (slice, slice_len, end_offset) = match requested_end {
-                Some(end) if end < head_len => {
-                    let s = entry.head_bytes.slice(0..=end);
-                    let len = s.len();
-                    (s, len, end as u64)
-                }
-                _ => (entry.head_bytes.clone(), head_len, head_len.saturating_sub(1) as u64),
-            };
+            let start_idx = req_start as usize;
+            let end_idx = (req_end as usize).min(head_len.saturating_sub(1));
+            let slice = entry.head_bytes.slice(start_idx..=end_idx);
+            let slice_len = slice.len();
+            let end_offset = req_start + (slice_len as u64).saturating_sub(1);
 
             METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
 
             info!(
                 %item_id,
+                req_start,
+                end_offset,
                 slice_len,
                 total_size = entry.total_size,
                 "[FAST-START] Buffer hit (head): serving {} bytes locally over LAN",
@@ -496,7 +491,7 @@ pub async fn handle_playback_request(
                 .header(header::CONTENT_TYPE, &entry.content_type)
                 .header(
                     header::CONTENT_RANGE,
-                    format!("bytes 0-{}/{}", end_offset, entry.total_size),
+                    format!("bytes {}-{}/{}", req_start, end_offset, entry.total_size),
                 )
                 .header(header::CONTENT_LENGTH, slice_len.to_string())
                 .header(header::ACCEPT_RANGES, "bytes")
@@ -637,6 +632,17 @@ fn parse_range_bounds(range_str: &str, total_size: u64) -> Option<(u64, u64)> {
     }
 }
 
+/// Determines whether a Range header starts inside the cached head buffer.
+fn is_head_range(range_str: &str, head_len: usize, total_size: u64) -> bool {
+    if head_len == 0 {
+        return false;
+    }
+    let Some((start, end)) = parse_range_bounds(range_str, total_size) else {
+        return false;
+    };
+    start < (head_len as u64) && end >= start
+}
+
 /// Determines whether a Range header is requesting the tail (MKV Cues / seekhead) region.
 fn is_tail_range(range_str: &str, total_size: u64) -> bool {
     let Some((start, _)) = parse_range_bounds(range_str, total_size) else {
@@ -713,6 +719,46 @@ pub fn stats_json() -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn head_subrange_requests_served_from_ram() {
+        let test_url = "http://127.0.0.1:9999/shogun-subrange-test.mkv";
+        let head_data: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+        FAST_START_CACHE.insert(
+            test_url.to_string(),
+            FastStartEntry {
+                item_id: Some(Uuid::nil()),
+                original_url: test_url.to_string(),
+                direct_cdn_url: "http://cdn.example.com/shogun.mkv".to_string(),
+                head_bytes: Bytes::from(head_data.clone()),
+                tail_bytes: None,
+                total_size: 1_000_000,
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+
+        // Request an open-ended range starting at byte 8154 inside the 16 KB head buffer
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=8154-"));
+        let resp = handle_playback_request(Uuid::nil(), test_url, &headers, None)
+            .await
+            .expect("should hit fast-start cache");
+
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("X-Remux-FastStart").unwrap(),
+            "hit-head"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 8154-16383/1000000"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body_bytes[..], &head_data[8154..16384]);
+    }
 
     #[tokio::test]
     async fn high_priority_prewarm_overtakes_queued_low_priority_on_same_url() {
