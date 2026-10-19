@@ -174,15 +174,25 @@ pub async fn prewarm_fast_start(
     if let Some(entry) = FAST_START_CACHE.get(original_url) {
         if let Some(pos_secs) = resume_position_secs {
             if entry.resume_buffer.is_none() {
-                let target_resume_size = if entry.head_bytes.len() >= FAST_START_4K_HEAD_SIZE {
+                let is_4k = entry.head_bytes.len() >= FAST_START_4K_HEAD_SIZE;
+                let target_resume_size = if is_4k {
                     FAST_START_4K_RESUME_SIZE
                 } else {
                     FAST_START_DEFAULT_RESUME_SIZE
                 };
+                // Infuse and other demuxers seek backward by 3-5 seconds of pre-roll before the target keyframe
+                // to decode audio/subtitle packets before the first video frame (e.g. 11.9MB in Lioness 4K).
+                // Add 24MB (4K) / 12MB (1080p) pre-roll headroom so client seeks always hit the RAM buffer.
+                let preroll_bytes: u64 = if is_4k {
+                    24 * 1024 * 1024
+                } else {
+                    12 * 1024 * 1024
+                };
                 let offset_opt = entry.tail_bytes.as_deref().and_then(|tb| find_mkv_cue_offset(&entry.head_bytes, tb, pos_secs))
                     .or_else(|| estimate_resume_byte_offset(pos_secs, total_duration_secs, entry.total_size));
-                if let Some(start_byte) = offset_opt {
-                    let end_byte = (start_byte + target_resume_size as u64 - 1).min(entry.total_size - 1);
+                if let Some(target_offset) = offset_opt {
+                    let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
+                    let end_byte = (start_byte + target_resume_size as u64 + preroll_bytes - 1).min(entry.total_size - 1);
                     let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                     let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
                     for (k, v) in request_headers {
@@ -413,13 +423,23 @@ pub async fn prewarm_fast_start(
 
     // Step 4: If resume position requested, find resume byte offset from Cues & fetch resume chunk!
     let resume_buffer = if let Some(pos_secs) = resume_position_secs {
+        let is_4k = head_bytes.len() >= FAST_START_4K_HEAD_SIZE;
+        // Infuse and other demuxers seek backward by 3-5 seconds of pre-roll before the target keyframe
+        // to decode audio/subtitle packets before the first video frame (e.g. 11.9MB in Lioness 4K).
+        // Add 24MB (4K) / 12MB (1080p) pre-roll headroom so client seeks always hit the RAM buffer.
+        let preroll_bytes: u64 = if is_4k {
+            24 * 1024 * 1024
+        } else {
+            12 * 1024 * 1024
+        };
         let offset_opt = tail_bytes
             .as_deref()
             .and_then(|tb| find_mkv_cue_offset(&head_bytes, tb, pos_secs))
             .or_else(|| estimate_resume_byte_offset(pos_secs, total_duration_secs, total_size));
 
-        if let Some(start_byte) = offset_opt {
-            let end_byte = (start_byte + target_resume_size as u64 - 1).min(total_size - 1);
+        if let Some(target_offset) = offset_opt {
+            let start_byte = target_offset.saturating_sub(preroll_bytes).max(head_bytes.len() as u64);
+            let end_byte = (start_byte + target_resume_size as u64 + preroll_bytes - 1).min(total_size - 1);
             let resume_range = format!("bytes={}-{}", start_byte, end_byte);
             let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
             for (k, v) in request_headers {
