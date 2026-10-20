@@ -32,6 +32,15 @@ pub const FAST_START_RESUME_HEAD_SIZE: usize = 48 * 1024 * 1024;
 /// Provides ~12-15 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
 pub const FAST_START_RESUME_BUFFER_SIZE: usize = 48 * 1024 * 1024;
 
+/// Pre-roll padding in bytes for the resume buffer: 8 MB.
+/// Positions the target keyframe 8 MB into the 48 MB buffer, providing demuxer backward headroom
+/// while leaving ~40 MB (~10-12s of 4K video) for smooth forward playback.
+pub const FAST_START_RESUME_PREROLL_BYTES: usize = 8 * 1024 * 1024;
+
+/// Infuse built-in Resume Rewind duration in seconds: 15.0s.
+/// Infuse consistently rewinds 10-15 seconds from the database pause timestamp when resuming playback.
+pub const FAST_START_RESUME_REWIND_SECS: f64 = 15.0;
+
 /// Global toggle: when enabled, Remux does NOT buffer head/tail bytes in RAM.
 /// Instead, pre-warming only resolves the direct Debrid CDN edge URL, and playback requests
 /// (from byte 0 to any seek) immediately receive an HTTP 307 redirect directly to the Debrid CDN.
@@ -193,9 +202,9 @@ pub async fn prewarm_fast_start(
             if pos_secs > 10.0 && entry.resume_buffer.is_none() {
                 if let Some(ref tail) = entry.tail_bytes {
                     if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
-                        let preroll_bytes: u64 = 32 * 1024 * 1024;
+                        let preroll_bytes = FAST_START_RESUME_PREROLL_BYTES as u64;
                         let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
-                        let end_byte = (target_offset + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
+                        let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
                         let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                         let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
                         for (k, v) in request_headers {
@@ -489,9 +498,9 @@ pub async fn prewarm_fast_start(
     let resume_buffer = if let (Some(pos_secs), Some(tb)) = (resume_position_secs, &tail_bytes) {
         if pos_secs > 10.0 {
             if let Some(target_offset) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
-                let preroll_bytes: u64 = 32 * 1024 * 1024;
+                let preroll_bytes = FAST_START_RESUME_PREROLL_BYTES as u64;
                 let start_byte = target_offset.saturating_sub(preroll_bytes).max(head_bytes.len() as u64);
-                let end_byte = (target_offset + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
+                let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
                 let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                 let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
                 for (k, v) in request_headers {
@@ -1135,7 +1144,7 @@ pub fn find_mkv_video_track(head_bytes: &[u8]) -> u64 {
 }
 
 /// Extracts the cluster byte offset for a given timestamp (in seconds) from an MKV head and tail index (Cues).
-/// Uses an 8-second backward pre-roll search window so the buffered range precedes the client's audio demuxer pre-roll.
+/// Accounts for Infuse's 15s auto-rewind behavior when seeking keyframes.
 pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_secs: f64) -> Option<u64> {
     if tail_bytes.len() < 16 {
         return None;
@@ -1151,8 +1160,9 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
     let (_cues_len, vint_len) = read_ebml_vint(&tail_bytes[cursor..])?;
     cursor += vint_len;
 
-    // Target the keyframe cluster right at or immediately before the resume timestamp
-    let target_time_ms = (target_time_secs.max(0.0) * 1000.0) as u64;
+    // Search for the keyframe cluster at or immediately before the target resume timestamp (accounting for Infuse's 15s auto-rewind)
+    let search_time_secs = (target_time_secs - FAST_START_RESUME_REWIND_SECS).max(0.0);
+    let target_time_ms = (search_time_secs * 1000.0) as u64;
     let mut best_cue: Option<(u64, u64)> = None; // (time_ms, cluster_offset)
 
     // Iterate through CuePoint elements (ID: 0xBB)
