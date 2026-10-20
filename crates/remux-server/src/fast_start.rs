@@ -192,8 +192,10 @@ pub async fn prewarm_fast_start(
         if let Some(pos_secs) = resume_position_secs {
             if pos_secs > 10.0 && entry.resume_buffer.is_none() {
                 if let Some(ref tail) = entry.tail_bytes {
-                    if let Some(start_byte) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
-                        let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
+                    if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
+                        let preroll_bytes: u64 = 32 * 1024 * 1024;
+                        let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
+                        let end_byte = (start_byte + preroll_bytes + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
                         let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                         let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
                         for (k, v) in request_headers {
@@ -483,11 +485,13 @@ pub async fn prewarm_fast_start(
         }
     };
 
-    // Step 3: If resuming, extract video cue offset and pre-warm 24 MB resume buffer
+    // Step 3: If resuming, extract video cue offset and pre-warm resume buffer with backward headroom
     let resume_buffer = if let (Some(pos_secs), Some(tb)) = (resume_position_secs, &tail_bytes) {
         if pos_secs > 10.0 {
-            if let Some(start_byte) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
-                let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
+            if let Some(target_offset) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
+                let preroll_bytes: u64 = 32 * 1024 * 1024;
+                let start_byte = target_offset.saturating_sub(preroll_bytes).max(head_bytes.len() as u64);
+                let end_byte = (start_byte + preroll_bytes + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
                 let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                 let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
                 for (k, v) in request_headers {
@@ -1147,8 +1151,8 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
     let (_cues_len, vint_len) = read_ebml_vint(&tail_bytes[cursor..])?;
     cursor += vint_len;
 
-    // Search ~8 seconds earlier to ensure the pre-warmed cluster covers the player's audio pre-roll
-    let search_time_secs = (target_time_secs - 8.0).max(0.0);
+    // Search ~30 seconds earlier to ensure the pre-warmed cluster covers player rewinds and audio/subtitle pre-roll
+    let search_time_secs = (target_time_secs - 30.0).max(0.0);
     let target_time_ms = (search_time_secs * 1000.0) as u64;
     let mut best_cue: Option<(u64, u64)> = None; // (time_ms, cluster_offset)
 
