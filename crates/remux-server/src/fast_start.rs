@@ -23,10 +23,10 @@ pub const FAST_START_HEAD_SIZE: usize = FAST_START_DEFAULT_HEAD_SIZE;
 /// Tail buffer size for MKV Cues / seekhead index: 2 MB.
 pub const FAST_START_TAIL_SIZE: usize = 2 * 1024 * 1024;
 
-/// Head buffer size in bytes for Continue Watching / resume streams: 48 MB.
-/// Provides sufficient headroom (~12s of 4K bitstream) for high-bitrate Dolby Vision/Atmos
+/// Head buffer size in bytes for Continue Watching / resume streams: 64 MB.
+/// Provides sufficient headroom (~16s of 4K bitstream) for high-bitrate Dolby Vision/Atmos
 /// files to complete avformat_find_stream_info entirely in RAM before seeking.
-pub const FAST_START_RESUME_HEAD_SIZE: usize = 48 * 1024 * 1024;
+pub const FAST_START_RESUME_HEAD_SIZE: usize = 64 * 1024 * 1024;
 
 /// Resume buffer size in bytes: 48 MB.
 /// Provides ~12-15 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
