@@ -195,7 +195,7 @@ pub async fn prewarm_fast_start(
                     if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
                         let preroll_bytes: u64 = 32 * 1024 * 1024;
                         let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
-                        let end_byte = (start_byte + preroll_bytes + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
+                        let end_byte = (target_offset + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
                         let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                         let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
                         for (k, v) in request_headers {
@@ -491,7 +491,7 @@ pub async fn prewarm_fast_start(
             if let Some(target_offset) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
                 let preroll_bytes: u64 = 32 * 1024 * 1024;
                 let start_byte = target_offset.saturating_sub(preroll_bytes).max(head_bytes.len() as u64);
-                let end_byte = (start_byte + preroll_bytes + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
+                let end_byte = (target_offset + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
                 let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                 let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
                 for (k, v) in request_headers {
@@ -1151,9 +1151,8 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
     let (_cues_len, vint_len) = read_ebml_vint(&tail_bytes[cursor..])?;
     cursor += vint_len;
 
-    // Search ~30 seconds earlier to ensure the pre-warmed cluster covers player rewinds and audio/subtitle pre-roll
-    let search_time_secs = (target_time_secs - 30.0).max(0.0);
-    let target_time_ms = (search_time_secs * 1000.0) as u64;
+    // Target the keyframe cluster right at or immediately before the resume timestamp
+    let target_time_ms = (target_time_secs.max(0.0) * 1000.0) as u64;
     let mut best_cue: Option<(u64, u64)> = None; // (time_ms, cluster_offset)
 
     // Iterate through CuePoint elements (ID: 0xBB)
