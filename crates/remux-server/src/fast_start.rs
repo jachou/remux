@@ -11,28 +11,10 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Minimum Fast-Start head buffer size: 16 MB.
-pub const FAST_START_MIN_HEAD_SIZE: usize = 16 * 1024 * 1024;
-
-/// Maximum Fast-Start head buffer size: 80 MB.
-pub const FAST_START_MAX_HEAD_SIZE: usize = 80 * 1024 * 1024;
-
-/// Target buffer duration in seconds to hold in RAM for instant Apple TV / AVPlayer start.
-/// Apple TV AVPlayer requires ~15 seconds forward buffer to trigger `ReadyToPlay`.
-/// Providing 22 seconds ensures 100% of the initial startup threshold is served from RAM over LAN,
-/// letting AVPlayer render the first frame in ~1.5–2s while the CDN stream connects in the background.
-pub const FAST_START_TARGET_SECS: f64 = 22.0;
-
-/// Default estimated runtime in seconds for a TV episode if duration is unknown: 45 minutes (2700s).
-pub const DEFAULT_TV_EPISODE_RUNTIME_SECS: f64 = 2700.0;
-
-/// Default estimated runtime in seconds for a Movie if duration is unknown: 105 minutes (6300s).
-pub const DEFAULT_MOVIE_RUNTIME_SECS: f64 = 6300.0;
-
 /// Default head buffer size in bytes for standard 1080p / smaller streams: 16 MB.
-pub const FAST_START_DEFAULT_HEAD_SIZE: usize = FAST_START_MIN_HEAD_SIZE;
+pub const FAST_START_DEFAULT_HEAD_SIZE: usize = 16 * 1024 * 1024;
 
-/// 4K / UHD / large stream head buffer size in bytes: 32 MB (retained for backward compatibility).
+/// 4K / UHD / large stream head buffer size in bytes: 32 MB.
 pub const FAST_START_4K_HEAD_SIZE: usize = 32 * 1024 * 1024;
 
 /// Backward-compatible alias for default head size.
@@ -60,114 +42,30 @@ pub fn set_force_direct_307(val: bool) {
     FORCE_DIRECT_307.store(val, Ordering::Relaxed);
 }
 
-/// Helper to detect whether a URL or filename likely represents a TV episode.
-pub fn is_likely_tv_episode(lower: &str) -> bool {
-    if lower.contains("season") || lower.contains("episode") || lower.contains("/shows/") {
-        return true;
-    }
-    let bytes = lower.as_bytes();
-    for i in 0..bytes.len() {
-        // Pattern: sXXeYY (e.g. s01e05, s3e7)
-        if bytes[i] == b's' && i + 3 < bytes.len() {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > i + 1 && j < bytes.len() && bytes[j] == b'e' {
-                let mut k = j + 1;
-                while k < bytes.len() && bytes[k].is_ascii_digit() {
-                    k += 1;
-                }
-                if k > j + 1 {
-                    return true;
-                }
-            }
-        }
-        // Pattern: :season:episode (Stremio format e.g. tt13111078:3:7)
-        if bytes[i] == b':' && i + 3 < bytes.len() {
-            let mut j = i + 1;
-            while j < bytes.len() && bytes[j].is_ascii_digit() {
-                j += 1;
-            }
-            if j > i + 1 && j < bytes.len() && bytes[j] == b':' {
-                let mut k = j + 1;
-                while k < bytes.len() && bytes[k].is_ascii_digit() {
-                    k += 1;
-                }
-                if k > j + 1 {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// Determines the ideal Fast-Start head buffer size based on bitrate, file size, runtime, or quality clues.
-///
-/// Targets ~22 seconds of playback data in RAM (clamped between 16 MB and 80 MB):
-/// - 1080p standard: ~16–22 MB
-/// - 4K 15 Mbps (e.g. Tracker): ~41 MB
-/// - 4K 25 Mbps (e.g. Lioness): ~68 MB
-/// - 4K 70+ Mbps Remux: 80 MB (clamped max)
+/// Determines the ideal Fast-Start head buffer size based on URL clues, file size, or 4K flags.
 pub fn calculate_fast_start_head_size(
     url: &str,
     size_bytes: Option<u64>,
-    duration_secs: Option<f64>,
-    bitrate_bps: Option<u64>,
     is_4k: Option<bool>,
 ) -> usize {
-    // 1. Probed bitrate known
-    if let Some(bps) = bitrate_bps {
-        if bps > 0 {
-            let bytes_per_sec = bps as f64 / 8.0;
-            let target_bytes = (bytes_per_sec * FAST_START_TARGET_SECS).round() as usize;
-            return target_bytes.clamp(FAST_START_MIN_HEAD_SIZE, FAST_START_MAX_HEAD_SIZE);
+    if is_4k == Some(true) {
+        return FAST_START_4K_HEAD_SIZE;
+    }
+    if let Some(bytes) = size_bytes {
+        if bytes > 8 * 1024 * 1024 * 1024 {
+            return FAST_START_4K_HEAD_SIZE;
         }
     }
-
-    // 2. Both file size and duration known
-    if let (Some(size), Some(duration)) = (size_bytes, duration_secs) {
-        if size > 0 && duration > 0.0 {
-            let bytes_per_sec = size as f64 / duration;
-            let target_bytes = (bytes_per_sec * FAST_START_TARGET_SECS).round() as usize;
-            return target_bytes.clamp(FAST_START_MIN_HEAD_SIZE, FAST_START_MAX_HEAD_SIZE);
-        }
-    }
-
-    // 3. File size known, estimate duration from TV vs Movie clues
-    if let Some(size) = size_bytes {
-        if size > 0 {
-            let lower = url.to_ascii_lowercase();
-            let is_tv = is_likely_tv_episode(&lower);
-            let est_duration = if is_tv {
-                DEFAULT_TV_EPISODE_RUNTIME_SECS
-            } else {
-                DEFAULT_MOVIE_RUNTIME_SECS
-            };
-            let bytes_per_sec = size as f64 / est_duration;
-            let target_bytes = (bytes_per_sec * FAST_START_TARGET_SECS).round() as usize;
-            return target_bytes.clamp(FAST_START_MIN_HEAD_SIZE, FAST_START_MAX_HEAD_SIZE);
-        }
-    }
-
-    // 4. Fallback based on resolution clues
     let lower = url.to_ascii_lowercase();
-    let is_4k_likely = is_4k == Some(true)
-        || lower.contains("2160p")
+    if lower.contains("2160p")
         || lower.contains("4k")
         || lower.contains("uhd")
-        || lower.contains("remux");
-
-    let est_bytes = if is_4k_likely {
-        // Typical 4K stream ~25 Mbps (~3.125 MB/s) -> 22s = ~68.75 MB
-        (3_125_000.0 * FAST_START_TARGET_SECS).round() as usize
+        || lower.contains("remux")
+    {
+        FAST_START_4K_HEAD_SIZE
     } else {
-        // Typical 1080p stream ~8 Mbps (~1.0 MB/s) -> 22s = ~22 MB
-        (1_000_000.0 * FAST_START_TARGET_SECS).round() as usize
-    };
-
-    est_bytes.clamp(FAST_START_MIN_HEAD_SIZE, FAST_START_MAX_HEAD_SIZE)
+        FAST_START_DEFAULT_HEAD_SIZE
+    }
 }
 
 /// Maximum number of items held in memory simultaneously.
@@ -406,7 +304,7 @@ pub async fn prewarm_fast_start(
     };
     let start_time = Instant::now();
 
-    let target_head_size = head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, None, None, None));
+    let target_head_size = head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, None));
 
     info!(
         %original_url,
@@ -1150,85 +1048,5 @@ mod tests {
 
         // Reset to false
         set_force_direct_307(false);
-    }
-
-    #[test]
-    fn test_calculate_fast_start_head_size_bitrate() {
-        // 25 Mbps: 25 * 10^6 / 8 = 3,125,000 B/s. 22s = 68,750,000 bytes (~65.57 MB)
-        let size_25mbps = calculate_fast_start_head_size("http://test.mkv", None, None, Some(25_000_000), None);
-        assert_eq!(size_25mbps, 68_750_000);
-
-        // 15 Mbps: 15 * 10^6 / 8 = 1,875,000 B/s. 22s = 41,250,000 bytes (~39.34 MB)
-        let size_15mbps = calculate_fast_start_head_size("http://test.mkv", None, None, Some(15_000_000), None);
-        assert_eq!(size_15mbps, 41_250_000);
-
-        // 4 Mbps: 4 * 10^6 / 8 = 500,000 B/s. 22s = 11,000,000 bytes -> clamped to 16 MB (16,777,216 bytes)
-        let size_4mbps = calculate_fast_start_head_size("http://test.mkv", None, None, Some(4_000_000), None);
-        assert_eq!(size_4mbps, FAST_START_MIN_HEAD_SIZE);
-
-        // 80 Mbps Remux: 80 * 10^6 / 8 = 10,000,000 B/s. 22s = 220,000,000 bytes -> clamped to 80 MB (83,886,080 bytes)
-        let size_80mbps = calculate_fast_start_head_size("http://test.mkv", None, None, Some(80_000_000), None);
-        assert_eq!(size_80mbps, FAST_START_MAX_HEAD_SIZE);
-    }
-
-    #[test]
-    fn test_calculate_fast_start_head_size_file_and_duration() {
-        // Lioness S03E07: 8,392,423,900 bytes, duration 2684.557s (~44.7 min)
-        // Rate: ~3,126,185.75 B/s. 22s = 68,776,087 bytes (~65.59 MB)
-        let lioness_size = calculate_fast_start_head_size(
-            "http://test.mkv",
-            Some(8_392_423_900),
-            Some(2684.557),
-            None,
-            None,
-        );
-        assert_eq!(lioness_size, 68_776_087);
-        assert!(lioness_size >= 65 * 1024 * 1024 && lioness_size <= 70 * 1024 * 1024);
-
-        // Tracker: 4,660,000,000 bytes, duration 2700s (~45 min)
-        // Rate: 1,725,925.9 B/s. 22s = 37,970,370 bytes (~36.2 MB)
-        let tracker_size = calculate_fast_start_head_size(
-            "http://test.mkv",
-            Some(4_660_000_000),
-            Some(2700.0),
-            None,
-            None,
-        );
-        assert_eq!(tracker_size, 37_970_370);
-    }
-
-    #[test]
-    fn test_calculate_fast_start_head_size_estimates_from_tv_vs_movie() {
-        // TV episode with size but no duration: estimates 2700s
-        let tv_size = calculate_fast_start_head_size(
-            "http://cdn.com/Lioness.2023.S03E08.2160p.mkv",
-            Some(8_000_000_000),
-            None,
-            None,
-            None,
-        );
-        // 8GB / 2700s = 2,962,962 B/s * 22s = 65,185,185 bytes (~62.17 MB)
-        assert_eq!(tv_size, 65_185_185);
-
-        // Movie with size but no duration: estimates 6300s
-        let movie_size = calculate_fast_start_head_size(
-            "http://cdn.com/Dune.Part.Two.2024.2160p.mkv",
-            Some(20_000_000_000),
-            None,
-            None,
-            None,
-        );
-        // 20GB / 6300s = 3,174,603 B/s * 22s = 69,841,270 bytes (~66.6 MB)
-        assert_eq!(movie_size, 69_841_270);
-    }
-
-    #[test]
-    fn test_is_likely_tv_episode() {
-        assert!(is_likely_tv_episode("lioness.2023.s03e07.mkv"));
-        assert!(is_likely_tv_episode("tracker.s1e2.mkv"));
-        assert!(is_likely_tv_episode("https://example.com/strem/tt13111078:3:7/stream.mkv"));
-        assert!(is_likely_tv_episode("/shows/lioness/season/3/episode/7"));
-        assert!(!is_likely_tv_episode("oppenheimer.2023.2160p.uhd.mkv"));
-        assert!(!is_likely_tv_episode("movie.title.2024.1080p.mkv"));
     }
 }
