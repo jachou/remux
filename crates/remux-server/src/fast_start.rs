@@ -196,34 +196,42 @@ pub async fn prewarm_fast_start(
     head_size: Option<usize>,
     resume_position_secs: Option<f64>,
 ) -> bool {
-    // If already pre-warmed and cached: check if resume buffer needs to be appended
+    // If already pre-warmed and cached: check if resume buffer needs to be appended or refreshed
     if let Some(entry) = FAST_START_CACHE.get(original_url) {
         if let Some(pos_secs) = resume_position_secs {
-            if pos_secs > 10.0 && entry.resume_buffer.is_none() {
+            if pos_secs > 10.0 {
                 if let Some(ref tail) = entry.tail_bytes {
                     if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
-                        let preroll_bytes = FAST_START_RESUME_PREROLL_BYTES as u64;
-                        let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
-                        let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
-                        let resume_range = format!("bytes={}-{}", start_byte, end_byte);
-                        let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
-                        for (k, v) in request_headers {
-                            res_req = res_req.header(k.as_str(), v.as_str());
-                        }
-                        res_req = res_req.header(header::RANGE, resume_range);
-                        if let Ok(resp) = res_req.send().await {
-                            if resp.status() == StatusCode::PARTIAL_CONTENT {
-                                if let Ok(b) = resp.bytes().await {
-                                    let mut updated = entry.clone();
-                                    updated.resume_buffer = Some((start_byte, b));
-                                    FAST_START_CACHE.insert(original_url.to_string(), updated);
-                                    info!(
-                                        %original_url,
-                                        item = ?item_id,
-                                        start_byte,
-                                        end_byte,
-                                        "[FAST-START] Appended resume buffer to existing cached entry"
-                                    );
+                        let already_covered = entry.resume_buffer.as_ref().map(|(start, bytes)| {
+                            target_offset >= *start && target_offset < *start + bytes.len() as u64
+                        }).unwrap_or(false);
+
+                        if !already_covered {
+                            let preroll_bytes = FAST_START_RESUME_PREROLL_BYTES as u64;
+                            let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
+                            let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
+                            let resume_range = format!("bytes={}-{}", start_byte, end_byte);
+                            let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
+                            for (k, v) in request_headers {
+                                res_req = res_req.header(k.as_str(), v.as_str());
+                            }
+                            res_req = res_req.header(header::RANGE, resume_range);
+                            if let Ok(resp) = res_req.send().await {
+                                if resp.status() == StatusCode::PARTIAL_CONTENT {
+                                    if let Ok(b) = resp.bytes().await {
+                                        let resume_size_bytes = b.len();
+                                        let mut updated = entry.clone();
+                                        updated.resume_buffer = Some((start_byte, b));
+                                        FAST_START_CACHE.insert(original_url.to_string(), updated);
+                                        info!(
+                                            %original_url,
+                                            item = ?item_id,
+                                            start_byte,
+                                            end_byte,
+                                            resume_size_bytes,
+                                            "[FAST-START] Refreshed resume buffer into RAM for cached stream"
+                                        );
+                                    }
                                 }
                             }
                         }
