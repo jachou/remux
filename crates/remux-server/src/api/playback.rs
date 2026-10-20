@@ -522,10 +522,34 @@ async fn items_playbackinfo_inner(
                 let url_clone = url.clone();
                 let headers_clone = request_headers.clone();
                 let item_id = id;
+                let duration_secs = item_runtime_seconds
+                    .map(|r| r as f64)
+                    .or_else(|| first.stream.runtime.map(|r| r as f64))
+                    .or_else(|| si.duration.map(|d| d as f64))
+                    .or_else(|| {
+                        first
+                            .source
+                            .run_time_ticks
+                            .or_else(|| first.stream.probe_data.as_ref().and_then(|pd| pd.run_time_ticks))
+                            .map(crate::common::ticks_to_seconds)
+                    });
+                let bitrate_bps = first
+                    .source
+                    .bitrate
+                    .or_else(|| first.stream.probe_data.as_ref().and_then(|pd| pd.bitrate))
+                    .map(|b| b as u64);
+                let is_4k = first
+                    .source
+                    .media_streams
+                    .iter()
+                    .any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
+                let size_bytes = si.size.map(|s| s as u64).or_else(|| first.source.size.map(|s| s as u64));
                 let head_size = crate::fast_start::calculate_fast_start_head_size(
                     url,
-                    si.size.map(|s| s as u64),
-                    None,
+                    size_bytes,
+                    duration_secs,
+                    bitrate_bps,
+                    Some(is_4k),
                 );
                 tokio::spawn(async move {
                     crate::fast_start::prewarm_fast_start(

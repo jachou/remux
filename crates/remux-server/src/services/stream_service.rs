@@ -764,10 +764,19 @@ impl StreamService {
                         let url_clone = url.clone();
                         let headers_clone = request_headers.clone();
                         let item_id = self.item_id;
+                        let duration_secs = first.runtime.map(|r| r as f64)
+                            .or_else(|| si.duration.map(|d| d as f64))
+                            .or_else(|| first.probe_data.as_ref().and_then(|pd| pd.run_time_ticks).map(crate::common::ticks_to_seconds));
+                        let bitrate_bps = first.probe_data.as_ref().and_then(|pd| pd.bitrate).map(|b| b as u64);
+                        let is_4k = first.probe_data.as_ref().map(|pd| {
+                            pd.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160)
+                        });
                         let head_size = crate::fast_start::calculate_fast_start_head_size(
                             url,
                             si.size.map(|s| s as u64),
-                            None,
+                            duration_secs,
+                            bitrate_bps,
+                            is_4k,
                         );
                         tokio::spawn(async move {
                             crate::fast_start::prewarm_fast_start(
@@ -1464,9 +1473,15 @@ impl StreamService {
                             let headers_clone = request_headers.clone();
                             let item_id = self.item_id;
                             let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
+                            let duration_secs = stream.runtime.map(|r| r as f64)
+                                .or_else(|| si.duration.map(|d| d as f64))
+                                .or_else(|| cached.run_time_ticks.map(crate::common::ticks_to_seconds));
+                            let bitrate_bps = cached.bitrate.map(|b| b as u64);
                             let head_size = crate::fast_start::calculate_fast_start_head_size(
                                 url,
-                                si.size.map(|s| s as u64),
+                                si.size.map(|s| s as u64).or_else(|| cached.size.map(|s| s as u64)),
+                                duration_secs,
+                                bitrate_bps,
                                 Some(is_4k),
                             );
                             tokio::spawn(async move {
@@ -1525,10 +1540,19 @@ impl StreamService {
                     let url_clone = url.clone();
                     let headers_clone = request_headers.clone();
                     let item_id = self.item_id;
+                    let duration_secs = stream.runtime.map(|r| r as f64)
+                        .or_else(|| si.duration.map(|d| d as f64))
+                        .or_else(|| stream.probe_data.as_ref().and_then(|pd| pd.run_time_ticks).map(crate::common::ticks_to_seconds));
+                    let bitrate_bps = stream.probe_data.as_ref().and_then(|pd| pd.bitrate).map(|b| b as u64);
+                    let is_4k = stream.probe_data.as_ref().map(|pd| {
+                        pd.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160)
+                    });
                     let head_size = crate::fast_start::calculate_fast_start_head_size(
                         url,
                         si.size.map(|s| s as u64),
-                        None,
+                        duration_secs,
+                        bitrate_bps,
+                        is_4k,
                     );
                     tokio::spawn(async move {
                         crate::fast_start::prewarm_fast_start(
@@ -1567,10 +1591,19 @@ impl StreamService {
                     let url_clone = url.clone();
                     let headers_clone = request_headers.clone();
                     let item_id = self.item_id;
+                    let duration_secs = effective.runtime.map(|r| r as f64)
+                        .or_else(|| si.duration.map(|d| d as f64))
+                        .or_else(|| effective.probe_data.as_ref().and_then(|pd| pd.run_time_ticks).map(crate::common::ticks_to_seconds));
+                    let bitrate_bps = effective.probe_data.as_ref().and_then(|pd| pd.bitrate).map(|b| b as u64);
+                    let is_4k = effective.probe_data.as_ref().map(|pd| {
+                        pd.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160)
+                    });
                     let head_size = crate::fast_start::calculate_fast_start_head_size(
                         url,
                         si.size.map(|s| s as u64),
-                        None,
+                        duration_secs,
+                        bitrate_bps,
+                        is_4k,
                     );
                     tokio::spawn(async move {
                         crate::fast_start::prewarm_fast_start(
@@ -1680,9 +1713,15 @@ pub fn spawn_preemptive_probe(
                                 let url_clone = url.clone();
                                 let headers_clone = request_headers.clone();
                                 let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
+                                let duration_secs = primary.runtime.map(|r| r as f64)
+                                    .or_else(|| si.duration.map(|d| d as f64))
+                                    .or_else(|| cached.run_time_ticks.map(crate::common::ticks_to_seconds));
+                                let bitrate_bps = cached.bitrate.map(|b| b as u64);
                                 let head_size = crate::fast_start::calculate_fast_start_head_size(
                                     url,
-                                    si.size.map(|s| s as u64),
+                                    si.size.map(|s| s as u64).or_else(|| cached.size.map(|s| s as u64)),
+                                    duration_secs,
+                                    bitrate_bps,
                                     Some(is_4k),
                                 );
                                 tokio::spawn(async move {
