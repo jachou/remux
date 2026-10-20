@@ -23,6 +23,14 @@ pub const FAST_START_HEAD_SIZE: usize = FAST_START_DEFAULT_HEAD_SIZE;
 /// Tail buffer size for MKV Cues / seekhead index: 2 MB.
 pub const FAST_START_TAIL_SIZE: usize = 2 * 1024 * 1024;
 
+/// Head buffer size in bytes for Continue Watching / resume streams: 8 MB.
+/// When resuming from the middle, 8 MB is plenty to decode container headers, tracks, and codecs.
+pub const FAST_START_RESUME_HEAD_SIZE: usize = 8 * 1024 * 1024;
+
+/// Resume buffer size in bytes: 24 MB.
+/// Provides ~8-10 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
+pub const FAST_START_RESUME_BUFFER_SIZE: usize = 24 * 1024 * 1024;
+
 /// Global toggle: when enabled, Remux does NOT buffer head/tail bytes in RAM.
 /// Instead, pre-warming only resolves the direct Debrid CDN edge URL, and playback requests
 /// (from byte 0 to any seek) immediately receive an HTTP 307 redirect directly to the Debrid CDN.
@@ -83,6 +91,7 @@ pub struct FastStartEntry {
     pub total_size: u64,
     pub head_bytes: Bytes,
     pub tail_bytes: Option<Bytes>,
+    pub resume_buffer: Option<(u64, Bytes)>,
     pub content_type: String,
     pub created_at: Instant,
 }
@@ -102,6 +111,7 @@ pub enum PrewarmPriority {
 pub struct FastStartMetrics {
     pub hits_head: AtomicU64,
     pub hits_tail: AtomicU64,
+    pub hits_resume: AtomicU64,
     pub redirects_issued: AtomicU64,
     pub misses: AtomicU64,
     pub prewarms_started: AtomicU64,
@@ -117,6 +127,7 @@ impl FastStartMetrics {
         Self {
             hits_head: AtomicU64::new(0),
             hits_tail: AtomicU64::new(0),
+            hits_resume: AtomicU64::new(0),
             redirects_issued: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             prewarms_started: AtomicU64::new(0),
@@ -163,7 +174,7 @@ static PREWARM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build fast-start prewarm client")
 });
 
-/// Pre-warms the head buffer (16 MB) and tail index (256 KB) for an upstream stream.
+/// Pre-warms the head buffer (16/32 MB or 8 MB resume), tail index (2 MB), and keyframe resume chunk (24 MB) for an upstream stream.
 ///
 /// Runs asynchronously in the background. Follows upstream redirects (e.g. Stremthru -> Torbox CDN),
 /// resolves the direct CDN edge URL, and caches the bytes in memory.
@@ -173,9 +184,41 @@ pub async fn prewarm_fast_start(
     request_headers: &HashMap<String, String>,
     priority: PrewarmPriority,
     head_size: Option<usize>,
+    resume_position_secs: Option<f64>,
 ) -> bool {
-    // If already pre-warmed and cached, skip!
+    // If already pre-warmed and cached: check if resume buffer needs to be appended
     if let Some(entry) = FAST_START_CACHE.get(original_url) {
+        if let Some(pos_secs) = resume_position_secs {
+            if pos_secs > 10.0 && entry.resume_buffer.is_none() {
+                if let Some(ref tail) = entry.tail_bytes {
+                    if let Some(start_byte) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
+                        let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
+                        let resume_range = format!("bytes={}-{}", start_byte, end_byte);
+                        let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
+                        for (k, v) in request_headers {
+                            res_req = res_req.header(k.as_str(), v.as_str());
+                        }
+                        res_req = res_req.header(header::RANGE, resume_range);
+                        if let Ok(resp) = res_req.send().await {
+                            if resp.status() == StatusCode::PARTIAL_CONTENT {
+                                if let Ok(b) = resp.bytes().await {
+                                    let mut updated = entry.clone();
+                                    updated.resume_buffer = Some((start_byte, b));
+                                    FAST_START_CACHE.insert(original_url.to_string(), updated);
+                                    info!(
+                                        %original_url,
+                                        item = ?item_id,
+                                        start_byte,
+                                        end_byte,
+                                        "[FAST-START] Appended resume buffer to existing cached entry"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
         debug!(
             %original_url,
             item = ?item_id,
@@ -232,6 +275,7 @@ pub async fn prewarm_fast_start(
             total_size,
             head_bytes: Bytes::new(),
             tail_bytes: None,
+            resume_buffer: None,
             content_type,
             created_at: Instant::now(),
         };
@@ -304,13 +348,20 @@ pub async fn prewarm_fast_start(
     };
     let start_time = Instant::now();
 
-    let target_head_size = head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, None));
+    let is_resuming = resume_position_secs.map(|p| p > 10.0).unwrap_or(false);
+    let target_head_size = if is_resuming {
+        FAST_START_RESUME_HEAD_SIZE
+    } else {
+        head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, None))
+    };
 
     info!(
         %original_url,
         item = ?item_id,
         ?priority,
         target_size_mb = target_head_size / (1024 * 1024),
+        is_resuming,
+        ?resume_position_secs,
         "[FAST-START] Starting pre-warm download"
     );
 
@@ -431,6 +482,56 @@ pub async fn prewarm_fast_start(
         }
     };
 
+    // Step 3: If resuming, extract video cue offset and pre-warm 24 MB resume buffer
+    let resume_buffer = if let (Some(pos_secs), Some(tb)) = (resume_position_secs, &tail_bytes) {
+        if pos_secs > 10.0 {
+            if let Some(start_byte) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
+                let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
+                let resume_range = format!("bytes={}-{}", start_byte, end_byte);
+                let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
+                for (k, v) in request_headers {
+                    res_req = res_req.header(k.as_str(), v.as_str());
+                }
+                res_req = res_req.header(header::RANGE, resume_range);
+
+                match res_req.send().await {
+                    Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
+                        match r.bytes().await {
+                            Ok(b) => {
+                                info!(
+                                    %original_url,
+                                    start_byte,
+                                    end_byte,
+                                    resume_size_bytes = b.len(),
+                                    "[FAST-START] Successfully pre-warmed resume chunk into RAM"
+                                );
+                                Some((start_byte, b))
+                            }
+                            Err(e) => {
+                                warn!(%original_url, error = %e, "[FAST-START] Failed reading resume chunk body");
+                                None
+                            }
+                        }
+                    }
+                    Ok(r) => {
+                        warn!(%original_url, status = ?r.status(), "[FAST-START] Resume fetch returned non-206 status");
+                        None
+                    }
+                    Err(e) => {
+                        warn!(%original_url, error = %e, "[FAST-START] Resume fetch request error");
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     let entry = FastStartEntry {
         item_id,
         original_url: original_url.to_string(),
@@ -438,6 +539,7 @@ pub async fn prewarm_fast_start(
         total_size,
         head_bytes: head_bytes.clone(),
         tail_bytes: tail_bytes.clone(),
+        resume_buffer: resume_buffer.clone(),
         content_type,
         created_at: Instant::now(),
     };
@@ -453,6 +555,7 @@ pub async fn prewarm_fast_start(
         direct_cdn_host = head_resp_host(&direct_cdn_url),
         head_size_bytes = head_bytes.len(),
         tail_size_bytes = tail_bytes.as_ref().map(|b| b.len()).unwrap_or(0),
+        resume_size_bytes = resume_buffer.as_ref().map(|(_, b)| b.len()).unwrap_or(0),
         total_size_bytes = total_size,
         ?elapsed,
         "[FAST-START] Successfully pre-warmed stream into RAM"
@@ -514,7 +617,7 @@ pub async fn resolve_fast_start_probe_url(url: &str) -> String {
     if url.starts_with("http://127.0.0.1:") || url.starts_with("http://localhost:") {
         return url.to_string();
     }
-    if !prewarm_fast_start(None, url, &HashMap::new(), PrewarmPriority::High, None).await {
+    if !prewarm_fast_start(None, url, &HashMap::new(), PrewarmPriority::High, None, None).await {
         return url.to_string();
     }
     let Some(port) = ensure_local_probe_server().await else {
@@ -572,7 +675,7 @@ pub async fn handle_playback_request(
         let url_str = url.to_string();
         let headers_clone = upstream_headers.cloned().unwrap_or_default();
         tokio::spawn(async move {
-            prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High, None).await;
+            prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High, None, None).await;
         });
         METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
         info!(
@@ -635,7 +738,7 @@ pub async fn handle_playback_request(
             let url_str = url.to_string();
             let headers_clone = upstream_headers.cloned().unwrap_or_default();
             tokio::spawn(async move {
-                prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High, None).await;
+                prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High, None, None).await;
             });
         }
     }
@@ -775,7 +878,65 @@ pub async fn handle_playback_request(
             Some(redirect)
         }
 
-        // Case 4: Video cluster stream / seek / continuous playback
+        // Case 4: Resume buffer hit (when resuming playback from middle)
+        Some(rng) if is_resume_range(rng, entry.resume_buffer.as_ref(), entry.total_size) => {
+            if let Some((resume_start, ref resume_bytes)) = entry.resume_buffer {
+                let (req_start, req_end) = parse_range_bounds(rng, entry.total_size)
+                    .unwrap_or((resume_start, entry.total_size.saturating_sub(1)));
+                let resume_len = resume_bytes.len() as u64;
+                let resume_end = resume_start + resume_len;
+                if req_start >= resume_start && req_start < resume_end {
+                    let offset = (req_start - resume_start) as usize;
+                    let end_in_resume = (req_end - resume_start) as usize;
+                    let end_clamped = end_in_resume.min(resume_bytes.len() - 1);
+                    let slice = resume_bytes.slice(offset..=end_clamped);
+                    let slice_len = slice.len();
+                    let end_byte = req_start + slice_len as u64 - 1;
+
+                    METRICS.hits_resume.fetch_add(1, Ordering::Relaxed);
+                    METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
+
+                    info!(
+                        %item_id,
+                        req_start,
+                        end_byte,
+                        slice_len,
+                        total_size = entry.total_size,
+                        "[FAST-START] Buffer hit (resume): serving {} bytes locally over LAN",
+                        slice_len
+                    );
+
+                    let resp = Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_TYPE, &entry.content_type)
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", req_start, end_byte, entry.total_size),
+                        )
+                        .header(header::CONTENT_LENGTH, slice_len.to_string())
+                        .header(header::ACCEPT_RANGES, "bytes")
+                        .header("X-Remux-FastStart", "hit-resume")
+                        .body(Body::from(slice))
+                        .unwrap();
+
+                    return Some(resp);
+                }
+            }
+
+            // Fall through to direct CDN redirect if resume chunk doesn't cover
+            METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            info!(
+                %item_id,
+                range = %rng,
+                direct_cdn = %entry.direct_cdn_url,
+                "[FAST-START] Resume range miss: redirecting to Debrid CDN (307)"
+            );
+            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
+            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static("redirect-direct-cdn"));
+            Some(redirect)
+        }
+
+        // Case 5: Video cluster stream / seek / continuous playback
         // Issue 307 Temporary Redirect DIRECTLY to Debrid CDN edge
         Some(rng) => {
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
@@ -836,6 +997,264 @@ fn is_tail_range(range_str: &str, total_size: u64) -> bool {
     start >= tail_start && start < total_size
 }
 
+/// Determines whether a Range header starts inside the cached resume buffer.
+fn is_resume_range(range_str: &str, resume_buf: Option<&(u64, Bytes)>, total_size: u64) -> bool {
+    let Some((resume_start, resume_bytes)) = resume_buf else {
+        return false;
+    };
+    let Some((start, _)) = parse_range_bounds(range_str, total_size) else {
+        return false;
+    };
+    let resume_end = resume_start + (resume_bytes.len() as u64);
+    start >= *resume_start && start < resume_end
+}
+
+fn read_ebml_id(slice: &[u8]) -> Option<(u32, usize)> {
+    if slice.is_empty() {
+        return None;
+    }
+    let first = slice[0];
+    let num_bytes = first.leading_zeros() as usize + 1;
+    if num_bytes > 4 || slice.len() < num_bytes {
+        return None;
+    }
+    let mut val = 0u32;
+    for &b in &slice[..num_bytes] {
+        val = (val << 8) | (b as u32);
+    }
+    Some((val, num_bytes))
+}
+
+fn read_ebml_vint(slice: &[u8]) -> Option<(u64, usize)> {
+    if slice.is_empty() {
+        return None;
+    }
+    let first = slice[0];
+    let num_bytes = first.leading_zeros() as usize + 1;
+    if num_bytes > 8 || slice.len() < num_bytes {
+        return None;
+    }
+    let mask = if num_bytes >= 8 { 0 } else { (0xFFu8) >> num_bytes };
+    let mut val = (first & mask) as u64;
+    for &b in &slice[1..num_bytes] {
+        val = (val << 8) | (b as u64);
+    }
+    Some((val, num_bytes))
+}
+
+fn read_ebml_uint(slice: &[u8]) -> u64 {
+    let mut val = 0u64;
+    for &b in slice {
+        val = (val << 8) | (b as u64);
+    }
+    val
+}
+
+/// Finds the MKV Segment data offset (where clusters begin).
+pub fn find_mkv_segment_data_offset(head_bytes: &[u8]) -> u64 {
+    let seg_id = [0x18u8, 0x53, 0x80, 0x67];
+    if let Some(pos) = head_bytes.windows(4).position(|w| w == seg_id) {
+        let cursor = pos + 4;
+        if let Some((_, vint_len)) = read_ebml_vint(&head_bytes[cursor..]) {
+            return (cursor + vint_len) as u64;
+        }
+    }
+    52 // Standard fallback for Matroska
+}
+
+/// Identifies the Video track number (TrackType == 1) from the Tracks header.
+/// If omitted or undetectable, defaults to track 1.
+pub fn find_mkv_video_track(head_bytes: &[u8]) -> u64 {
+    let tracks_id = [0x16u8, 0x54, 0xAE, 0x6B];
+    let mut pos = 0;
+    while pos < head_bytes.len() {
+        let Some(idx) = head_bytes[pos..].windows(4).position(|w| w == tracks_id) else {
+            break;
+        };
+        let actual_pos = pos + idx;
+        pos = actual_pos + 4;
+
+        let Some((tlen, vlen)) = read_ebml_vint(&head_bytes[pos..]) else {
+            continue;
+        };
+        let mut cursor = pos + vlen;
+        let end = (cursor + tlen as usize).min(head_bytes.len());
+
+        while cursor < end {
+            let Some((eid, eid_len)) = read_ebml_id(&head_bytes[cursor..]) else {
+                break;
+            };
+            cursor += eid_len;
+            let Some((elen, evlen)) = read_ebml_vint(&head_bytes[cursor..]) else {
+                break;
+            };
+            cursor += evlen;
+            let entry_end = (cursor + elen as usize).min(end);
+
+            if eid == 0xAE {
+                // TrackEntry
+                let mut sc = cursor;
+                let mut tnum = None;
+                let mut ttype = None;
+
+                while sc < entry_end {
+                    let Some((sub_id, se_len)) = read_ebml_id(&head_bytes[sc..]) else {
+                        break;
+                    };
+                    sc += se_len;
+                    let Some((slen, svlen)) = read_ebml_vint(&head_bytes[sc..]) else {
+                        break;
+                    };
+                    sc += svlen;
+                    let sub_end = (sc + slen as usize).min(entry_end);
+
+                    if sub_id == 0xD7 {
+                        // TrackNumber
+                        tnum = Some(read_ebml_uint(&head_bytes[sc..sub_end]));
+                    } else if sub_id == 0x83 {
+                        // TrackType: 1 = video, 2 = audio, 17 = subtitle
+                        ttype = Some(read_ebml_uint(&head_bytes[sc..sub_end]));
+                    }
+                    sc = sub_end;
+                }
+
+                if ttype == Some(1) && tnum.is_some() {
+                    return tnum.unwrap();
+                }
+            }
+
+            cursor = entry_end;
+        }
+    }
+    1
+}
+
+/// Extracts the cluster byte offset for a given timestamp (in seconds) from an MKV head and tail index (Cues).
+/// Uses an 8-second backward pre-roll search window so the buffered range precedes the client's audio demuxer pre-roll.
+pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_secs: f64) -> Option<u64> {
+    if tail_bytes.len() < 16 {
+        return None;
+    }
+    let seg_offset = find_mkv_segment_data_offset(head_bytes);
+    let vid_track = find_mkv_video_track(head_bytes);
+
+    // Search for Cues element ID: [0x1C, 0x53, 0xBB, 0x6B]
+    let cues_id = [0x1Cu8, 0x53, 0xBB, 0x6B];
+    let cues_pos = tail_bytes.windows(4).position(|w| w == cues_id)?;
+
+    let mut cursor = cues_pos + 4;
+    let (_cues_len, vint_len) = read_ebml_vint(&tail_bytes[cursor..])?;
+    cursor += vint_len;
+
+    // Search ~8 seconds earlier to ensure the pre-warmed cluster covers the player's audio pre-roll
+    let search_time_secs = (target_time_secs - 8.0).max(0.0);
+    let target_time_ms = (search_time_secs * 1000.0) as u64;
+    let mut best_cue: Option<(u64, u64)> = None; // (time_ms, cluster_offset)
+
+    // Iterate through CuePoint elements (ID: 0xBB)
+    while cursor < tail_bytes.len() {
+        if tail_bytes[cursor] != 0xBB {
+            cursor += 1;
+            continue;
+        }
+        cursor += 1; // skip 0xBB
+        let Some((point_len, point_vint_len)) = read_ebml_vint(&tail_bytes[cursor..]) else {
+            break;
+        };
+        cursor += point_vint_len;
+        let point_end = (cursor + point_len as usize).min(tail_bytes.len());
+
+        let mut sub_cursor = cursor;
+        let mut cue_time_ms: Option<u64> = None;
+        let mut matching_cluster_pos: Option<u64> = None;
+
+        while sub_cursor < point_end {
+            let elem_id = tail_bytes[sub_cursor];
+            sub_cursor += 1;
+            let Some((elem_len, elem_vint_len)) = read_ebml_vint(&tail_bytes[sub_cursor..]) else {
+                break;
+            };
+            sub_cursor += elem_vint_len;
+            let elem_end = (sub_cursor + elem_len as usize).min(point_end);
+
+            if elem_id == 0xB3 {
+                // CueTime
+                cue_time_ms = Some(read_ebml_uint(&tail_bytes[sub_cursor..elem_end]));
+            } else if elem_id == 0xB7 {
+                // CueTrackPositions: scan inside for CueTrack (0xF7) and CueClusterPosition (0xF1)
+                let mut track_cursor = sub_cursor;
+                let mut this_track: Option<u64> = None;
+                let mut this_pos: Option<u64> = None;
+                while track_cursor < elem_end {
+                    let tid = tail_bytes[track_cursor];
+                    track_cursor += 1;
+                    let Some((tlen, tvint_len)) = read_ebml_vint(&tail_bytes[track_cursor..]) else {
+                        break;
+                    };
+                    track_cursor += tvint_len;
+                    let tend = (track_cursor + tlen as usize).min(elem_end);
+                    if tid == 0xF7 {
+                        this_track = Some(read_ebml_uint(&tail_bytes[track_cursor..tend]));
+                    } else if tid == 0xF1 {
+                        this_pos = Some(read_ebml_uint(&tail_bytes[track_cursor..tend]));
+                    }
+                    track_cursor = tend;
+                }
+                // If this CueTrackPositions entry matches the video track (or track not specified), keep its cluster position
+                if this_track.is_none() || this_track == Some(vid_track) {
+                    if let Some(pos) = this_pos {
+                        matching_cluster_pos = Some(pos);
+                    }
+                }
+            }
+            sub_cursor = elem_end;
+        }
+
+        if let (Some(t), Some(c)) = (cue_time_ms, matching_cluster_pos) {
+            if t <= target_time_ms {
+                match best_cue {
+                    Some((best_t, _)) if t > best_t => {
+                        best_cue = Some((t, c));
+                    }
+                    None => {
+                        best_cue = Some((t, c));
+                    }
+                    _ => {}
+                }
+            } else if best_cue.is_some() {
+                break;
+            }
+        }
+
+        cursor = point_end;
+    }
+
+    // CueClusterPosition is relative to Segment data offset.
+    best_cue.map(|(_, pos)| pos + seg_offset)
+}
+
+/// Looks up any saved playback position (in seconds) for a user and item.
+pub async fn lookup_resume_position(
+    db: &sqlx::SqlitePool,
+    user_id: Option<Uuid>,
+    item_id: Option<Uuid>,
+) -> Option<f64> {
+    let (Some(user_id), Some(item_id)) = (user_id, item_id) else {
+        return None;
+    };
+    sqlx::query_scalar::<_, i64>(
+        "SELECT playback_position FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
+    )
+    .bind(user_id)
+    .bind(item_id)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .filter(|pos| *pos > 0)
+    .map(|pos| pos as f64)
+}
+
 /// Heuristically detects the MIME type from the file extension in a URL.
 fn detect_content_type(url: &str) -> &'static str {
     let path = url.split('?').next().unwrap_or(url);
@@ -860,7 +1279,8 @@ pub fn stats_json() -> serde_json::Value {
     for (url, entry) in FAST_START_CACHE.iter() {
         let head_len = entry.head_bytes.len() as u64;
         let tail_len = entry.tail_bytes.as_ref().map(|b| b.len() as u64).unwrap_or(0);
-        let item_ram = head_len + tail_len;
+        let resume_len = entry.resume_buffer.as_ref().map(|(_, b)| b.len() as u64).unwrap_or(0);
+        let item_ram = head_len + tail_len + resume_len;
         total_ram_bytes += item_ram;
 
         cached_items.push(json!({
@@ -870,6 +1290,7 @@ pub fn stats_json() -> serde_json::Value {
             "total_file_size_bytes": entry.total_size,
             "head_buffer_bytes": head_len,
             "tail_buffer_bytes": tail_len,
+            "resume_buffer_bytes": resume_len,
             "ram_usage_mb": (item_ram as f64) / (1024.0 * 1024.0),
             "age_seconds": entry.created_at.elapsed().as_secs(),
         }));
@@ -879,6 +1300,7 @@ pub fn stats_json() -> serde_json::Value {
         "metrics": {
             "hits_head": METRICS.hits_head.load(Ordering::Relaxed),
             "hits_tail": METRICS.hits_tail.load(Ordering::Relaxed),
+            "hits_resume": METRICS.hits_resume.load(Ordering::Relaxed),
             "redirects_issued": METRICS.redirects_issued.load(Ordering::Relaxed),
             "misses": METRICS.misses.load(Ordering::Relaxed),
             "prewarms_started": METRICS.prewarms_started.load(Ordering::Relaxed),
@@ -921,6 +1343,7 @@ mod tests {
                 direct_cdn_url: "http://cdn.example.com/shogun.mkv".to_string(),
                 head_bytes: Bytes::from(head_data.clone()),
                 tail_bytes: None,
+                resume_buffer: None,
                 total_size: 1_000_000,
                 content_type: "video/x-matroska".to_string(),
                 created_at: Instant::now(),
@@ -977,7 +1400,7 @@ mod tests {
 
         // Spawn a Low-priority pre-warm; it must wait in the semaphore queue WITHOUT holding PREWARM_LOCKS
         let low_handle = tokio::spawn(async move {
-            prewarm_fast_start(None, &url_low, &HashMap::new(), PrewarmPriority::Low, None).await
+            prewarm_fast_start(None, &url_low, &HashMap::new(), PrewarmPriority::Low, None, None).await
         });
 
         // Give Low task a moment to enter the semaphore queue
@@ -991,7 +1414,7 @@ mod tests {
         // Now run a High-priority pre-warm for the EXACT SAME URL while the semaphore is still 100% exhausted!
         let high_ok = tokio::time::timeout(
             Duration::from_millis(500),
-            prewarm_fast_start(None, &test_url, &HashMap::new(), PrewarmPriority::High, None),
+            prewarm_fast_start(None, &test_url, &HashMap::new(), PrewarmPriority::High, None, None),
         )
         .await
         .expect("High-priority pre-warm should not be blocked by exhausted background semaphore");
@@ -1022,6 +1445,7 @@ mod tests {
                 direct_cdn_url: cdn_url.to_string(),
                 head_bytes: Bytes::from(vec![0xAA; 1024]),
                 tail_bytes: None,
+                resume_buffer: None,
                 total_size: 1_000_000,
                 content_type: "video/x-matroska".to_string(),
                 created_at: Instant::now(),
@@ -1048,5 +1472,68 @@ mod tests {
 
         // Reset to false
         set_force_direct_307(false);
+    }
+
+    #[tokio::test]
+    async fn resume_buffer_hit_serves_local_lan_and_direct_307_fallback() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+        let test_url = "http://127.0.0.1:9999/resume-test.mkv";
+        let cdn_url = "http://cdn.example.com/resume-direct.mkv";
+        let resume_start: u64 = 5_000_000;
+        let resume_data: Vec<u8> = (0..16384u32).map(|i| (i % 251) as u8).collect();
+
+        FAST_START_CACHE.insert(
+            test_url.to_string(),
+            FastStartEntry {
+                item_id: Some(Uuid::nil()),
+                original_url: test_url.to_string(),
+                direct_cdn_url: cdn_url.to_string(),
+                head_bytes: Bytes::from(vec![0x11; 1024]),
+                tail_bytes: None,
+                resume_buffer: Some((resume_start, Bytes::from(resume_data.clone()))),
+                total_size: 10_000_000,
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+
+        // 1. Client seeks to byte 5,000,100 (inside the 16KB resume buffer starting at 5,000,000)
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=5000100-"));
+        let resp = handle_playback_request(Uuid::nil(), test_url, &headers, None)
+            .await
+            .expect("should hit resume buffer");
+
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("X-Remux-FastStart").unwrap(),
+            "hit-resume"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 5000100-5016383/10000000"
+        );
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body_bytes[..], &resume_data[100..]);
+
+        // 2. Client seeks past resume buffer (e.g. byte 5,020,000): should immediately 307 redirect to CDN
+        let mut headers_seek = HeaderMap::new();
+        headers_seek.insert(header::RANGE, HeaderValue::from_static("bytes=5020000-"));
+        let resp_seek = handle_playback_request(Uuid::nil(), test_url, &headers_seek, None)
+            .await
+            .expect("should redirect to CDN");
+
+        assert_eq!(resp_seek.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp_seek.headers().get("X-Remux-FastStart").unwrap(),
+            "redirect-direct-cdn"
+        );
+        assert_eq!(
+            resp_seek.headers().get(header::LOCATION).unwrap(),
+            cdn_url
+        );
     }
 }

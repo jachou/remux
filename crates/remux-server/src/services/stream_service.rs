@@ -764,18 +764,22 @@ impl StreamService {
                         let url_clone = url.clone();
                         let headers_clone = request_headers.clone();
                         let item_id = self.item_id;
+                        let user_id = self.user_id;
+                        let db_pool = self.ctx.db.clone();
                         let head_size = crate::fast_start::calculate_fast_start_head_size(
                             url,
                             si.size.map(|s| s as u64),
                             None,
                         );
                         tokio::spawn(async move {
+                            let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
                             crate::fast_start::prewarm_fast_start(
                                 Some(item_id),
                                 &url_clone,
                                 &headers_clone,
                                 crate::fast_start::PrewarmPriority::High,
                                 Some(head_size),
+                                resume_pos,
                             )
                             .await;
                         });
@@ -1463,6 +1467,8 @@ impl StreamService {
                             let url_clone = url.clone();
                             let headers_clone = request_headers.clone();
                             let item_id = self.item_id;
+                            let user_id = self.user_id;
+                            let db_pool = self.ctx.db.clone();
                             let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
                             let head_size = crate::fast_start::calculate_fast_start_head_size(
                                 url,
@@ -1470,12 +1476,14 @@ impl StreamService {
                                 Some(is_4k),
                             );
                             tokio::spawn(async move {
+                                let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
                                 crate::fast_start::prewarm_fast_start(
                                     Some(item_id),
                                     &url_clone,
                                     &headers_clone,
                                     crate::fast_start::PrewarmPriority::Low,
                                     Some(head_size),
+                                    resume_pos,
                                 )
                                 .await;
                             });
@@ -1537,6 +1545,7 @@ impl StreamService {
                             &headers_clone,
                             crate::fast_start::PrewarmPriority::Low,
                             Some(head_size),
+                            None,
                         )
                         .await;
                     });
@@ -1579,6 +1588,7 @@ impl StreamService {
                             &headers_clone,
                             crate::fast_start::PrewarmPriority::Low,
                             Some(head_size),
+                            None,
                         )
                         .await;
                     });
@@ -1679,6 +1689,7 @@ pub fn spawn_preemptive_probe(
                             if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
                                 let url_clone = url.clone();
                                 let headers_clone = request_headers.clone();
+                                let db_pool = ctx.db.clone();
                                 let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
                                 let head_size = crate::fast_start::calculate_fast_start_head_size(
                                     url,
@@ -1686,12 +1697,14 @@ pub fn spawn_preemptive_probe(
                                     Some(is_4k),
                                 );
                                 tokio::spawn(async move {
+                                    let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
                                     crate::fast_start::prewarm_fast_start(
                                         Some(item_id),
                                         &url_clone,
                                         &headers_clone,
                                         crate::fast_start::PrewarmPriority::Low,
                                         Some(head_size),
+                                        resume_pos,
                                     )
                                     .await;
                                 });
