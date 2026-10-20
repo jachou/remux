@@ -27,9 +27,9 @@ pub const FAST_START_TAIL_SIZE: usize = 2 * 1024 * 1024;
 /// When resuming from the middle, 8 MB is plenty to decode container headers, tracks, and codecs.
 pub const FAST_START_RESUME_HEAD_SIZE: usize = 8 * 1024 * 1024;
 
-/// Resume buffer size in bytes: 24 MB.
-/// Provides ~8-10 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
-pub const FAST_START_RESUME_BUFFER_SIZE: usize = 24 * 1024 * 1024;
+/// Resume buffer size in bytes: 48 MB.
+/// Provides ~12-15 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
+pub const FAST_START_RESUME_BUFFER_SIZE: usize = 48 * 1024 * 1024;
 
 /// Global toggle: when enabled, Remux does NOT buffer head/tail bytes in RAM.
 /// Instead, pre-warming only resolves the direct Debrid CDN edge URL, and playback requests
@@ -939,6 +939,28 @@ pub async fn handle_playback_request(
         // Case 5: Video cluster stream / seek / continuous playback
         // Issue 307 Temporary Redirect DIRECTLY to Debrid CDN edge
         Some(rng) => {
+            // If this stream has a resume buffer pre-warmed in RAM, and the client is reading
+            // through the head boundary (immediately after head buffer, up to head + 64MB)
+            // before the resume cluster, do NOT immediately 307-redirect it!
+            // Prematurely issuing a 307 on the head continuation causes Infuse/FFmpeg to update
+            // its base URL to the CDN, evicting the client before its resume seek arrives at Remux.
+            // Holding this request briefly gives Infuse the ~1-2s window it needs to parse Cues
+            // and dispatch the seek to Remux's RAM resume buffer.
+            if let Some((resume_start, _)) = entry.resume_buffer {
+                let head_len = entry.head_bytes.len() as u64;
+                if let Some((req_start, _)) = parse_range_bounds(rng, entry.total_size) {
+                    if req_start >= head_len && req_start < head_len + 64 * 1024 * 1024 && req_start < resume_start {
+                        info!(
+                            %item_id,
+                            range = %rng,
+                            resume_start,
+                            "[FAST-START] Holding head continuation read for 2000ms to allow resume seek to hit RAM buffer..."
+                        );
+                        tokio::time::sleep(Duration::from_millis(2000)).await;
+                    }
+                }
+            }
+
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             info!(
                 %item_id,
