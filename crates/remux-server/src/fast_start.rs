@@ -23,19 +23,38 @@ pub const FAST_START_HEAD_SIZE: usize = FAST_START_DEFAULT_HEAD_SIZE;
 /// Tail buffer size for MKV Cues / seekhead index: 2 MB.
 pub const FAST_START_TAIL_SIZE: usize = 2 * 1024 * 1024;
 
-/// Head buffer size in bytes for Continue Watching / resume streams: 48 MB.
-/// Provides sufficient headroom (~12s of 4K bitstream) for high-bitrate Dolby Vision/Atmos
+/// Head buffer size in bytes for standard 1080p Continue Watching / resume streams: 24 MB.
+/// Provides plenty of headroom (~25s of 1080p bitstream) to parse container headers and tracks.
+pub const FAST_START_RESUME_HEAD_SIZE_1080P: usize = 24 * 1024 * 1024;
+
+/// Head buffer size in bytes for 4K / UHD Continue Watching / resume streams: 64 MB.
+/// Provides sufficient headroom (~16s of 33 Mbps bitstream) for high-bitrate Dolby Vision/Atmos
 /// files to complete avformat_find_stream_info entirely in RAM before seeking.
-pub const FAST_START_RESUME_HEAD_SIZE: usize = 48 * 1024 * 1024;
+pub const FAST_START_RESUME_HEAD_SIZE_4K: usize = 64 * 1024 * 1024;
 
-/// Resume buffer size in bytes: 48 MB.
+/// Backward-compatible alias for 4K resume head size.
+pub const FAST_START_RESUME_HEAD_SIZE: usize = FAST_START_RESUME_HEAD_SIZE_4K;
+
+/// Resume buffer size in bytes for standard 1080p Continue Watching streams: 24 MB.
+pub const FAST_START_RESUME_BUFFER_SIZE_1080P: usize = 24 * 1024 * 1024;
+
+/// Resume buffer size in bytes for 4K / UHD Continue Watching streams: 48 MB.
 /// Provides ~12-15 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
-pub const FAST_START_RESUME_BUFFER_SIZE: usize = 48 * 1024 * 1024;
+pub const FAST_START_RESUME_BUFFER_SIZE_4K: usize = 48 * 1024 * 1024;
 
-/// Pre-roll padding in bytes for the resume buffer: 8 MB.
+/// Backward-compatible alias for 4K resume buffer size.
+pub const FAST_START_RESUME_BUFFER_SIZE: usize = FAST_START_RESUME_BUFFER_SIZE_4K;
+
+/// Pre-roll padding in bytes for standard 1080p resume buffer: 8 MB.
+pub const FAST_START_RESUME_PREROLL_BYTES_1080P: usize = 8 * 1024 * 1024;
+
+/// Pre-roll padding in bytes for 4K resume buffer: 8 MB.
 /// Positions the target keyframe 8 MB into the 48 MB buffer, providing demuxer backward headroom
 /// while leaving ~40 MB (~10-12s of 4K video) for smooth forward playback.
-pub const FAST_START_RESUME_PREROLL_BYTES: usize = 8 * 1024 * 1024;
+pub const FAST_START_RESUME_PREROLL_BYTES_4K: usize = 8 * 1024 * 1024;
+
+/// Backward-compatible alias for 4K resume preroll bytes.
+pub const FAST_START_RESUME_PREROLL_BYTES: usize = FAST_START_RESUME_PREROLL_BYTES_4K;
 
 /// Infuse built-in Resume Rewind duration in seconds: 15.0s.
 /// Infuse consistently rewinds 10-15 seconds from the database pause timestamp when resuming playback.
@@ -60,29 +79,50 @@ pub fn set_force_direct_307(val: bool) {
     FORCE_DIRECT_307.store(val, Ordering::Relaxed);
 }
 
+/// Helper to determine if a stream is 4K / UHD based on URL clues, file size, or 4K flags.
+pub fn is_4k_stream(
+    url: &str,
+    size_bytes: Option<u64>,
+    is_4k: Option<bool>,
+) -> bool {
+    if is_4k == Some(true) {
+        return true;
+    }
+    if let Some(bytes) = size_bytes {
+        if bytes > 8 * 1024 * 1024 * 1024 {
+            return true;
+        }
+    }
+    let lower = url.to_ascii_lowercase();
+    lower.contains("2160p")
+        || lower.contains("4k")
+        || lower.contains("uhd")
+        || lower.contains("remux")
+}
+
 /// Determines the ideal Fast-Start head buffer size based on URL clues, file size, or 4K flags.
 pub fn calculate_fast_start_head_size(
     url: &str,
     size_bytes: Option<u64>,
     is_4k: Option<bool>,
 ) -> usize {
-    if is_4k == Some(true) {
-        return FAST_START_4K_HEAD_SIZE;
-    }
-    if let Some(bytes) = size_bytes {
-        if bytes > 8 * 1024 * 1024 * 1024 {
-            return FAST_START_4K_HEAD_SIZE;
-        }
-    }
-    let lower = url.to_ascii_lowercase();
-    if lower.contains("2160p")
-        || lower.contains("4k")
-        || lower.contains("uhd")
-        || lower.contains("remux")
-    {
+    if is_4k_stream(url, size_bytes, is_4k) {
         FAST_START_4K_HEAD_SIZE
     } else {
         FAST_START_DEFAULT_HEAD_SIZE
+    }
+}
+
+/// Determines the ideal Fast-Start resume head buffer size (24 MB for 1080p, 64 MB for 4K).
+pub fn calculate_fast_start_resume_head_size(
+    url: &str,
+    size_bytes: Option<u64>,
+    is_4k: Option<bool>,
+) -> usize {
+    if is_4k_stream(url, size_bytes, is_4k) {
+        FAST_START_RESUME_HEAD_SIZE_4K
+    } else {
+        FAST_START_RESUME_HEAD_SIZE_1080P
     }
 }
 
@@ -207,9 +247,19 @@ pub async fn prewarm_fast_start(
                         }).unwrap_or(false);
 
                         if !already_covered {
-                            let preroll_bytes = FAST_START_RESUME_PREROLL_BYTES as u64;
+                            let is_4k = is_4k_stream(original_url, Some(entry.total_size), None);
+                            let preroll_bytes = if is_4k {
+                                FAST_START_RESUME_PREROLL_BYTES_4K as u64
+                            } else {
+                                FAST_START_RESUME_PREROLL_BYTES_1080P as u64
+                            };
+                            let resume_buffer_size = if is_4k {
+                                FAST_START_RESUME_BUFFER_SIZE_4K
+                            } else {
+                                FAST_START_RESUME_BUFFER_SIZE_1080P
+                            };
                             let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
-                            let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(entry.total_size - 1);
+                            let end_byte = (start_byte + resume_buffer_size as u64 - 1).min(entry.total_size - 1);
                             let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                             let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
                             for (k, v) in request_headers {
@@ -370,7 +420,7 @@ pub async fn prewarm_fast_start(
 
     let is_resuming = resume_position_secs.map(|p| p > 10.0).unwrap_or(false);
     let target_head_size = if is_resuming {
-        FAST_START_RESUME_HEAD_SIZE
+        calculate_fast_start_resume_head_size(original_url, None, None)
     } else {
         head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, None))
     };
@@ -506,9 +556,19 @@ pub async fn prewarm_fast_start(
     let resume_buffer = if let (Some(pos_secs), Some(tb)) = (resume_position_secs, &tail_bytes) {
         if pos_secs > 10.0 {
             if let Some(target_offset) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
-                let preroll_bytes = FAST_START_RESUME_PREROLL_BYTES as u64;
+                let is_4k = is_4k_stream(original_url, Some(total_size), None);
+                let preroll_bytes = if is_4k {
+                    FAST_START_RESUME_PREROLL_BYTES_4K as u64
+                } else {
+                    FAST_START_RESUME_PREROLL_BYTES_1080P as u64
+                };
+                let target_resume_buffer_size = if is_4k {
+                    FAST_START_RESUME_BUFFER_SIZE_4K
+                } else {
+                    FAST_START_RESUME_BUFFER_SIZE_1080P
+                };
                 let start_byte = target_offset.saturating_sub(preroll_bytes).max(head_bytes.len() as u64);
-                let end_byte = (start_byte + FAST_START_RESUME_BUFFER_SIZE as u64 - 1).min(total_size - 1);
+                let end_byte = (start_byte + target_resume_buffer_size as u64 - 1).min(total_size - 1);
                 let resume_range = format!("bytes={}-{}", start_byte, end_byte);
                 let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
                 for (k, v) in request_headers {
@@ -1350,6 +1410,32 @@ mod tests {
     use super::*;
 
     static TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    #[test]
+    fn tiered_resume_head_and_buffer_sizing() {
+        let url_1080p = "http://cdn.example.com/Show.S01E01.1080p.WEB-DL.mkv";
+        let url_4k = "http://cdn.example.com/Lioness.S03E06.2160p.ATV.WEB-DL.mkv";
+
+        assert!(!is_4k_stream(url_1080p, None, None));
+        assert!(is_4k_stream(url_4k, None, None));
+
+        assert_eq!(
+            calculate_fast_start_resume_head_size(url_1080p, None, None),
+            24 * 1024 * 1024
+        );
+        assert_eq!(
+            calculate_fast_start_resume_head_size(url_4k, None, None),
+            64 * 1024 * 1024
+        );
+        assert_eq!(
+            calculate_fast_start_head_size(url_1080p, None, None),
+            16 * 1024 * 1024
+        );
+        assert_eq!(
+            calculate_fast_start_head_size(url_4k, None, None),
+            32 * 1024 * 1024
+        );
+    }
 
     #[tokio::test]
     async fn head_subrange_requests_served_from_ram() {
