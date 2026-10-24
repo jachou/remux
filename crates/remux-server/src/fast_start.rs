@@ -36,30 +36,30 @@ pub const FAST_START_RESUME_HEAD_SIZE_4K: usize = 64 * 1024 * 1024;
 /// Backward-compatible alias for 4K resume head size.
 pub const FAST_START_RESUME_HEAD_SIZE: usize = FAST_START_RESUME_HEAD_SIZE_4K;
 
-/// Resume buffer size in bytes for standard 1080p Continue Watching streams: 24 MB.
-pub const FAST_START_RESUME_BUFFER_SIZE_1080P: usize = 24 * 1024 * 1024;
+/// Resume buffer size in bytes for standard 1080p Continue Watching streams: 48 MB.
+pub const FAST_START_RESUME_BUFFER_SIZE_1080P: usize = 48 * 1024 * 1024;
 
-/// Resume buffer size in bytes for 4K / UHD Continue Watching streams: 48 MB.
-/// Provides ~12-15 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
-pub const FAST_START_RESUME_BUFFER_SIZE_4K: usize = 48 * 1024 * 1024;
+/// Resume buffer size in bytes for 4K / UHD Continue Watching streams: 64 MB.
+/// Provides ~18-22 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
+pub const FAST_START_RESUME_BUFFER_SIZE_4K: usize = 64 * 1024 * 1024;
 
 /// Backward-compatible alias for 4K resume buffer size.
 pub const FAST_START_RESUME_BUFFER_SIZE: usize = FAST_START_RESUME_BUFFER_SIZE_4K;
 
-/// Pre-roll padding in bytes for standard 1080p resume buffer: 8 MB.
-pub const FAST_START_RESUME_PREROLL_BYTES_1080P: usize = 8 * 1024 * 1024;
+/// Pre-roll padding in bytes for standard 1080p resume buffer: 18 MB.
+pub const FAST_START_RESUME_PREROLL_BYTES_1080P: usize = 18 * 1024 * 1024;
 
-/// Pre-roll padding in bytes for 4K resume buffer: 8 MB.
-/// Positions the target keyframe 8 MB into the 48 MB buffer, providing demuxer backward headroom
-/// while leaving ~40 MB (~10-12s of 4K video) for smooth forward playback.
-pub const FAST_START_RESUME_PREROLL_BYTES_4K: usize = 8 * 1024 * 1024;
+/// Pre-roll padding in bytes for 4K resume buffer: 18 MB.
+/// Positions the target keyframe 18 MB into the 64 MB buffer, providing demuxer backward headroom
+/// while leaving ~46 MB (~14-16s of 4K video) for smooth forward playback.
+pub const FAST_START_RESUME_PREROLL_BYTES_4K: usize = 18 * 1024 * 1024;
 
 /// Backward-compatible alias for 4K resume preroll bytes.
 pub const FAST_START_RESUME_PREROLL_BYTES: usize = FAST_START_RESUME_PREROLL_BYTES_4K;
 
-/// Infuse built-in Resume Rewind duration in seconds: 15.0s.
-/// Infuse consistently rewinds 10-15 seconds from the database pause timestamp when resuming playback.
-pub const FAST_START_RESUME_REWIND_SECS: f64 = 15.0;
+/// Infuse built-in Resume Rewind duration in seconds: 22.0s.
+/// Infuse consistently rewinds 15-22+ seconds from the database pause timestamp when resuming playback.
+pub const FAST_START_RESUME_REWIND_SECS: f64 = 22.0;
 
 /// Global toggle: when enabled, Remux does NOT buffer head/tail bytes in RAM.
 /// Instead, pre-warming only resolves the direct Debrid CDN edge URL, and playback requests
@@ -982,7 +982,7 @@ async fn serve_from_in_flight(
                 Some(t)
             } else {
                 let _ = tokio::time::timeout(
-                    Duration::from_millis(1500),
+                    Duration::from_millis(3500),
                     in_flight.tail_notify.notified(),
                 ).await;
                 in_flight.tail_bytes.read().unwrap().clone()
