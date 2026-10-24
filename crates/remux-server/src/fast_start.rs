@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
+use futures_util::StreamExt as _;
 use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -146,6 +147,22 @@ pub struct FastStartEntry {
     pub created_at: Instant,
 }
 
+/// In-flight pre-warm entry allowing clients to stream chunks in real-time over LAN before download completes.
+pub struct InFlightHead {
+    pub item_id: Option<Uuid>,
+    pub original_url: String,
+    pub direct_cdn_url: String,
+    pub total_size: u64,
+    pub target_head_size: usize,
+    pub content_type: String,
+    pub buffer: RwLock<BytesMut>,
+    pub tail_bytes: RwLock<Option<Bytes>>,
+    pub notify: tokio::sync::Notify,
+    pub tail_notify: tokio::sync::Notify,
+    pub is_done: AtomicBool,
+    pub has_error: AtomicBool,
+}
+
 /// Priority lane for Fast-Start pre-warming.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrewarmPriority {
@@ -205,6 +222,10 @@ pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStart
             .max_capacity(FAST_START_MAX_ITEMS as u64)
             .build()
     });
+
+/// Tracks in-flight pre-warms so requests for uncompleted buffers can stream chunks immediately.
+pub(crate) static IN_FLIGHT_PREWARMS: LazyLock<dashmap::DashMap<String, Arc<InFlightHead>>> =
+    LazyLock::new(dashmap::DashMap::new);
 
 /// Tracks URLs currently queued or running in the low-priority background lane to prevent duplicate spawns.
 static QUEUED_PREWARMS: LazyLock<dashmap::DashSet<String>> =
@@ -518,12 +539,39 @@ pub async fn prewarm_fast_start(
         .map(|ct| ct.to_string())
         .unwrap_or_else(|| detect_content_type(original_url).to_string());
 
-    // Step 2: Read the 16 MB head body AND fetch the 256 KB tail index (MKV Cues) in parallel!
-    let tail_fut = async {
-        if total_size > FAST_START_TAIL_SIZE as u64 {
+    // Register in-flight pre-warm entry so concurrent stream requests can stream chunks immediately
+    let in_flight = Arc::new(InFlightHead {
+        item_id,
+        original_url: original_url.to_string(),
+        direct_cdn_url: direct_cdn_url.clone(),
+        total_size,
+        target_head_size,
+        content_type: content_type.clone(),
+        buffer: RwLock::new(BytesMut::with_capacity(target_head_size)),
+        tail_bytes: RwLock::new(None),
+        notify: tokio::sync::Notify::new(),
+        tail_notify: tokio::sync::Notify::new(),
+        is_done: AtomicBool::new(false),
+        has_error: AtomicBool::new(false),
+    });
+    IN_FLIGHT_PREWARMS.insert(original_url.to_string(), in_flight.clone());
+
+    struct InFlightGuard<'a>(&'a str);
+    impl<'a> Drop for InFlightGuard<'a> {
+        fn drop(&mut self) {
+            IN_FLIGHT_PREWARMS.remove(self.0);
+        }
+    }
+    let _in_flight_guard = InFlightGuard(original_url);
+
+    // Step 2: Stream head body in chunks AND fetch tail cues in parallel!
+    let in_flight_tail = in_flight.clone();
+    let direct_cdn_url_tail = direct_cdn_url.clone();
+    let tail_fut = async move {
+        let res = if total_size > FAST_START_TAIL_SIZE as u64 {
             let tail_start = total_size - FAST_START_TAIL_SIZE as u64;
             let tail_range = format!("bytes={}-{}", tail_start, total_size - 1);
-            let mut tail_req = PREWARM_CLIENT.get(&direct_cdn_url);
+            let mut tail_req = PREWARM_CLIENT.get(&direct_cdn_url_tail);
             for (k, v) in request_headers {
                 tail_req = tail_req.header(k.as_str(), v.as_str());
             }
@@ -543,10 +591,44 @@ pub async fn prewarm_fast_start(
             }
         } else {
             None
+        };
+        {
+            let mut t = in_flight_tail.tail_bytes.write().unwrap();
+            *t = res.clone();
         }
+        in_flight_tail.tail_notify.notify_waiters();
+        res
     };
 
-    let (head_res, tail_bytes) = tokio::join!(head_resp.bytes(), tail_fut);
+    let in_flight_head = in_flight.clone();
+    let head_fut = async move {
+        let mut stream = head_resp.bytes_stream();
+        while let Some(chunk_res) = stream.next().await {
+            match chunk_res {
+                Ok(chunk) => {
+                    {
+                        let mut buf = in_flight_head.buffer.write().unwrap();
+                        buf.extend_from_slice(&chunk);
+                    }
+                    in_flight_head.notify.notify_waiters();
+                }
+                Err(e) => {
+                    in_flight_head.has_error.store(true, Ordering::Relaxed);
+                    in_flight_head.notify.notify_waiters();
+                    return Err(e);
+                }
+            }
+        }
+        in_flight_head.is_done.store(true, Ordering::Relaxed);
+        in_flight_head.notify.notify_waiters();
+        let final_bytes = {
+            let buf = in_flight_head.buffer.read().unwrap();
+            Bytes::copy_from_slice(&buf)
+        };
+        Ok(final_bytes)
+    };
+
+    let (head_res, tail_bytes) = tokio::join!(head_fut, tail_fut);
 
     let head_bytes = match head_res {
         Ok(b) => b,
@@ -734,6 +816,251 @@ fn is_browser_video_request(headers: &HeaderMap) -> bool {
         .is_some_and(|ua| ua.starts_with("Mozilla/"))
 }
 
+/// Serves chunks in real-time from an actively downloading in-flight pre-warm buffer.
+async fn serve_from_in_flight(
+    item_id: Uuid,
+    in_flight: &Arc<InFlightHead>,
+    headers: &HeaderMap,
+) -> Option<Response> {
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+
+    match range_header {
+        // Case 1: Head sub-range or open-ended request (starts inside target_head_size)
+        Some(rng) if is_head_range(rng, in_flight.target_head_size, in_flight.total_size) => {
+            METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
+            let (req_start, req_end) = parse_range_bounds(rng, in_flight.total_size)
+                .unwrap_or((0, in_flight.total_size.saturating_sub(1)));
+
+            let end_offset = (req_start + in_flight.target_head_size as u64 - 1)
+                .min(in_flight.total_size - 1);
+            let content_len = end_offset.saturating_sub(req_start) + 1;
+
+            info!(
+                %item_id,
+                req_start,
+                end_offset,
+                content_len,
+                total_size = in_flight.total_size,
+                "[FAST-START] Buffer hit (head): serving {} bytes locally over LAN (in-flight stream)",
+                content_len
+            );
+
+            let in_flight_clone = in_flight.clone();
+            let body_stream = async_stream::stream! {
+                let mut cursor = req_start as usize;
+                let target_end = (end_offset as usize) + 1;
+
+                while cursor < target_end {
+                    let chunk = {
+                        let buf = in_flight_clone.buffer.read().unwrap();
+                        let available_end = buf.len().min(target_end);
+                        if available_end > cursor {
+                            let slice = Bytes::copy_from_slice(&buf[cursor..available_end]);
+                            cursor = available_end;
+                            Some(slice)
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(slice) = chunk {
+                        let slice_len = slice.len();
+                        METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
+                        yield Ok::<Bytes, std::io::Error>(slice);
+                    } else {
+                        // Wait for upstream to deliver more bytes
+                        if in_flight_clone.is_done.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if in_flight_clone.has_error.load(Ordering::Relaxed) {
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "in-flight stream error",
+                            ));
+                            break;
+                        }
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            in_flight_clone.notify.notified(),
+                        ).await;
+                    }
+                }
+            };
+
+            let resp = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, &in_flight.content_type)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes {}-{}/{}", req_start, end_offset, in_flight.total_size),
+                )
+                .header(header::CONTENT_LENGTH, content_len.to_string())
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header("X-Remux-FastStart", "hit-head-inflight")
+                .body(Body::from_stream(body_stream))
+                .unwrap();
+
+            Some(resp)
+        }
+
+        // Case 2: No range header specified (treat as head probe)
+        None => {
+            METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
+            let target_head_size = in_flight.target_head_size;
+            let end_offset = (target_head_size as u64).min(in_flight.total_size).saturating_sub(1);
+            let content_len = end_offset + 1;
+
+            info!(
+                %item_id,
+                content_len,
+                total_size = in_flight.total_size,
+                "[FAST-START] Buffer hit (no range): serving {} bytes locally over LAN (in-flight stream)",
+                content_len
+            );
+
+            let in_flight_clone = in_flight.clone();
+            let body_stream = async_stream::stream! {
+                let mut cursor = 0usize;
+                let target_end = (end_offset as usize) + 1;
+
+                while cursor < target_end {
+                    let chunk = {
+                        let buf = in_flight_clone.buffer.read().unwrap();
+                        let available_end = buf.len().min(target_end);
+                        if available_end > cursor {
+                            let slice = Bytes::copy_from_slice(&buf[cursor..available_end]);
+                            cursor = available_end;
+                            Some(slice)
+                        } else {
+                            None
+                        }
+                    };
+
+                    if let Some(slice) = chunk {
+                        let slice_len = slice.len();
+                        METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
+                        yield Ok::<Bytes, std::io::Error>(slice);
+                    } else {
+                        if in_flight_clone.is_done.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if in_flight_clone.has_error.load(Ordering::Relaxed) {
+                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
+                                std::io::ErrorKind::ConnectionReset,
+                                "in-flight stream error",
+                            ));
+                            break;
+                        }
+                        let _ = tokio::time::timeout(
+                            Duration::from_secs(5),
+                            in_flight_clone.notify.notified(),
+                        ).await;
+                    }
+                }
+            };
+
+            let resp = Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(header::CONTENT_TYPE, &in_flight.content_type)
+                .header(
+                    header::CONTENT_RANGE,
+                    format!("bytes 0-{}/{}", end_offset, in_flight.total_size),
+                )
+                .header(header::CONTENT_LENGTH, content_len.to_string())
+                .header(header::ACCEPT_RANGES, "bytes")
+                .header("X-Remux-FastStart", "hit-head-inflight")
+                .body(Body::from_stream(body_stream))
+                .unwrap();
+
+            Some(resp)
+        }
+
+        // Case 3: Tail / MKV Cues index probe
+        Some(rng) if is_tail_range(rng, in_flight.total_size) => {
+            let tail_opt = in_flight.tail_bytes.read().unwrap().clone();
+            let tail_bytes = if let Some(t) = tail_opt {
+                Some(t)
+            } else {
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(1500),
+                    in_flight.tail_notify.notified(),
+                ).await;
+                in_flight.tail_bytes.read().unwrap().clone()
+            };
+
+            if let Some(tail) = tail_bytes {
+                let tail_len = tail.len() as u64;
+                let tail_start = in_flight.total_size.saturating_sub(tail_len);
+                if let Some((req_start, req_end)) = parse_range_bounds(rng, in_flight.total_size) {
+                    if req_start >= tail_start && req_start < in_flight.total_size && req_end >= req_start {
+                        let offset = (req_start - tail_start) as usize;
+                        if offset < tail.len() {
+                            let end_in_tail = (req_end - tail_start) as usize;
+                            let end_clamped = end_in_tail.min(tail.len() - 1);
+                            let slice = tail.slice(offset..=end_clamped);
+                            let slice_len = slice.len();
+                            let end_byte = req_start + slice_len as u64 - 1;
+
+                            METRICS.hits_tail.fetch_add(1, Ordering::Relaxed);
+                            METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
+
+                            info!(
+                                %item_id,
+                                req_start,
+                                end_byte,
+                                slice_len,
+                                total_size = in_flight.total_size,
+                                "[FAST-START] Buffer hit (tail/cues): serving {} bytes locally over LAN",
+                                slice_len
+                            );
+
+                            let resp = Response::builder()
+                                .status(StatusCode::PARTIAL_CONTENT)
+                                .header(header::CONTENT_TYPE, &in_flight.content_type)
+                                .header(
+                                    header::CONTENT_RANGE,
+                                    format!("bytes {}-{}/{}", req_start, end_byte, in_flight.total_size),
+                                )
+                                .header(header::CONTENT_LENGTH, slice_len.to_string())
+                                .header(header::ACCEPT_RANGES, "bytes")
+                                .header("X-Remux-FastStart", "hit-tail")
+                                .body(Body::from(slice))
+                                .unwrap();
+
+                            return Some(resp);
+                        }
+                    }
+                }
+            }
+
+            METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            info!(
+                %item_id,
+                range = %rng,
+                direct_cdn = %in_flight.direct_cdn_url,
+                "[FAST-START] In-flight tail redirect: issuing 307 directly to Debrid CDN"
+            );
+            let mut redirect = Redirect::temporary(&in_flight.direct_cdn_url).into_response();
+            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static("redirect-direct-cdn"));
+            Some(redirect)
+        }
+
+        // Case 4: Any other range (continuous playback past head, seek)
+        Some(rng) => {
+            METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            info!(
+                %item_id,
+                range = %rng,
+                direct_cdn = %in_flight.direct_cdn_url,
+                "[FAST-START] Direct CDN handoff: issuing 307 directly to CDN edge (0 Mbps server upload)"
+            );
+            let mut redirect = Redirect::temporary(&in_flight.direct_cdn_url).into_response();
+            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static("redirect-direct-cdn"));
+            Some(redirect)
+        }
+    }
+}
+
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///
@@ -802,23 +1129,31 @@ pub async fn handle_playback_request(
     // 1. Direct lookup by exact URL to avoid stream hijacking if the user selected a different version/source
     let mut entry = FAST_START_CACHE.get(url);
 
-    // 2. If not cached, await in-flight prewarm up to 4000ms for this exact URL
+    // 2. If not cached, check if stream is currently in-flight to stream chunks in real-time
     if entry.is_none() {
-        if PREWARM_LOCKS.contains_key(&url.to_string()) {
-            info!(%item_id, %url, "[FAST-START] Pre-warm currently in flight; awaiting completion up to 4000ms");
-            let _ = tokio::time::timeout(
-                Duration::from_millis(4000),
-                PREWARM_LOCKS.lock_if_exists(&url.to_string()),
-            )
-            .await;
-
-            // Re-check cache after lock release
-            entry = FAST_START_CACHE.get(url);
-
-            if entry.is_some() {
-                info!(%item_id, "[FAST-START] In-flight pre-warm successfully coalesced into cache!");
+        if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+            if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
+                return Some(resp);
             }
-        } else {
+        }
+
+        // If not yet in IN_FLIGHT_PREWARMS but PREWARM_LOCKS is held, poll briefly (up to 500ms) for registration
+        if PREWARM_LOCKS.contains_key(&url.to_string()) {
+            for _ in 0..10 {
+                if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+                    if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
+                        return Some(resp);
+                    }
+                }
+                if let Some(e) = FAST_START_CACHE.get(url) {
+                    entry = Some(e);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        if entry.is_none() {
             // Uncached and nothing in-flight: don't block this request.
             // Spawn pre-warm in background for this exact URL so subsequent seeks benefit, but immediately fall through to 307 redirect.
             info!(%item_id, %url, "[FAST-START] Uncached & not in-flight: spawning background pre-warm and immediately falling back to direct redirect");
@@ -1402,6 +1737,7 @@ pub fn stats_json() -> serde_json::Value {
             "force_direct_307": is_force_direct_307(),
             "max_items": FAST_START_MAX_ITEMS,
             "cached_items_count": cached_items.len(),
+            "in_flight_count": IN_FLIGHT_PREWARMS.len(),
             "total_ram_bytes": total_ram_bytes,
             "total_ram_mb": (total_ram_bytes as f64) / (1024.0 * 1024.0),
             "ttl_seconds": FAST_START_TTL.as_secs(),
@@ -1434,7 +1770,7 @@ mod tests {
         );
         assert_eq!(
             calculate_fast_start_head_size(url_1080p, None, None),
-            16 * 1024 * 1024
+            32 * 1024 * 1024
         );
         assert_eq!(
             calculate_fast_start_head_size(url_4k, None, None),
@@ -1648,5 +1984,72 @@ mod tests {
             resp_seek.headers().get(header::LOCATION).unwrap(),
             cdn_url
         );
+    }
+
+    #[tokio::test]
+    async fn in_flight_chunk_streaming_serves_live_chunks() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+        let test_url = "http://127.0.0.1:9999/inflight-live-stream-test.mkv";
+        let target_size = 1024 * 1024;
+        let total_size = 50 * 1024 * 1024;
+
+        let in_flight = Arc::new(InFlightHead {
+            item_id: Some(Uuid::nil()),
+            original_url: test_url.to_string(),
+            direct_cdn_url: "http://cdn.example.com/inflight.mkv".to_string(),
+            total_size,
+            target_head_size: target_size,
+            content_type: "video/x-matroska".to_string(),
+            buffer: RwLock::new(BytesMut::new()),
+            tail_bytes: RwLock::new(None),
+            notify: tokio::sync::Notify::new(),
+            tail_notify: tokio::sync::Notify::new(),
+            is_done: AtomicBool::new(false),
+            has_error: AtomicBool::new(false),
+        });
+        IN_FLIGHT_PREWARMS.insert(test_url.to_string(), in_flight.clone());
+
+        // Client requests open-ended byte 0
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+        let resp = handle_playback_request(Uuid::nil(), test_url, &headers, None)
+            .await
+            .expect("should hit in-flight streaming");
+
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get("X-Remux-FastStart").unwrap(),
+            "hit-head-inflight"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap().to_str().unwrap(),
+            format!("bytes 0-{}/{}", target_size - 1, total_size)
+        );
+
+        // Feed chunks into in_flight buffer asynchronously
+        let in_flight_producer = in_flight.clone();
+        tokio::spawn(async move {
+            for i in 0..4 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                {
+                    let mut b = in_flight_producer.buffer.write().unwrap();
+                    b.extend_from_slice(&vec![i as u8; 256 * 1024]);
+                }
+                in_flight_producer.notify.notify_waiters();
+            }
+            in_flight_producer.is_done.store(true, Ordering::Relaxed);
+            in_flight_producer.notify.notify_waiters();
+        });
+
+        // Drain the streamed body
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body_bytes.len(), target_size);
+        assert_eq!(&body_bytes[0..4], &[0, 0, 0, 0]);
+        assert_eq!(&body_bytes[256 * 1024..256 * 1024 + 4], &[1, 1, 1, 1]);
+
+        IN_FLIGHT_PREWARMS.remove(test_url);
     }
 }
