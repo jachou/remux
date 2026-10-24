@@ -11,8 +11,8 @@ use serde_json::json;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-/// Default head buffer size in bytes for standard 1080p / smaller streams: 16 MB.
-pub const FAST_START_DEFAULT_HEAD_SIZE: usize = 16 * 1024 * 1024;
+/// Default head buffer size in bytes for standard 1080p / smaller streams: 32 MB.
+pub const FAST_START_DEFAULT_HEAD_SIZE: usize = 32 * 1024 * 1024;
 
 /// 4K / UHD / large stream head buffer size in bytes: 32 MB.
 pub const FAST_START_4K_HEAD_SIZE: usize = 32 * 1024 * 1024;
@@ -129,7 +129,7 @@ pub fn calculate_fast_start_resume_head_size(
 /// Maximum number of items held in memory simultaneously.
 pub const FAST_START_MAX_ITEMS: usize = 50;
 
-/// Cache TTL matching Remux's LIVENESS_CACHE_TTL (1 hour).
+/// Default liveness re-verification threshold (1 hour).
 pub const FAST_START_TTL: Duration = Duration::from_secs(60 * 60);
 
 /// Cached fast-start entry for an upstream stream.
@@ -193,11 +193,16 @@ impl FastStartMetrics {
 pub static METRICS: FastStartMetrics = FastStartMetrics::new();
 
 /// Fast-start buffer cache, keyed by upstream stream URL.
+///
+/// Bounded strictly by `FAST_START_MAX_ITEMS` (50 items) via LRU capacity.
+/// Buffer retention is bound to HTTP liveness rather than a rigid 1-hour timer:
+/// raw format bitstream bytes in RAM are immutable and valid indefinitely,
+/// while the CDN redirect target URL is refreshed on-the-fly by liveness checks
+/// and dead streams are evicted immediately.
 pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStartEntry>> =
     LazyLock::new(|| {
         moka::sync::Cache::builder()
             .max_capacity(FAST_START_MAX_ITEMS as u64)
-            .time_to_live(FAST_START_TTL)
             .build()
     });
 
@@ -224,7 +229,7 @@ static PREWARM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build fast-start prewarm client")
 });
 
-/// Pre-warms the head buffer (16/32 MB or 8 MB resume), tail index (2 MB), and keyframe resume chunk (24 MB) for an upstream stream.
+/// Pre-warms the head buffer (32 MB or 8 MB resume), tail index (2 MB), and keyframe resume chunk (24/48 MB) for an upstream stream.
 ///
 /// Runs asynchronously in the background. Follows upstream redirects (e.g. Stremthru -> Torbox CDN),
 /// resolves the direct CDN edge URL, and caches the bytes in memory.
@@ -435,7 +440,7 @@ pub async fn prewarm_fast_start(
         "[FAST-START] Starting pre-warm download"
     );
 
-    // Step 1: Request the first N MB (16 MB for standard, 32 MB for 4K / large)
+    // Step 1: Request the first N MB (32 MB for standard / 4K)
     let head_range = format!("bytes=0-{}", target_head_size - 1);
     let mut head_req = PREWARM_CLIENT.get(original_url);
     for (k, v) in request_headers {

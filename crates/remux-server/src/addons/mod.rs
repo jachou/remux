@@ -3361,6 +3361,38 @@ impl AddonService {
             return Ok(());
         }
 
+        // Fast path 2: If existing streams are already in DB and candidate #1 is confirmed alive
+        // (or warm in Fast-Start RAM cache), skip the slow synchronous upstream scrape.
+        let existing = media.streams(&ctx.db).await.unwrap_or_default();
+        if let Some(primary) = existing.first() {
+            let candidate_alive = if let Some(si) = &primary.stream_info {
+                match &si.descriptor {
+                    crate::stream::StreamDescriptor::Http { url, .. } => {
+                        crate::fast_start::FAST_START_CACHE.get(url).is_some()
+                            || crate::stream::STREAM_LIVENESS_CACHE.get(url).is_some_and(|e| e.alive)
+                    }
+                    _ => true,
+                }
+            } else {
+                false
+            };
+
+            if candidate_alive {
+                let now = chrono::Utc::now().naive_utc();
+                let _ = sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(media.id)
+                    .execute(&ctx.db)
+                    .await;
+                media.streams_refreshed_at = Some(now);
+                debug!(
+                    title = %media.title,
+                    "existing stream candidate is warm and alive; skipping blocking addon scrape"
+                );
+                return Ok(());
+            }
+        }
+
         // Acquire per-media lock to prevent concurrent refreshes.
         let _guard = STREAM_LOCKS
             .lock(media.id)

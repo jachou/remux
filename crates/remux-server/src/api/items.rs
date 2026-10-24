@@ -1814,7 +1814,7 @@ async fn item_for_user(
             .await
             .log_err("failed to refresh sources");
 
-        if matches!(media.kind, db::MediaKind::Movie) {
+        if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
             crate::services::stream_service::spawn_preemptive_probe(
                 &state.ctx,
                 media.id,
@@ -2077,11 +2077,8 @@ async fn item_for_user(
         .await;
     }
 
-    // When streams were actually fetched but none found, replace the
-    // listing-style stubs with a single "No streams found" stub. Must run
-    // before the resolve/label blocks below so they operate on this final
-    // source instead of the transient two-stub list from db_media_to_item
-    // (whose second entry is an empty placeholder with no real streams).
+    // When streams were actually fetched but none found, clear any
+    // transient stubs from db_media_to_item so clients know no streams exist.
     if needs_streams
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
         && media
@@ -2089,23 +2086,7 @@ async fn item_for_user(
             .as_deref()
             .map_or(false, |s| s.is_empty())
     {
-        let media_streams = media
-            .probe_data
-            .as_ref()
-            .map(|p| {
-                p.media_streams
-                    .clone()
-            })
-            .unwrap_or_default();
-        base_item.media_sources = Some(vec![api::MediaSourceInfo {
-            id: media.id,
-            e_tag: media.id,
-            name: Some("No streams found".to_string()),
-            protocol: api::MediaProtocol::File,
-            path: Some(format!("/remux/{}", media.id)),
-            media_streams,
-            ..Default::default()
-        }]);
+        base_item.media_sources = None;
     }
 
     // Items detail never advertises subtitle tracks — neither embedded (from
@@ -2372,6 +2353,7 @@ async fn item_for_user(
         base_item.location_type = api::LocationType::Virtual;
         base_item.path = None;
         base_item.can_download = Some(false);
+        base_item.media_sources = None;
     }
 
     if let Some(source_ticks) = base_item
@@ -7312,5 +7294,49 @@ mod tests {
         for item in body["Items"].as_array().unwrap() {
             assert_eq!(item["Type"], "CollectionFolder");
         }
+    }
+
+    #[tokio::test]
+    async fn get_item_triggers_preemptive_probe_for_movies_and_episodes() {
+        use crate::integration_test::{seed_episode, seed_movie};
+        use crate::services::stream_service::PREEMPTIVE_PROBES_DISPATCHED;
+        use std::sync::atomic::Ordering;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let ctx = &guard.0;
+
+        let movie = seed_movie(ctx).await;
+        let episode = seed_episode(ctx).await;
+
+        let before_movie = PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::SeqCst);
+        let resp_movie = server
+            .get(&format!("/items/{}", movie.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp_movie.assert_status_ok();
+        assert_eq!(
+            PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::SeqCst),
+            before_movie + 1,
+            "GET /items/movie must trigger preemptive probe"
+        );
+
+        let before_ep = PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::SeqCst);
+        let resp_ep = server
+            .get(&format!("/items/{}", episode.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        resp_ep.assert_status_ok();
+        assert_eq!(
+            PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::SeqCst),
+            before_ep + 1,
+            "GET /items/episode must trigger preemptive probe"
+        );
     }
 }

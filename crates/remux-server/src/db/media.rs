@@ -3428,6 +3428,9 @@ impl Media {
         old_id: Uuid,
         new_id: Uuid,
     ) -> Result<()> {
+        if old_id == new_id {
+            return Ok(());
+        }
         let _permit = DB_WRITE_SEMAPHORE
             .acquire()
             .await
@@ -3445,11 +3448,34 @@ impl Media {
             .bind(old_id)
             .execute(&mut *tx)
             .await?;
+
+        // user_media_state: deduplicate before updating to avoid UNIQUE (user_id, media_id) violation
+        sqlx::query(
+            "DELETE FROM user_media_state WHERE media_id = ? AND user_id IN (SELECT user_id FROM user_media_state WHERE media_id = ?)",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query("UPDATE user_media_state SET media_id = ? WHERE media_id = ?")
             .bind(new_id)
             .bind(old_id)
             .execute(&mut *tx)
             .await?;
+
+        // media_relations: deduplicate relations where (new_id, right_media_id, role) already exists
+        sqlx::query(
+            "DELETE FROM media_relations WHERE left_media_id = ? AND EXISTS (
+                SELECT 1 FROM media_relations r2 
+                WHERE r2.left_media_id = ? 
+                  AND r2.right_media_id = media_relations.right_media_id 
+                  AND COALESCE(r2.role, '') = COALESCE(media_relations.role, '')
+            )",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "UPDATE media_relations SET left_media_id = ? WHERE left_media_id = ?",
         )
@@ -3457,6 +3483,81 @@ impl Media {
         .bind(old_id)
         .execute(&mut *tx)
         .await?;
+
+        // media_relations (right_media_id): deduplicate relations where (left_media_id, new_id, role) already exists
+        sqlx::query(
+            "DELETE FROM media_relations WHERE right_media_id = ? AND EXISTS (
+                SELECT 1 FROM media_relations r2 
+                WHERE r2.right_media_id = ? 
+                  AND r2.left_media_id = media_relations.left_media_id 
+                  AND COALESCE(r2.role, '') = COALESCE(media_relations.role, '')
+            )",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "UPDATE media_relations SET right_media_id = ? WHERE right_media_id = ?",
+        )
+        .bind(new_id)
+        .bind(old_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // media_images: deduplicate images where new_id already has (image_type, image_index)
+        sqlx::query(
+            "DELETE FROM media_images WHERE media_id = ? AND EXISTS (
+                SELECT 1 FROM media_images i2
+                WHERE i2.media_id = ? 
+                  AND i2.image_type = media_images.image_type 
+                  AND i2.image_index = media_images.image_index
+            )",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE media_images SET media_id = ? WHERE media_id = ?")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // media_tags: deduplicate tags where new_id already has the tag
+        sqlx::query(
+            "DELETE FROM media_tags WHERE media_id = ? AND EXISTS (
+                SELECT 1 FROM media_tags t2
+                WHERE t2.media_id = ? 
+                  AND lower(t2.tag) = lower(media_tags.tag)
+            )",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE media_tags SET media_id = ? WHERE media_id = ?")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // media_metrics: deduplicate metrics
+        sqlx::query(
+            "DELETE FROM media_metrics WHERE media_id = ? AND EXISTS (
+                SELECT 1 FROM media_metrics m2 WHERE m2.media_id = ?
+            )",
+        )
+        .bind(old_id)
+        .bind(new_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE media_metrics SET media_id = ? WHERE media_id = ?")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(&mut *tx)
+            .await?;
+
         tx.commit()
             .await?;
         Ok(())

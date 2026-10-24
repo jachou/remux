@@ -329,11 +329,27 @@ impl StreamDescriptor {
                 let is_ok = status.as_u16() < 400;
                 let elapsed = start.elapsed();
                 if is_ok {
-                    tracing::info!(%url, ?status, ?elapsed, "liveness check passed, cached");
+                    let direct_url = r.url().as_str().to_string();
+                    tracing::info!(%url, ?status, ?elapsed, direct_url = %direct_url, "liveness check passed, cached");
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(true));
+
+                    // Keep Fast-Start RAM buffer synchronized: if direct CDN redirect URL changed, refresh it in-place
+                    if let Some(mut fs_entry) = crate::fast_start::FAST_START_CACHE.get(url) {
+                        if fs_entry.direct_cdn_url != direct_url {
+                            tracing::info!(
+                                %url,
+                                old_cdn = %fs_entry.direct_cdn_url,
+                                new_cdn = %direct_url,
+                                "[FAST-START] Refreshed CDN edge redirect URL from liveness check"
+                            );
+                            fs_entry.direct_cdn_url = direct_url;
+                            crate::fast_start::FAST_START_CACHE.insert(url.clone(), fs_entry);
+                        }
+                    }
                 } else {
                     tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
+                    crate::fast_start::FAST_START_CACHE.invalidate(url);
                 }
                 is_ok
             }
@@ -341,6 +357,7 @@ impl StreamDescriptor {
                 let elapsed = start.elapsed();
                 tracing::warn!(%url, error = %e, ?elapsed, "liveness check request error");
                 STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
+                crate::fast_start::FAST_START_CACHE.invalidate(url);
                 false
             }
         }

@@ -1601,6 +1601,8 @@ impl StreamService {
 
 pub(crate) static QUEUED_PROBES: std::sync::LazyLock<dashmap::DashSet<Uuid>> =
     std::sync::LazyLock::new(dashmap::DashSet::new);
+pub(crate) static PREEMPTIVE_PROBES_DISPATCHED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 pub(crate) static ACTIVE_PROBES: std::sync::LazyLock<
     dashmap::DashMap<Uuid, tokio::sync::watch::Receiver<bool>>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
@@ -1640,6 +1642,7 @@ pub fn spawn_preemptive_probe(
     item_id: Uuid,
     user_id: Option<Uuid>,
 ) {
+    PREEMPTIVE_PROBES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !QUEUED_PROBES.insert(item_id) {
         tracing::debug!(%item_id, "preemptive probe already in flight or queued, skipping duplicate spawn");
         return;
@@ -1663,6 +1666,39 @@ pub fn spawn_preemptive_probe(
             return;
         }
 
+        let _permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            PREEMPTIVE_SEMAPHORE.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                tracing::debug!(%item_id, "preemptive probe timed out waiting for semaphore permit, skipping");
+                return;
+            }
+        };
+
+        // Acquired permit: mark as actively running so foreground PlaybackInfo coalesces with it
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        ACTIVE_PROBES.insert(item_id, rx);
+        struct ActiveGuard {
+            id: Uuid,
+            tx: Option<tokio::sync::watch::Sender<bool>>,
+        }
+        impl Drop for ActiveGuard {
+            fn drop(&mut self) {
+                ACTIVE_PROBES.remove(&self.id);
+                if let Some(tx) = self.tx.take() {
+                    let _ = tx.send(true);
+                }
+            }
+        }
+        let active_guard = ActiveGuard {
+            id: item_id,
+            tx: Some(tx),
+        };
+
         let probe_cfg = db::Settings::get_config_or_default(&ctx.db).await;
         let show_ungrouped = probe_cfg.stream_groups_show_ungrouped.unwrap_or(true);
         let mut service = StreamService::new(StreamServiceConfig {
@@ -1679,7 +1715,7 @@ pub fn spawn_preemptive_probe(
             return;
         }
 
-        // Fast path: if Candidate #1 already has reusable probe data, pre-warm immediately in parallel without waiting for a semaphore permit!
+        // Fast path: if Candidate #1 already has reusable probe data, pre-warm immediately in parallel without waiting
         if let Ok((Some(primary), _)) = service.resolve_primary_candidate().await {
             if let Some(cached) = &primary.probe_data {
                 if is_reusable_probe_cache(cached) {
@@ -1721,45 +1757,13 @@ pub fn spawn_preemptive_probe(
                         true
                     };
                     if is_alive {
+                        drop(active_guard);
                         prefetch_subtitles_for_media(&ctx, &media, Some(&primary), user_id).await;
                         return;
                     }
                 }
             }
         }
-
-        let _permit = match tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            PREEMPTIVE_SEMAPHORE.acquire(),
-        )
-        .await
-        {
-            Ok(Ok(p)) => p,
-            _ => {
-                tracing::debug!(%item_id, "preemptive probe timed out waiting for semaphore permit, skipping");
-                return;
-            }
-        };
-
-        // Acquired permit: mark as actively running so foreground PlaybackInfo coalesces with it
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        ACTIVE_PROBES.insert(item_id, rx);
-        struct ActiveGuard {
-            id: Uuid,
-            tx: Option<tokio::sync::watch::Sender<bool>>,
-        }
-        impl Drop for ActiveGuard {
-            fn drop(&mut self) {
-                ACTIVE_PROBES.remove(&self.id);
-                if let Some(tx) = self.tx.take() {
-                    let _ = tx.send(true);
-                }
-            }
-        }
-        let active_guard = ActiveGuard {
-            id: item_id,
-            tx: Some(tx),
-        };
 
         let probe_result = service.probe_primary_candidate().await;
         // Drop active guard immediately so foreground PlaybackInfo unblocks without waiting for subtitle prefetch

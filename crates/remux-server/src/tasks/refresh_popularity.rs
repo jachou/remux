@@ -2,7 +2,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures::{StreamExt as _, stream};
 use std::sync::Arc;
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{ProgressReporter, Task, TaskCategory, TaskService};
 use crate::{AppContext, db};
@@ -40,6 +40,25 @@ impl Task for RefreshPopularityTask {
         else {
             return Ok(());
         };
+
+        // Quick availability check: if RemuxDB is down or throwing 5xx (e.g. Cloudflare outage),
+        // abort the sync cycle early with a single clean warning instead of failing thousands of requests.
+        let check_url = format!("{}/api/media/tt0903747", base_url.trim_end_matches('/'));
+        let is_available = match tokio::time::timeout(
+            std::time::Duration::from_secs(4),
+            reqwest::Client::new().head(&check_url).send(),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => !resp.status().is_server_error(),
+            Ok(Err(_)) => false,
+            Err(_) => false,
+        };
+
+        if !is_available {
+            warn!("RemuxDB upstream is temporarily unavailable (5xx / Cloudflare); skipping popularity sync cycle");
+            return Ok(());
+        }
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM media WHERE kind IN ('movie', 'series') \
              AND json_extract(external_ids, '$.imdb') IS NOT NULL",

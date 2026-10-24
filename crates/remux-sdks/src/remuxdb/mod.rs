@@ -336,6 +336,10 @@ pub async fn fetch_media_metrics(
     {
         Ok(metrics) => Some(metrics),
         Err(ClientError::Http { status: 404, .. }) => None,
+        Err(ClientError::Http { status, .. }) if (500..=599).contains(&status) => {
+            debug!(%imdb_id, status, "remuxdb: upstream temporarily unavailable");
+            None
+        }
         Err(error) => {
             warn!(%imdb_id, %error, "remuxdb: metrics fetch failed");
             None
@@ -421,6 +425,10 @@ pub async fn fetch_probe(
             Some(versions)
         }
         Err(ClientError::Http { status: 404, .. }) => None,
+        Err(ClientError::Http { status, .. }) if (500..=599).contains(&status) => {
+            debug!(status, "remuxdb: upstream temporarily unavailable");
+            None
+        }
         Err(e) => {
             warn!(error = %e, "remuxdb: probe fetch failed");
             None
