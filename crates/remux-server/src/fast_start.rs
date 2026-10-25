@@ -638,11 +638,21 @@ pub async fn prewarm_fast_start(
     }
     head_req = head_req.header(header::RANGE, head_range);
 
-    let head_resp = match head_req.send().await {
-        Ok(r) => r,
-        Err(e) => {
+    let head_resp = match tokio::time::timeout(Duration::from_secs(5), head_req.send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
             warn!(%original_url, error = %e, "[FAST-START] Pre-warm head request failed");
+            crate::stream::STREAM_LIVENESS_CACHE.insert(
+                original_url.to_string(),
+                crate::stream::LivenessEntry::new(false),
+            );
+            notify.notify_waiters();
+            return false;
+        }
+        Err(_) => {
+            METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
+            warn!(%original_url, "[FAST-START] Pre-warm head request timed out after 5s");
             crate::stream::STREAM_LIVENESS_CACHE.insert(
                 original_url.to_string(),
                 crate::stream::LivenessEntry::new(false),

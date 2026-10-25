@@ -2077,8 +2077,11 @@ async fn item_for_user(
         .await;
     }
 
-    // When streams were actually fetched but none found, clear any
-    // transient stubs from db_media_to_item so clients know no streams exist.
+    // When streams were actually fetched but none found, replace the
+    // listing-style stubs with a single "No streams found" stub. Must run
+    // before the resolve/label blocks below so they operate on this final
+    // source instead of the transient two-stub list from db_media_to_item
+    // (whose second entry is an empty placeholder with no real streams).
     if needs_streams
         && matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode)
         && media
@@ -2086,7 +2089,23 @@ async fn item_for_user(
             .as_deref()
             .map_or(false, |s| s.is_empty())
     {
-        base_item.media_sources = None;
+        let media_streams = media
+            .probe_data
+            .as_ref()
+            .map(|p| {
+                p.media_streams
+                    .clone()
+            })
+            .unwrap_or_default();
+        base_item.media_sources = Some(vec![api::MediaSourceInfo {
+            id: media.id,
+            e_tag: media.id,
+            name: Some("No streams found".to_string()),
+            protocol: api::MediaProtocol::File,
+            path: Some(format!("/remux/{}", media.id)),
+            media_streams,
+            ..Default::default()
+        }]);
     }
 
     // Items detail never advertises subtitle tracks — neither embedded (from
@@ -2353,7 +2372,6 @@ async fn item_for_user(
         base_item.location_type = api::LocationType::Virtual;
         base_item.path = None;
         base_item.can_download = Some(false);
-        base_item.media_sources = None;
     }
 
     if let Some(source_ticks) = base_item

@@ -1514,7 +1514,7 @@ fn select_candidates(
         .stream_info
         .as_ref()
         .and_then(|si| si.resolution_tag());
-    probe_pool
+    let mut candidates: Vec<(db::Media, String)> = probe_pool
         .iter()
         .filter(|c| {
             if c.id == primary.id {
@@ -1553,7 +1553,35 @@ fn select_candidates(
                 .server_input(c.id, port);
             Some((c.clone(), url))
         })
-        .collect()
+        .collect();
+
+    // If restricting resolution yielded no candidates, relax restriction to try siblings of any resolution
+    if candidates.is_empty() && restrict_resolution {
+        candidates = probe_pool
+            .iter()
+            .filter(|c| {
+                if c.id == primary.id {
+                    return false;
+                }
+                let c_p2p = c
+                    .stream_info
+                    .as_ref()
+                    .map_or(false, |si| si.is_p2p());
+                c_p2p == pri_p2p
+            })
+            .take(max_retries)
+            .filter_map(|c| {
+                let url = c
+                    .stream_info
+                    .as_ref()?
+                    .descriptor
+                    .server_input(c.id, port);
+                Some((c.clone(), url))
+            })
+            .collect();
+    }
+
+    candidates
 }
 
 /// Probe a stream URL, retrying with the next matching candidate on failure.

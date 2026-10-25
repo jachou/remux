@@ -319,9 +319,11 @@ pub fn db_state_to_dto(
 /// multi-version clients (e.g. Infuse) expose a version picker.
 fn stub_sources(media: &db::Media) -> Vec<MediaSourceInfo> {
     vec![
-        media
-            .clone()
-            .into(),
+        {
+            let mut info = MediaSourceInfo::from(media.clone());
+            info.supports_probing = false;
+            info
+        },
         MediaSourceInfo {
             id: uuid::Uuid::new_v5(
                 &uuid::Uuid::NAMESPACE_OID,
@@ -331,6 +333,7 @@ fn stub_sources(media: &db::Media) -> Vec<MediaSourceInfo> {
             name: Some(format!("{} (2)", media.title)),
             protocol: MediaProtocol::File,
             container: None,
+            supports_probing: false,
             ..Default::default()
         },
     ]
@@ -1099,23 +1102,18 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
     }
     item.external_urls = external_urls;
 
-    // several dlients require at least one stream
+    // several clients require at least one stream
     if !hide_sources
         && (media.kind == db::MediaKind::Movie
             || media.kind == db::MediaKind::Episode
             || media.kind == db::MediaKind::Track)
     {
-        let now = chrono::Utc::now().naive_utc();
-        let is_unreleased = (media.kind == db::MediaKind::Episode)
-            && (media.released_at.map_or(false, |d| d > now)
-                || media.digital_released_at.map_or(false, |d| d > now)
-                || matches!(media.status, Some(db::MediaStatus::Unreleased)));
-
+        item.can_download = Some(true);
         item.media_sources = match media
             .sources
             .clone()
         {
-            Some(sources) if sources.is_empty() => None,
+            Some(sources) if sources.is_empty() => Some(stub_sources(&media)),
             Some(sources) => {
                 let mut infos: Vec<MediaSourceInfo> = sources
                     .into_iter()
@@ -1128,41 +1126,33 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
                 }
                 Some(infos)
             }
-            None if is_unreleased => None,
             None => Some(stub_sources(&media)),
         };
-        if item.media_sources.is_some() {
-            item.can_download = Some(true);
-            item.path = item
-                .media_sources
-                .as_ref()
-                .and_then(|s| s.first())
-                .and_then(|s| {
-                    s.path
-                        .as_deref()
-                })
-                .map(|p| format!("{}.strm", p));
-            item.bitrate = item
-                .media_sources
-                .as_ref()
-                .and_then(|s| s.first())
-                .and_then(|s| s.bitrate);
-            if let Some(source_ticks) = item
-                .media_sources
-                .as_ref()
-                .and_then(|s| s.first())
-                .and_then(|s| s.run_time_ticks)
-                .filter(|ticks| *ticks > 0)
-            {
-                item.run_time_ticks = Some(source_ticks);
-            }
-            if media.kind != db::MediaKind::Track {
-                item.video_type = Some(VideoType::VideoFile);
-            }
-        } else {
-            item.can_download = Some(false);
-            item.location_type = LocationType::Virtual;
-            item.path = None;
+        item.path = item
+            .media_sources
+            .as_ref()
+            .and_then(|s| s.first())
+            .and_then(|s| {
+                s.path
+                    .as_deref()
+            })
+            .map(|p| format!("{}.strm", p));
+        item.bitrate = item
+            .media_sources
+            .as_ref()
+            .and_then(|s| s.first())
+            .and_then(|s| s.bitrate);
+        if let Some(source_ticks) = item
+            .media_sources
+            .as_ref()
+            .and_then(|s| s.first())
+            .and_then(|s| s.run_time_ticks)
+            .filter(|ticks| *ticks > 0)
+        {
+            item.run_time_ticks = Some(source_ticks);
+        }
+        if media.kind != db::MediaKind::Track {
+            item.video_type = Some(VideoType::VideoFile);
         }
     }
 

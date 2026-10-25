@@ -417,6 +417,7 @@ impl From<db::Media> for api::MediaSourceInfo {
             .probe_data
             .as_ref()
             .and_then(|p| p.size);
+        let has_probe_data = source.probe_data.is_some();
         let mut media_streams = source
             .probe_data
             .map(|mut p| {
@@ -508,6 +509,7 @@ impl From<db::Media> for api::MediaSourceInfo {
             bitrate: probe_bitrate,
             size: probe_size,
             media_streams,
+            supports_probing: !is_stub && has_probe_data,
             // `default_audio_stream_index` / `default_subtitle_stream_index` are
             // derived per request via `MediaSourceInfo::resolve_default_streams`;
             // stored probe data never carries them.

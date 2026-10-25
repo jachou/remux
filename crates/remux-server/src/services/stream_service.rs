@@ -1430,16 +1430,17 @@ impl StreamService {
                 max_bitrate: device_profile.as_ref().and_then(|p| p.max_streaming_bitrate),
             });
 
-            let (mut ranked, _) = self
+            let (ranked, _) = self
                 .rank_candidates(std::mem::take(&mut sel.candidates), ranking, ranking_prefs)
                 .await;
-            ranked.sort_by_key(|s| {
-                s.stream_info
-                    .as_ref()
-                    .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
-            });
             sel.candidates = ranked;
         }
+
+        sel.candidates.sort_by_key(|s| {
+            s.stream_info
+                .as_ref()
+                .map_or(0, |si| if si.descriptor.is_known_dead() { 1 } else { 0 })
+        });
 
         let primary = if let Some(pref_id) = saved_pref {
             sel.candidates.iter().find(|s| s.id == *pref_id).cloned().or_else(|| sel.candidates.first().cloned())

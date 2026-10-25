@@ -1421,6 +1421,9 @@ async fn videos_stream_inner(
                 media_source = ?q.media_source_id,
                 "stream lookup failed; serving no-streams placeholder: {e:#}"
             );
+            if q.static_ == Some(true) {
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            }
             return Ok(no_streams_response().into_response());
         }
     };
@@ -1433,6 +1436,9 @@ async fn videos_stream_inner(
             media = %media.id,
             "resolved media has no stream_info; serving no-streams placeholder"
         );
+        if q.static_ == Some(true) {
+            return Ok(StatusCode::NOT_FOUND.into_response());
+        }
         return Ok(no_streams_response().into_response());
     };
     let mut descriptor = si.descriptor.clone();
@@ -1482,9 +1488,15 @@ async fn videos_stream_inner(
                     q.play_session_id.as_deref(),
                 );
             } else {
+                if q.static_ == Some(true) {
+                    return Ok(StatusCode::NOT_FOUND.into_response());
+                }
                 return Ok(no_streams_response().into_response());
             }
         } else {
+            if q.static_ == Some(true) {
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            }
             return Ok(no_streams_response().into_response());
         }
     }
@@ -1625,8 +1637,21 @@ async fn videos_stream_inner(
                     return Ok(resp);
                 }
 
-                tracing::info!(item = %id, redirect_url = %url, "redirecting client to upstream stream (307)");
-                return Ok(axum::response::Redirect::temporary(url).into_response());
+                // If Fast-Start could not serve from buffer:
+                // Check if we have a direct CDN URL in cache or in-flight to redirect to.
+                if let Some(direct_cdn_url) = crate::fast_start::FAST_START_CACHE
+                    .get(url)
+                    .map(|e| e.direct_cdn_url.clone())
+                    .or_else(|| crate::fast_start::IN_FLIGHT_PREWARMS.get(url).map(|e| e.direct_cdn_url.clone()))
+                {
+                    tracing::info!(item = %id, direct_cdn = %direct_cdn_url, "redirecting client directly to CDN edge (307)");
+                    return Ok(axum::response::Redirect::temporary(&direct_cdn_url).into_response());
+                }
+
+                // Never 307 redirect clients to upstream resolver HTML pages (StremThru/Meteor):
+                // When a cold probe arrives and direct CDN URL is not yet known,
+                // fall through to serving the stream via proxy (200/206) using STREAM_PROXY_CLIENT.
+                tracing::info!(item = %id, url = %url, "fast-start buffer/CDN url not ready yet; serving via proxy (200/206)");
             }
         }
 
@@ -2465,6 +2490,22 @@ mod tests {
             .save(&ctx.db)
             .await
             .unwrap();
+
+        // Seed FAST_START_CACHE with direct_cdn_url so http_redirect_stream can redirect to CDN edge
+        crate::fast_start::FAST_START_CACHE.insert(
+            stream_url.to_string(),
+            crate::fast_start::FastStartEntry {
+                item_id: Some(media.id),
+                original_url: stream_url.to_string(),
+                direct_cdn_url: stream_url.to_string(),
+                total_size: 10_000_000,
+                head_bytes: bytes::Bytes::new(),
+                tail_bytes: None,
+                resume_buffer: None,
+                content_type: "video/mp4".to_string(),
+                created_at: std::time::Instant::now(),
+            },
+        );
 
         // Expect a 3xx so axum-test doesn't reject it as non-2xx.
         let resp = server
