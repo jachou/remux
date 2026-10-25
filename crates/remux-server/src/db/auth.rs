@@ -737,6 +737,13 @@ impl JellyfinAuthHeader {
             None => return Ok(JellyfinAuthHeader::default()),
         };
 
+        if scheme.eq_ignore_ascii_case("Bearer") {
+            return Ok(Self {
+                token: Some(rest.trim().to_string()),
+                ..Default::default()
+            });
+        }
+
         if !scheme.eq_ignore_ascii_case("MediaBrowser")
             && !scheme.eq_ignore_ascii_case("Emby")
         {
@@ -795,7 +802,7 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        if let Some(auth) = parts
+        let mut auth = parts
             .headers
             .get(http::header::AUTHORIZATION)
             .or_else(|| {
@@ -805,50 +812,43 @@ impl FromRequestParts<AppState> for JellyfinAuthHeader {
             })
             .map(header_text_lossy)
             .and_then(|raw| JellyfinAuthHeader::from_str(&raw).ok())
-        {
-            return Ok(auth);
-        }
+            .unwrap_or_default();
 
-        // Try X-Emby / MediaBrowser token headers
-        let token = parts
-            .headers
-            .get("X-Emby-Token")
-            .or_else(|| {
-                parts
-                    .headers
-                    .get("X-MediaBrowser-Token")
-            })
-            .map(header_text_lossy);
-
-        if let Some(token) = token {
-            return Ok(JellyfinAuthHeader {
-                token: Some(token),
-                ..Default::default()
-            });
+        // If Authorization header didn't include a token, check X-Emby / MediaBrowser token headers
+        if auth.token.is_none() {
+            auth.token = parts
+                .headers
+                .get("X-Emby-Token")
+                .or_else(|| {
+                    parts
+                        .headers
+                        .get("X-MediaBrowser-Token")
+                })
+                .map(header_text_lossy);
         }
 
         // Query params fallback
-        if let Some(query) = parts
-            .uri
-            .query()
-        {
-            for pair in query.split('&') {
-                let mut kv = pair.splitn(2, '=');
-                if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
-                    if key.eq_ignore_ascii_case("api_key")
-                        || key.eq_ignore_ascii_case("apikey")
-                        || key.eq_ignore_ascii_case("token")
-                    {
-                        return Ok(JellyfinAuthHeader {
-                            token: Some(val.to_string()),
-                            ..Default::default()
-                        });
+        if auth.token.is_none() {
+            if let Some(query) = parts
+                .uri
+                .query()
+            {
+                for pair in query.split('&') {
+                    let mut kv = pair.splitn(2, '=');
+                    if let (Some(key), Some(val)) = (kv.next(), kv.next()) {
+                        if key.eq_ignore_ascii_case("api_key")
+                            || key.eq_ignore_ascii_case("apikey")
+                            || key.eq_ignore_ascii_case("token")
+                        {
+                            auth.token = Some(val.to_string());
+                            break;
+                        }
                     }
                 }
             }
         }
 
-        Ok(JellyfinAuthHeader::default())
+        Ok(auth)
     }
 }
 
