@@ -3384,6 +3384,11 @@ impl AddonService {
                     .bind(media.id)
                     .execute(&ctx.db)
                     .await;
+                let _ = sqlx::query("UPDATE media SET updated_at = ? WHERE parent_id = ? AND kind = 'stream'")
+                    .bind(now)
+                    .bind(media.id)
+                    .execute(&ctx.db)
+                    .await;
                 media.streams_refreshed_at = Some(now);
                 debug!(
                     title = %media.title,
