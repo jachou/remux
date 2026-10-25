@@ -1462,6 +1462,24 @@ async fn check_liveness_with_fallback(
             None => true,
         };
         if !alive {
+            if crate::stream::is_rate_limited_or_timed_out(&url) {
+                warn!(
+                    id = %stream.id,
+                    url = %url,
+                    attempt = attempts,
+                    "candidate hit upstream rate limit or timeout (429/504/timeout); aborting cascade immediately to prevent lockout"
+                );
+                break;
+            }
+            if attempts >= 2 {
+                warn!(
+                    id = %stream.id,
+                    url = %url,
+                    attempt = attempts,
+                    "fallback limit reached: tried primary + 1 backup candidate; stopping search"
+                );
+                break;
+            }
             warn!(
                 id = %stream.id,
                 url = %url,
@@ -1514,7 +1532,7 @@ fn select_candidates(
         .stream_info
         .as_ref()
         .and_then(|si| si.resolution_tag());
-    let mut candidates: Vec<(db::Media, String)> = probe_pool
+    probe_pool
         .iter()
         .filter(|c| {
             if c.id == primary.id {
@@ -1538,12 +1556,12 @@ fn select_candidates(
             }
             true
         })
-        // In group-cascade mode (restrict_resolution=false) try all candidates;
-        // otherwise honour the configured retry cap.
+        // Limit backup candidate attempts: try at most 1 backup candidate (primary + 1 backup)
+        // to avoid hammering upstream Debrid providers during outages or rate limits.
         .take(if restrict_resolution {
-            max_retries
+            max_retries.min(1)
         } else {
-            usize::MAX
+            1
         })
         .filter_map(|c| {
             let url = c
@@ -1553,35 +1571,7 @@ fn select_candidates(
                 .server_input(c.id, port);
             Some((c.clone(), url))
         })
-        .collect();
-
-    // If restricting resolution yielded no candidates, relax restriction to try siblings of any resolution
-    if candidates.is_empty() && restrict_resolution {
-        candidates = probe_pool
-            .iter()
-            .filter(|c| {
-                if c.id == primary.id {
-                    return false;
-                }
-                let c_p2p = c
-                    .stream_info
-                    .as_ref()
-                    .map_or(false, |si| si.is_p2p());
-                c_p2p == pri_p2p
-            })
-            .take(max_retries)
-            .filter_map(|c| {
-                let url = c
-                    .stream_info
-                    .as_ref()?
-                    .descriptor
-                    .server_input(c.id, port);
-                Some((c.clone(), url))
-            })
-            .collect();
-    }
-
-    candidates
+        .collect()
 }
 
 /// Probe a stream URL, retrying with the next matching candidate on failure.
@@ -1760,7 +1750,27 @@ where
             }
             Err(_) => {
                 warn!(url = %url, timeout = timeout_secs, "probe timed out");
+                crate::stream::trip_preemptive_circuit_breaker(None, "probe timed out");
             }
+        }
+
+        if crate::stream::is_rate_limited_or_timed_out(&url) {
+            warn!(
+                id = %stream.id,
+                url = %url,
+                attempt = attempts,
+                "candidate hit upstream rate limit or timeout; aborting cascade immediately to prevent lockout"
+            );
+            break;
+        }
+        if attempts >= 2 {
+            warn!(
+                id = %stream.id,
+                url = %url,
+                attempt = attempts,
+                "fallback limit reached: tried primary + 1 backup candidate; stopping search"
+            );
+            break;
         }
     }
 
@@ -2161,7 +2171,7 @@ mod probe_tests {
     }
 
     #[test]
-    fn cascade_mode_ignores_retry_cap() {
+    fn cascade_mode_caps_backup_candidates() {
         let primary = http_media("http://a.example.com");
         let others: Vec<_> = (0..5)
             .map(|i| http_media(&format!("http://s{i}.example.com")))
@@ -2170,7 +2180,7 @@ mod probe_tests {
             .chain(others)
             .collect();
         let result = select_candidates(&primary, &all, true, 1, false, 3000);
-        assert_eq!(result.len(), 5);
+        assert_eq!(result.len(), 1);
     }
 
     #[tokio::test]
@@ -2374,7 +2384,7 @@ mod probe_tests {
         .await;
         let err = format!("{:?}", result.unwrap_err());
         assert!(
-            err.contains("tried 4 of 4 streams"),
+            err.contains("tried 2 of 4 streams"),
             "unexpected error: {err}"
         );
     }
@@ -2382,8 +2392,9 @@ mod probe_tests {
     // Regression: items_playbackinfo was building probe_pool = candidate_streams,
     // which is narrowed to 1 item when a specific media_source_id is requested.
     // The fallback pool must be the full filtered list, not the selection.
+    // When falling back, we try at most 1 backup candidate (2 streams tried total).
     #[tokio::test]
-    async fn specific_stream_request_falls_back_through_all_streams() {
+    async fn specific_stream_request_falls_back_to_backup_candidate() {
         let db = test_db().await;
         let primary = http_media("http://a.example.com");
         let other_a = http_media("http://b.example.com");
@@ -2411,8 +2422,42 @@ mod probe_tests {
         .await;
         let err = format!("{:?}", result.unwrap_err());
         assert!(
-            err.contains("tried 3 of 3 streams"),
-            "expected all 3 streams tried, got: {err}"
+            err.contains("tried 2 of 3 streams"),
+            "expected at most 1 backup candidate tried (2 of 3 streams), got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_or_timeout_aborts_cascade_immediately() {
+        let db = test_db().await;
+        let primary = http_media("http://a.example.com/rl-test");
+        let other_a = http_media("http://b.example.com/other-a");
+        let other_b = http_media("http://c.example.com/other-b");
+
+        // Mark primary as rate-limited/timed out in cache
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            "http://a.example.com/rl-test".to_string(),
+            crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+        );
+
+        let probe_pool = vec![primary.clone(), other_a, other_b];
+        let result = check_liveness_with_fallback(
+            primary,
+            Some("http://a.example.com/rl-test".into()),
+            true,
+            5,
+            &probe_pool,
+            false,
+            3000,
+            &db,
+        )
+        .await;
+
+        let err = format!("{:?}", result.unwrap_err());
+        // Must abort after 1 attempt, NOT trying backup candidates
+        assert!(
+            err.contains("tried 1 of 3 streams"),
+            "expected abort after 1 attempt on rate limit, got: {err}"
         );
     }
 

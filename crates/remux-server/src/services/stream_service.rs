@@ -1669,6 +1669,10 @@ pub fn spawn_preemptive_probe_opts(
     user_id: Option<Uuid>,
     force_refresh_liveness: bool,
 ) {
+    if crate::stream::is_preemptive_probe_circuit_broken() {
+        tracing::debug!(%item_id, "preemptive probe skipped: circuit breaker active due to upstream rate limit or outage");
+        return;
+    }
     PREEMPTIVE_PROBES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !QUEUED_PROBES.insert(item_id) {
         tracing::debug!(%item_id, "preemptive probe already in flight or queued, skipping duplicate spawn");
@@ -1705,6 +1709,11 @@ pub fn spawn_preemptive_probe_opts(
                 return;
             }
         };
+
+        if crate::stream::is_preemptive_probe_circuit_broken() {
+            tracing::debug!(%item_id, "preemptive probe aborted after semaphore acquire: circuit breaker active");
+            return;
+        }
 
         // Acquired permit: mark as actively running so foreground PlaybackInfo coalesces with it
         let (tx, rx) = tokio::sync::watch::channel(false);

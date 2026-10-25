@@ -1644,8 +1644,12 @@ async fn videos_stream_inner(
                     .map(|e| e.direct_cdn_url.clone())
                     .or_else(|| crate::fast_start::IN_FLIGHT_PREWARMS.get(url).map(|e| e.direct_cdn_url.clone()))
                 {
-                    tracing::info!(item = %id, direct_cdn = %direct_cdn_url, "redirecting client directly to CDN edge (307)");
-                    return Ok(axum::response::Redirect::temporary(&direct_cdn_url).into_response());
+                    if crate::stream::is_error_video_url(&direct_cdn_url) {
+                        tracing::warn!(item = %id, direct_cdn = %direct_cdn_url, "refusing to 307 redirect client to error placeholder video");
+                    } else {
+                        tracing::info!(item = %id, direct_cdn = %direct_cdn_url, "redirecting client directly to CDN edge (307)");
+                        return Ok(axum::response::Redirect::temporary(&direct_cdn_url).into_response());
+                    }
                 }
 
                 // Never 307 redirect clients to upstream resolver HTML pages (StremThru/Meteor):

@@ -489,16 +489,41 @@ pub async fn prewarm_fast_start(
             Err(e) => {
                 METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
                 warn!(%original_url, error = %e, "[FAST-START] Direct-307 resolution request failed");
+                if e.is_timeout() {
+                    crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 timeout");
+                }
                 return false;
             }
         };
+
+        let status = head_resp.status();
+        if status == StatusCode::TOO_MANY_REQUESTS
+            || status == StatusCode::GATEWAY_TIMEOUT
+            || status == StatusCode::SERVICE_UNAVAILABLE
+        {
+            crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 rate-limit/gateway error");
+            crate::stream::STREAM_LIVENESS_CACHE.insert(
+                original_url.to_string(),
+                crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+            );
+            return false;
+        }
+
+        let direct_cdn_url = head_resp.url().as_str().to_string();
+        if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) {
+            warn!(%original_url, direct_url = %direct_cdn_url, "[FAST-START] Upstream resolved to error video URL; marking dead");
+            crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 error video URL");
+            crate::stream::STREAM_LIVENESS_CACHE.insert(
+                original_url.to_string(),
+                crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+            );
+            return false;
+        }
 
         crate::stream::STREAM_LIVENESS_CACHE.insert(
             original_url.to_string(),
             crate::stream::LivenessEntry::new(true),
         );
-
-        let direct_cdn_url = head_resp.url().as_str().to_string();
         let total_size = head_resp
             .headers()
             .get(header::CONTENT_RANGE)
@@ -542,6 +567,14 @@ pub async fn prewarm_fast_start(
     // BEFORE acquiring PREWARM_LOCKS so they never block foreground playback requests or High-priority prewarms.
     let (_queued_guard, _permit) = match priority {
         PrewarmPriority::Low => {
+            if crate::stream::is_preemptive_probe_circuit_broken() {
+                debug!(
+                    %original_url,
+                    item = ?item_id,
+                    "[FAST-START] Low-priority pre-warm skipped: circuit breaker active due to upstream rate limit/outage"
+                );
+                return false;
+            }
             if !QUEUED_PREWARMS.insert(original_url.to_string()) {
                 debug!(
                     %original_url,
@@ -563,6 +596,14 @@ pub async fn prewarm_fast_start(
                     return false;
                 }
             };
+            if crate::stream::is_preemptive_probe_circuit_broken() {
+                debug!(
+                    %original_url,
+                    item = ?item_id,
+                    "[FAST-START] Low-priority pre-warm aborted after acquiring permit: circuit breaker active"
+                );
+                return false;
+            }
             (q_guard, Some(permit))
         }
         PrewarmPriority::High => (QueuedPrewarmGuard(None), None),
@@ -638,24 +679,37 @@ pub async fn prewarm_fast_start(
     }
     head_req = head_req.header(header::RANGE, head_range);
 
-    let head_resp = match tokio::time::timeout(Duration::from_secs(5), head_req.send()).await {
+    let prewarm_timeout_secs = std::env::var("REMUX_LIVENESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(12);
+    let head_resp = match tokio::time::timeout(Duration::from_secs(prewarm_timeout_secs), head_req.send()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
             warn!(%original_url, error = %e, "[FAST-START] Pre-warm head request failed");
-            crate::stream::STREAM_LIVENESS_CACHE.insert(
-                original_url.to_string(),
-                crate::stream::LivenessEntry::new(false),
-            );
+            if e.is_timeout() {
+                crate::stream::trip_preemptive_circuit_breaker(None, "fast-start head request timeout");
+                crate::stream::STREAM_LIVENESS_CACHE.insert(
+                    original_url.to_string(),
+                    crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+                );
+            } else {
+                crate::stream::STREAM_LIVENESS_CACHE.insert(
+                    original_url.to_string(),
+                    crate::stream::LivenessEntry::new(false),
+                );
+            }
             notify.notify_waiters();
             return false;
         }
         Err(_) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
-            warn!(%original_url, "[FAST-START] Pre-warm head request timed out after 5s");
+            warn!(%original_url, timeout_secs = prewarm_timeout_secs, "[FAST-START] Pre-warm head request timed out");
+            crate::stream::trip_preemptive_circuit_breaker(None, "fast-start head request timed out");
             crate::stream::STREAM_LIVENESS_CACHE.insert(
                 original_url.to_string(),
-                crate::stream::LivenessEntry::new(false),
+                crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
             );
             notify.notify_waiters();
             return false;
@@ -665,6 +719,19 @@ pub async fn prewarm_fast_start(
     let status = head_resp.status();
     let is_partial = status == StatusCode::PARTIAL_CONTENT;
     let is_ok = status == StatusCode::OK;
+
+    if status == StatusCode::TOO_MANY_REQUESTS
+        || status == StatusCode::GATEWAY_TIMEOUT
+        || status == StatusCode::SERVICE_UNAVAILABLE
+    {
+        crate::stream::trip_preemptive_circuit_breaker(None, "fast-start pre-warm rate-limit/gateway error");
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            original_url.to_string(),
+            crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+        );
+        notify.notify_waiters();
+        return false;
+    }
 
     if !is_partial && !is_ok {
         METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
@@ -677,15 +744,31 @@ pub async fn prewarm_fast_start(
         return false;
     }
 
+    // Capture the direct CDN edge URL after Stremthru redirect
+    let direct_cdn_url = head_resp.url().as_str().to_string();
+
+    if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) {
+        METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            %original_url,
+            direct_url = %direct_cdn_url,
+            "[FAST-START] Upstream resolved to error placeholder video URL; marking dead"
+        );
+        crate::stream::trip_preemptive_circuit_breaker(None, "fast-start upstream error placeholder video detected");
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            original_url.to_string(),
+            crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+        );
+        notify.notify_waiters();
+        return false;
+    }
+
     // Stream responded with 200/206: populate STREAM_LIVENESS_CACHE immediately so liveness checks are instant
     crate::stream::STREAM_LIVENESS_CACHE.insert(
         original_url.to_string(),
         crate::stream::LivenessEntry::new(true),
     );
     notify.notify_waiters();
-
-    // Capture the direct CDN edge URL after Stremthru redirect
-    let direct_cdn_url = head_resp.url().as_str().to_string();
 
     // Parse total file size from Content-Range header: bytes 0-16777215/4694973563
     let total_size = head_resp

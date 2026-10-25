@@ -149,6 +149,104 @@ mod internal_host_tests {
     }
 }
 
+/// Returns true if the URL points to a mock error/rate-limit MP4 placeholder video
+/// served by Stremio addons (e.g. Meteor, ElfHosted, MediaFusion, Comet) instead of actual media.
+pub fn is_error_video_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    // Path check: status video endpoints (e.g. Meteor /status/video/...)
+    if lower.contains("/status/video/") {
+        return true;
+    }
+    // Rate limit video assets (e.g. /assets/public-rate-limit-exceeded.mp4, rate-limit.mp4)
+    if lower.contains("rate-limit")
+        || lower.contains("rate_limit")
+        || lower.contains("ratelimit")
+        || lower.contains("rate-limit-exceeded")
+    {
+        if lower.contains(".mp4") || lower.contains("/video/") || lower.contains("/assets/") {
+            return true;
+        }
+    }
+    if lower.contains("timeout.mp4")
+        || lower.contains("too-many-requests")
+        || lower.contains("too_many_requests")
+        || lower.contains("debrid-error")
+        || lower.contains("playback-error")
+        || lower.contains("playback_error")
+        || lower.contains("cooldown.mp4")
+        || lower.contains("account-expired")
+    {
+        return true;
+    }
+    false
+}
+
+/// Global circuit breaker timestamp: epoch milliseconds until which preemptive background
+/// probing is throttled/paused due to upstream rate limits (429), timeouts (>4.5s/504), or error videos.
+static PREEMPTIVE_CIRCUIT_BREAKER_UNTIL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Default circuit breaker duration: 120 seconds (configurable via REMUX_CIRCUIT_BREAKER_SECS).
+pub fn default_circuit_breaker_duration() -> std::time::Duration {
+    let secs = std::env::var("REMUX_CIRCUIT_BREAKER_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Trips the preemptive probe circuit breaker for `duration` (or default if None).
+pub fn trip_preemptive_circuit_breaker(duration: Option<std::time::Duration>, reason: &str) {
+    let d = duration.unwrap_or_else(default_circuit_breaker_duration);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let until = now + d.as_millis() as u64;
+    PREEMPTIVE_CIRCUIT_BREAKER_UNTIL.fetch_max(until, std::sync::atomic::Ordering::Relaxed);
+    tracing::warn!(
+        reason,
+        duration_secs = d.as_secs(),
+        "[CIRCUIT-BREAKER] Preemptive background probing throttled/paused due to upstream rate limit or outage"
+    );
+}
+
+/// Returns true if the circuit breaker is active (preemptive background probes should be paused).
+pub fn is_preemptive_probe_circuit_broken() -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let until = PREEMPTIVE_CIRCUIT_BREAKER_UNTIL.load(std::sync::atomic::Ordering::Relaxed);
+    now < until
+}
+
+#[cfg(test)]
+mod error_video_tests {
+    use super::*;
+
+    #[test]
+    fn detects_addon_error_video_urls() {
+        assert!(is_error_video_url("https://meteorfortheweebs.midnightignite.me/status/video/rate-limit.mp4"));
+        assert!(is_error_video_url("https://meteorfortheweebs.midnightignite.me/status/video/timeout.mp4"));
+        assert!(is_error_video_url("https://meteorfortheweebs.midnightignite.me/status/video/error.mp4"));
+        assert!(is_error_video_url("https://elfhosted.com/assets/public-rate-limit-exceeded.mp4"));
+        assert!(is_error_video_url("https://some-addon.com/videos/rate-limit.mp4?token=123"));
+        assert!(is_error_video_url("https://some-addon.com/videos/debrid-error.mp4"));
+        assert!(is_error_video_url("https://some-addon.com/videos/playback-error.mp4"));
+        assert!(is_error_video_url("https://some-addon.com/videos/too-many-requests.mp4"));
+        assert!(is_error_video_url("https://some-addon.com/videos/account-expired.mp4"));
+        assert!(is_error_video_url("https://some-addon.com/videos/cooldown.mp4"));
+    }
+
+    #[test]
+    fn allows_normal_media_urls() {
+        assert!(!is_error_video_url("https://direct-cdn.torbox.app/d/12345/Tracker.S04E03.1080p.mkv"));
+        assert!(!is_error_video_url("https://real-debrid.com/d/abc/Movie.2024.2160p.mp4"));
+        assert!(!is_error_video_url("http://aiostreams:3000/playback/stream.mkv"));
+    }
+}
+
 fn deserialize_tracker_urls<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<TrackerUrl>, D::Error>
@@ -330,6 +428,20 @@ impl StreamDescriptor {
                 let elapsed = start.elapsed();
                 if is_ok {
                     let direct_url = r.url().as_str().to_string();
+                    if is_error_video_url(&direct_url) || is_error_video_url(url) {
+                        tracing::warn!(
+                            %url,
+                            direct_url = %direct_url,
+                            ?status,
+                            ?elapsed,
+                            "liveness check rejected upstream error placeholder video"
+                        );
+                        STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
+                        crate::fast_start::FAST_START_CACHE.invalidate(url);
+                        trip_preemptive_circuit_breaker(None, "liveness check detected upstream error video URL");
+                        return false;
+                    }
+
                     tracing::info!(%url, ?status, ?elapsed, direct_url = %direct_url, "liveness check passed, cached");
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(true));
 
@@ -348,7 +460,15 @@ impl StreamDescriptor {
                     }
                 } else {
                     tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
-                    STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
+                    let is_rate_or_gw = status == http::StatusCode::TOO_MANY_REQUESTS
+                        || status == http::StatusCode::GATEWAY_TIMEOUT
+                        || status == http::StatusCode::SERVICE_UNAVAILABLE;
+                    if is_rate_or_gw {
+                        trip_preemptive_circuit_breaker(None, "liveness check hit rate limit or gateway error (429/504/503)");
+                        STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
+                    } else {
+                        STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
+                    }
                     crate::fast_start::FAST_START_CACHE.invalidate(url);
                 }
                 is_ok
@@ -356,7 +476,13 @@ impl StreamDescriptor {
             Err(e) => {
                 let elapsed = start.elapsed();
                 tracing::warn!(%url, error = %e, ?elapsed, "liveness check request error");
-                STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
+                let is_timeout = e.is_timeout() || elapsed >= std::time::Duration::from_millis(8000);
+                if is_timeout {
+                    trip_preemptive_circuit_breaker(None, "liveness check timed out");
+                    STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
+                } else {
+                    STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
+                }
                 crate::fast_start::FAST_START_CACHE.invalidate(url);
                 false
             }
@@ -580,6 +706,7 @@ pub trait StreamSource: Send + Sync {
 pub struct LivenessEntry {
     pub alive: bool,
     pub verified_at: std::time::Instant,
+    pub rate_limited_or_timeout: bool,
 }
 
 impl LivenessEntry {
@@ -587,8 +714,21 @@ impl LivenessEntry {
         Self {
             alive,
             verified_at: std::time::Instant::now(),
+            rate_limited_or_timeout: false,
         }
     }
+
+    pub fn new_rate_limited_or_timeout() -> Self {
+        Self {
+            alive: false,
+            verified_at: std::time::Instant::now(),
+            rate_limited_or_timeout: true,
+        }
+    }
+}
+
+pub fn is_rate_limited_or_timed_out(url: &str) -> bool {
+    STREAM_LIVENESS_CACHE.get(url).is_some_and(|e| e.rate_limited_or_timeout)
 }
 
 pub(crate) static STREAM_LIVENESS_CACHE: std::sync::LazyLock<
@@ -602,9 +742,17 @@ pub(crate) static STREAM_LIVENESS_CACHE: std::sync::LazyLock<
 
 static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
+        let timeout_secs = std::env::var("REMUX_LIVENESS_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(12);
+        let connect_timeout_secs = std::env::var("REMUX_LIVENESS_CONNECT_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(8);
         reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(3))
-            .timeout(std::time::Duration::from_secs(5))
+            .connect_timeout(std::time::Duration::from_secs(connect_timeout_secs))
+            .timeout(std::time::Duration::from_secs(timeout_secs))
             .build()
             .expect("failed to build availability client")
     });
@@ -1236,6 +1384,7 @@ mod tests {
             LivenessEntry {
                 alive: true,
                 verified_at: std::time::Instant::now() - std::time::Duration::from_secs(45 * 60),
+                rate_limited_or_timeout: false,
             },
         );
         assert!(desc.is_liveness_expiring_soon());
