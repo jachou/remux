@@ -37,29 +37,27 @@ pub const FAST_START_RESUME_HEAD_SIZE_4K: usize = 64 * 1024 * 1024;
 pub const FAST_START_RESUME_HEAD_SIZE: usize = FAST_START_RESUME_HEAD_SIZE_4K;
 
 /// Resume buffer size in bytes for standard 1080p Continue Watching streams: 48 MB.
-pub const FAST_START_RESUME_BUFFER_SIZE_1080P: usize = 48 * 1024 * 1024;
+pub const FAST_START_RESUME_BUFFER_SIZE_1080P: usize = 56 * 1024 * 1024;
 
-/// Resume buffer size in bytes for 4K / UHD Continue Watching streams: 64 MB.
-/// Provides ~18-22 seconds of 4K video playback starting from the keyframe cluster before the resume timestamp.
-pub const FAST_START_RESUME_BUFFER_SIZE_4K: usize = 64 * 1024 * 1024;
+/// Resume buffer size in bytes for 4K / UHD Continue Watching streams: 104 MB.
+/// Provides ~25-30 seconds of forward 4K video playback while absorbing up to 20 seconds of Infuse auto-rewind.
+pub const FAST_START_RESUME_BUFFER_SIZE_4K: usize = 104 * 1024 * 1024;
 
 /// Backward-compatible alias for 4K resume buffer size.
 pub const FAST_START_RESUME_BUFFER_SIZE: usize = FAST_START_RESUME_BUFFER_SIZE_4K;
 
-/// Pre-roll padding in bytes for standard 1080p resume buffer: 18 MB.
-pub const FAST_START_RESUME_PREROLL_BYTES_1080P: usize = 18 * 1024 * 1024;
+/// Pre-roll padding in bytes for standard 1080p resume buffer: 20 MB.
+/// Absorbs up to 20 seconds of Infuse auto-rewind on 1080p streams (~15-20s of demuxer backward headroom)
+/// while leaving 36 MB (~35s of 1080p video) for smooth forward playback.
+pub const FAST_START_RESUME_PREROLL_BYTES_1080P: usize = 20 * 1024 * 1024;
 
-/// Pre-roll padding in bytes for 4K resume buffer: 18 MB.
-/// Positions the target keyframe 18 MB into the 64 MB buffer, providing demuxer backward headroom
-/// while leaving ~46 MB (~14-16s of 4K video) for smooth forward playback.
-pub const FAST_START_RESUME_PREROLL_BYTES_4K: usize = 18 * 1024 * 1024;
+/// Pre-roll padding in bytes for 4K resume buffer: 48 MB.
+/// Absorbs up to 20 seconds of Infuse auto-rewind on high-bitrate 4K streams (~18-20s of demuxer backward headroom)
+/// while leaving 56 MB (~25-30s of 4K video) for smooth forward playback.
+pub const FAST_START_RESUME_PREROLL_BYTES_4K: usize = 48 * 1024 * 1024;
 
 /// Backward-compatible alias for 4K resume preroll bytes.
 pub const FAST_START_RESUME_PREROLL_BYTES: usize = FAST_START_RESUME_PREROLL_BYTES_4K;
-
-/// Infuse built-in Resume Rewind duration in seconds: 22.0s.
-/// Infuse consistently rewinds 15-22+ seconds from the database pause timestamp when resuming playback.
-pub const FAST_START_RESUME_REWIND_SECS: f64 = 22.0;
 
 /// Global toggle: when enabled, Remux does NOT buffer head/tail bytes in RAM.
 /// Instead, pre-warming only resolves the direct Debrid CDN edge URL, and playback requests
@@ -1599,9 +1597,8 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
     let (_cues_len, vint_len) = read_ebml_vint(&tail_bytes[cursor..])?;
     cursor += vint_len;
 
-    // Search for the keyframe cluster at or immediately before the target resume timestamp (accounting for Infuse's 15s auto-rewind)
-    let search_time_secs = (target_time_secs - FAST_START_RESUME_REWIND_SECS).max(0.0);
-    let target_time_ms = (search_time_secs * 1000.0) as u64;
+    // Search for the keyframe cluster at or immediately before the target resume timestamp
+    let target_time_ms = (target_time_secs.max(0.0) * 1000.0) as u64;
     let mut best_cue: Option<(u64, u64)> = None; // (time_ms, cluster_offset)
 
     // Iterate through CuePoint elements (ID: 0xBB)
@@ -1706,6 +1703,19 @@ pub async fn lookup_resume_position(
     .flatten()
     .filter(|pos| *pos > 0)
     .map(|pos| pos as f64)
+}
+
+/// Purges any cached resume buffer from RAM for a specific media item (e.g. when marked played or finished).
+/// Head bytes (32MB) and tail cues are retained so subsequent replays or probes remain 0ms.
+pub fn purge_resume_buffer_for_item(item_id: Uuid) {
+    for (url, entry) in FAST_START_CACHE.iter() {
+        if entry.item_id == Some(item_id) && entry.resume_buffer.is_some() {
+            let mut updated = entry.clone();
+            updated.resume_buffer = None;
+            FAST_START_CACHE.insert(url.to_string(), updated);
+            tracing::info!(%url, %item_id, "[FAST-START] Purged resume buffer from RAM for completed item");
+        }
+    }
 }
 
 /// Heuristically detects the MIME type from the file extension in a URL.

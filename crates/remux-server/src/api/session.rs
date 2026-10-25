@@ -393,20 +393,21 @@ pub async fn report_playback_stopped(
                 }));
 
             if played {
+                crate::fast_start::purge_resume_buffer_for_item(item_id);
                 crate::services::stream_service::spawn_next_episode_probe(
                     &state.ctx,
                     item_id,
                     session.user.id,
                     "Trigger 2 (on playback stopped)",
                 );
+            } else {
+                // Stopped mid-way: immediately pre-warm / refill the resume buffer at the new stop position!
+                crate::services::stream_service::spawn_preemptive_probe(
+                    &state.ctx,
+                    item_id,
+                    Some(session.user.id),
+                );
             }
-            // Pre-warm the stopped item in the background if its liveness is expiring soon,
-            // so resuming or replaying is instant!
-            crate::services::stream_service::spawn_preemptive_probe(
-                &state.ctx,
-                item_id,
-                Some(session.user.id),
-            );
         }
     } else if !data
         .item_id
