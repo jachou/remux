@@ -1321,28 +1321,31 @@ pub async fn handle_playback_request(
             }
         }
 
-        // If uncached and not in-flight, ensure a High-priority pre-warm is active, and wait up to 2.5s to coalesce
-        if !PREWARM_LOCKS.contains_key(&url.to_string()) && !IN_FLIGHT_PREWARMS.contains_key(url) {
-            info!(%item_id, %url, "[FAST-START] Uncached on playback request: spawning High-priority pre-warm to coalesce");
+        // If not yet in IN_FLIGHT_PREWARMS but PREWARM_LOCKS is held, poll briefly (up to 500ms) for registration
+        if PREWARM_LOCKS.contains_key(&url.to_string()) {
+            for _ in 0..10 {
+                if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+                    if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
+                        return Some(resp);
+                    }
+                }
+                if let Some(e) = FAST_START_CACHE.get(url) {
+                    entry = Some(e);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        if entry.is_none() {
+            // Uncached and nothing in-flight: don't block this request.
+            // Spawn pre-warm in background for this exact URL so subsequent seeks benefit, but immediately fall through to 307 redirect.
+            info!(%item_id, %url, "[FAST-START] Uncached & not in-flight: spawning background pre-warm and immediately falling back to direct redirect");
             let url_str = url.to_string();
             let headers_clone = upstream_headers.cloned().unwrap_or_default();
             tokio::spawn(async move {
                 prewarm_fast_start(Some(item_id), &url_str, &headers_clone, PrewarmPriority::High, None, None).await;
             });
-        }
-
-        // Poll up to 2500ms (50 x 50ms) for IN_FLIGHT_PREWARMS or FAST_START_CACHE
-        for _ in 0..50 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
-                if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
-                    return Some(resp);
-                }
-            }
-            if let Some(e) = FAST_START_CACHE.get(url) {
-                entry = Some(e);
-                break;
-            }
         }
     }
 

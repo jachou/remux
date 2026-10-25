@@ -1625,20 +1625,8 @@ async fn videos_stream_inner(
                     return Ok(resp);
                 }
 
-                // If Fast-Start could not serve from buffer:
-                // Check if we have a direct CDN URL in cache or in-flight to redirect to.
-                if let Some(direct_cdn_url) = crate::fast_start::FAST_START_CACHE
-                    .get(url)
-                    .map(|e| e.direct_cdn_url.clone())
-                    .or_else(|| crate::fast_start::IN_FLIGHT_PREWARMS.get(url).map(|e| e.direct_cdn_url.clone()))
-                {
-                    tracing::info!(item = %id, direct_cdn = %direct_cdn_url, "redirecting client directly to CDN edge (307)");
-                    return Ok(axum::response::Redirect::temporary(&direct_cdn_url).into_response());
-                }
-
-                // Do NOT 307 redirect to StremThru (which returns 302 to CDN, breaking Infuse probe with nested redirects).
-                // Instead, gracefully fall through to serving the stream via proxy (200/206).
-                tracing::warn!(item = %id, url = %url, "fast-start unavailable and CDN unresolved; falling through to proxy serving");
+                tracing::info!(item = %id, redirect_url = %url, "redirecting client to upstream stream (307)");
+                return Ok(axum::response::Redirect::temporary(url).into_response());
             }
         }
 
