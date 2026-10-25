@@ -274,9 +274,9 @@ impl StreamDescriptor {
     }
 
     pub const LIVENESS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
-    pub const LIVENESS_PREWARM_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+    pub const LIVENESS_PREWARM_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
-    /// Checks if this stream's liveness check is missing or expiring within 20 minutes of the 1-hour TTL.
+    /// Checks if this stream's liveness check is missing or expiring within 30 minutes of the 1-hour TTL.
     pub fn is_liveness_expiring_soon(&self) -> bool {
         let Self::Http { url, .. } = self else {
             return false;

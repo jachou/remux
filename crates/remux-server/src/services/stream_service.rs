@@ -1648,12 +1648,23 @@ pub fn spawn_preemptive_probe(
     item_id: Uuid,
     user_id: Option<Uuid>,
 ) {
+    spawn_preemptive_probe_opts(ctx, item_id, user_id, false);
+}
+
+/// Spawns a background task to pre-emptively probe the primary stream candidate,
+/// optionally forcing an unconditional refresh of upstream HTTP CDN liveness tokens.
+pub fn spawn_preemptive_probe_opts(
+    ctx: &crate::AppContext,
+    item_id: Uuid,
+    user_id: Option<Uuid>,
+    force_refresh_liveness: bool,
+) {
     PREEMPTIVE_PROBES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !QUEUED_PROBES.insert(item_id) {
         tracing::debug!(%item_id, "preemptive probe already in flight or queued, skipping duplicate spawn");
         return;
     }
-    tracing::info!(%item_id, "spawning preemptive probe task");
+    tracing::info!(%item_id, force_refresh_liveness, "spawning preemptive probe task");
     let ctx = ctx.clone();
     tokio::spawn(async move {
         struct QueuedGuard(Uuid);
@@ -1752,7 +1763,10 @@ pub fn spawn_preemptive_probe(
                     };
                     let liveness_fut = async {
                         if let Some(si) = &primary.stream_info {
-                            if si.descriptor.is_liveness_expiring_soon() {
+                            if force_refresh_liveness || si.descriptor.is_liveness_expiring_soon() {
+                                if force_refresh_liveness {
+                                    tracing::info!(%item_id, "force-refreshing liveness token in background at milestone");
+                                }
                                 si.descriptor.refresh_liveness().await
                             } else {
                                 si.descriptor.is_alive().await
@@ -1923,7 +1937,8 @@ pub fn spawn_next_episode_probe(
 
         if let Some(next_id) = target_id {
             tracing::info!(%next_id, trigger, "{}: auto-probing next episode in background", trigger);
-            spawn_preemptive_probe(&ctx, next_id, Some(user_id));
+            let force_refresh = trigger.contains("80%") || trigger.contains("5m");
+            spawn_preemptive_probe_opts(&ctx, next_id, Some(user_id), force_refresh);
         }
     });
 }
