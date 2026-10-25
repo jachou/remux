@@ -1224,7 +1224,7 @@ pub(crate) fn is_reusable_probe_cache(cached: &api::MediaSourceInfo) -> bool {
     let Some(_video) = cached.video_stream() else {
         return false;
     };
-    if cached.is_filename_guess() {
+    if !SKIP_FFPROBE && cached.is_filename_guess() {
         return false;
     }
     // H.264 compatibility rules need RefFrames. RemuxDB or other imported
@@ -1433,6 +1433,30 @@ async fn check_liveness_with_fallback(
             continue;
         }
         attempts += 1;
+        // For Candidate #1 (when not a retry), initiate fast-start pre-warm if not already running so liveness and head buffering coalesce in one upstream request!
+        if !is_retry {
+            if let Some(crate::stream::StreamDescriptor::Http { url, request_headers, .. }) = stream.stream_info.as_ref().map(|si| &si.descriptor) {
+                if !crate::stream::STREAM_LIVENESS_CACHE.contains_key(url) && crate::fast_start::get_active_prewarm_notify(url).is_none() {
+                    let url_c = url.clone();
+                    let hdrs_c = request_headers.clone();
+                    let item_id = stream.id;
+                    let head_sz = stream.stream_info.as_ref().map(|si| {
+                        crate::fast_start::calculate_fast_start_head_size(&url_c, si.size.map(|s| s as u64), None)
+                    });
+                    tokio::spawn(async move {
+                        crate::fast_start::prewarm_fast_start(
+                            Some(item_id),
+                            &url_c,
+                            &hdrs_c,
+                            crate::fast_start::PrewarmPriority::High,
+                            head_sz,
+                            None,
+                        )
+                        .await;
+                    });
+                }
+            }
+        }
         let alive = match stream.stream_info.as_ref().map(|si| &si.descriptor) {
             Some(d) => d.is_alive().await,
             None => true,
@@ -1937,7 +1961,7 @@ mod probe_tests {
             }),
             ..Default::default()
         };
-        assert!(!is_reusable_probe_cache(&guess));
+        assert_eq!(is_reusable_probe_cache(&guess), SKIP_FFPROBE);
     }
 
     #[test]

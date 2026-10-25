@@ -235,6 +235,15 @@ static QUEUED_PREWARMS: LazyLock<dashmap::DashSet<String>> =
 static PREWARM_LOCKS: LazyLock<crate::keyed_lock::KeyedLock<String>> =
     LazyLock::new(crate::keyed_lock::KeyedLock::new);
 
+/// Tracks URLs actively executing an initial pre-warm head request so concurrent liveness checks can coalesce.
+pub static ACTIVE_PREWARM_NOTIFY: LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Notify>>> =
+    LazyLock::new(dashmap::DashMap::new);
+
+/// Returns the `Notify` handle if a fast-start pre-warm is actively running for `url`.
+pub fn get_active_prewarm_notify(url: &str) -> Option<Arc<tokio::sync::Notify>> {
+    ACTIVE_PREWARM_NOTIFY.get(url).map(|n| n.value().clone())
+}
+
 /// Global semaphore limiting concurrent low-priority background pre-warms to 2 simultaneous chunk downloads,
 /// leaving bandwidth headroom for high-priority interactive playback requests.
 pub static FAST_START_PREWARM_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
@@ -437,6 +446,17 @@ pub async fn prewarm_fast_start(
         return true;
     }
 
+    let notify = Arc::new(tokio::sync::Notify::new());
+    ACTIVE_PREWARM_NOTIFY.insert(original_url.to_string(), notify.clone());
+    struct NotifyGuard<'a>(&'a str, Arc<tokio::sync::Notify>);
+    impl<'a> Drop for NotifyGuard<'a> {
+        fn drop(&mut self) {
+            ACTIVE_PREWARM_NOTIFY.remove(self.0);
+            self.1.notify_waiters();
+        }
+    }
+    let _notify_guard = NotifyGuard(original_url, notify.clone());
+
     METRICS.prewarms_started.fetch_add(1, Ordering::Relaxed);
     match priority {
         PrewarmPriority::High => METRICS.prewarms_high_started.fetch_add(1, Ordering::Relaxed),
@@ -474,6 +494,11 @@ pub async fn prewarm_fast_start(
         Err(e) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
             warn!(%original_url, error = %e, "[FAST-START] Pre-warm head request failed");
+            crate::stream::STREAM_LIVENESS_CACHE.insert(
+                original_url.to_string(),
+                crate::stream::LivenessEntry::new(false),
+            );
+            notify.notify_waiters();
             return false;
         }
     };
@@ -485,6 +510,11 @@ pub async fn prewarm_fast_start(
     if !is_partial && !is_ok {
         METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
         warn!(%original_url, ?status, "[FAST-START] Pre-warm head request returned non-success status");
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            original_url.to_string(),
+            crate::stream::LivenessEntry::new(false),
+        );
+        notify.notify_waiters();
         return false;
     }
 
@@ -493,6 +523,7 @@ pub async fn prewarm_fast_start(
         original_url.to_string(),
         crate::stream::LivenessEntry::new(true),
     );
+    notify.notify_waiters();
 
     // Capture the direct CDN edge URL after Stremthru redirect
     let direct_cdn_url = head_resp.url().as_str().to_string();
