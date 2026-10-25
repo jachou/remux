@@ -444,18 +444,20 @@ pub async fn report_playback_stopped(
             }));
 
         if played {
+            crate::fast_start::purge_resume_buffer_for_item(data.item_id);
             crate::services::stream_service::spawn_next_episode_probe(
                 &state.ctx,
                 data.item_id,
                 session.user.id,
                 "Trigger 2 (on playback stopped)",
             );
+        } else {
+            crate::services::stream_service::spawn_preemptive_probe(
+                &state.ctx,
+                data.item_id,
+                Some(session.user.id),
+            );
         }
-        crate::services::stream_service::spawn_preemptive_probe(
-            &state.ctx,
-            data.item_id,
-            Some(session.user.id),
-        );
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

@@ -275,22 +275,24 @@ pub async fn prewarm_fast_start(
             if pos_secs > 10.0 {
                 if let Some(ref tail) = entry.tail_bytes {
                     if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
+                        let is_4k = is_4k_stream(original_url, Some(entry.total_size), None);
+                        let preroll_bytes = if is_4k {
+                            FAST_START_RESUME_PREROLL_BYTES_4K as u64
+                        } else {
+                            FAST_START_RESUME_PREROLL_BYTES_1080P as u64
+                        };
+                        let resume_buffer_size = if is_4k {
+                            FAST_START_RESUME_BUFFER_SIZE_4K
+                        } else {
+                            FAST_START_RESUME_BUFFER_SIZE_1080P
+                        };
                         let already_covered = entry.resume_buffer.as_ref().map(|(start, bytes)| {
-                            target_offset >= *start && target_offset < *start + bytes.len() as u64
+                            let end = *start + bytes.len() as u64;
+                            let min_start = target_offset.saturating_sub(preroll_bytes / 2);
+                            target_offset >= *start && target_offset < end && *start <= min_start
                         }).unwrap_or(false);
 
                         if !already_covered {
-                            let is_4k = is_4k_stream(original_url, Some(entry.total_size), None);
-                            let preroll_bytes = if is_4k {
-                                FAST_START_RESUME_PREROLL_BYTES_4K as u64
-                            } else {
-                                FAST_START_RESUME_PREROLL_BYTES_1080P as u64
-                            };
-                            let resume_buffer_size = if is_4k {
-                                FAST_START_RESUME_BUFFER_SIZE_4K
-                            } else {
-                                FAST_START_RESUME_BUFFER_SIZE_1080P
-                            };
                             let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
                             let end_byte = (start_byte + resume_buffer_size as u64 - 1).min(entry.total_size - 1);
                             let resume_range = format!("bytes={}-{}", start_byte, end_byte);
@@ -1580,14 +1582,50 @@ pub fn find_mkv_video_track(head_bytes: &[u8]) -> u64 {
     1
 }
 
+/// Extracts the TimestampScale (in nanoseconds, default 1,000,000) from the MKV Info header in head_bytes.
+pub fn find_mkv_timestamp_scale(head_bytes: &[u8]) -> u64 {
+    let info_id = [0x15u8, 0x49, 0xA9, 0x66];
+    let mut pos = 0;
+    while pos < head_bytes.len() {
+        let Some(idx) = head_bytes[pos..].windows(4).position(|w| w == info_id) else {
+            break;
+        };
+        let actual_pos = pos + idx;
+        pos = actual_pos + 4;
+
+        let Some((ilen, vlen)) = read_ebml_vint(&head_bytes[pos..]) else {
+            continue;
+        };
+        let cursor = pos + vlen;
+        let end = (cursor + ilen as usize).min(head_bytes.len());
+
+        let scale_id = [0x2Au8, 0xD7, 0xB1];
+        if let Some(sidx) = head_bytes[cursor..end].windows(3).position(|w| w == scale_id) {
+            let sc_pos = cursor + sidx + 3;
+            if let Some((slen, svlen)) = read_ebml_vint(&head_bytes[sc_pos..]) {
+                let sc_data = sc_pos + svlen;
+                let sc_end = (sc_data + slen as usize).min(end);
+                if sc_end > sc_data {
+                    let val = read_ebml_uint(&head_bytes[sc_data..sc_end]);
+                    if val > 0 {
+                        return val;
+                    }
+                }
+            }
+        }
+        break;
+    }
+    1_000_000
+}
+
 /// Extracts the cluster byte offset for a given timestamp (in seconds) from an MKV head and tail index (Cues).
-/// Accounts for Infuse's 15s auto-rewind behavior when seeking keyframes.
 pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_secs: f64) -> Option<u64> {
     if tail_bytes.len() < 16 {
         return None;
     }
     let seg_offset = find_mkv_segment_data_offset(head_bytes);
     let vid_track = find_mkv_video_track(head_bytes);
+    let time_scale = find_mkv_timestamp_scale(head_bytes);
 
     // Search for Cues element ID: [0x1C, 0x53, 0xBB, 0x6B]
     let cues_id = [0x1Cu8, 0x53, 0xBB, 0x6B];
@@ -1597,9 +1635,9 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
     let (_cues_len, vint_len) = read_ebml_vint(&tail_bytes[cursor..])?;
     cursor += vint_len;
 
-    // Search for the keyframe cluster at or immediately before the target resume timestamp
-    let target_time_ms = (target_time_secs.max(0.0) * 1000.0) as u64;
-    let mut best_cue: Option<(u64, u64)> = None; // (time_ms, cluster_offset)
+    // Search for the keyframe cluster at or immediately before the target resume timestamp in ticks
+    let target_time_ticks = ((target_time_secs.max(0.0) * 1_000_000_000.0) / (time_scale as f64)) as u64;
+    let mut best_cue: Option<(u64, u64)> = None; // (time_ticks, cluster_offset)
 
     // Iterate through CuePoint elements (ID: 0xBB)
     while cursor < tail_bytes.len() {
@@ -1661,7 +1699,7 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
         }
 
         if let (Some(t), Some(c)) = (cue_time_ms, matching_cluster_pos) {
-            if t <= target_time_ms {
+            if t <= target_time_ticks {
                 match best_cue {
                     Some((best_t, _)) if t > best_t => {
                         best_cue = Some((t, c));

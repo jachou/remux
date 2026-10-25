@@ -7021,7 +7021,13 @@ impl Media {
             // previous fetch and may have expired URLs. They stay in the DB so
             // an ongoing playback session can still reach them by direct ID.
             if let Some(refreshed) = self.streams_refreshed_at {
-                sources.retain(|s| s.updated_at >= refreshed);
+                let mut filtered = sources.clone();
+                filtered.retain(|s| s.updated_at >= refreshed);
+                // If the freshness filter stripped all streams (e.g. clock skew or failed refresh),
+                // fall back to existing sources rather than returning 0 streams and breaking playback.
+                if !filtered.is_empty() {
+                    sources = filtered;
+                }
             }
 
             self.sources = Some(sources);
