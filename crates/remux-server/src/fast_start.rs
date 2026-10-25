@@ -15,8 +15,8 @@ use uuid::Uuid;
 /// Default head buffer size in bytes for standard 1080p / smaller streams: 32 MB.
 pub const FAST_START_DEFAULT_HEAD_SIZE: usize = 32 * 1024 * 1024;
 
-/// 4K / UHD / large stream head buffer size in bytes: 32 MB.
-pub const FAST_START_4K_HEAD_SIZE: usize = 32 * 1024 * 1024;
+/// 4K / UHD / large stream head buffer size in bytes: 64 MB.
+pub const FAST_START_4K_HEAD_SIZE: usize = 64 * 1024 * 1024;
 
 /// Backward-compatible alias for default head size.
 pub const FAST_START_HEAD_SIZE: usize = FAST_START_DEFAULT_HEAD_SIZE;
@@ -454,7 +454,7 @@ pub async fn prewarm_fast_start(
     head_size: Option<usize>,
     resume_position_secs: Option<f64>,
 ) -> bool {
-    let is_4k_hint = head_size.map(|sz| sz >= FAST_START_RESUME_HEAD_SIZE_4K);
+    let is_4k_hint = head_size.map(|sz| sz >= FAST_START_4K_HEAD_SIZE);
 
     // If already pre-warmed and cached: check if resume buffer needs to be appended or refreshed
     if FAST_START_CACHE.get(original_url).is_some() {
