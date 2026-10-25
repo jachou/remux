@@ -2137,6 +2137,40 @@ impl Media {
         }
     }
 
+    /// Returns the runtime in seconds, falling back to the probed stream duration
+    /// from the primary stream if metadata runtime is missing or zero.
+    pub async fn effective_runtime(&self, db: &SqlitePool) -> Option<i64> {
+        if let Some(runtime) = self.runtime {
+            if runtime > 0 {
+                return Some(runtime);
+            }
+        }
+        let probed_secs = sqlx::query_scalar::<_, i64>(
+            "SELECT CAST(json_extract(probe_data, '$.RunTimeTicks') AS INTEGER) / 10000000 FROM media WHERE kind = 'stream' AND parent_id = ? AND probe_data IS NOT NULL AND json_extract(probe_data, '$.RunTimeTicks') > 0 ORDER BY idx ASC LIMIT 1",
+        )
+        .bind(self.id)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+        .filter(|&rt| rt > 0);
+
+        if let Some(secs) = probed_secs {
+            let id = self.id;
+            let db_clone = db.clone();
+            tokio::spawn(async move {
+                let _ = sqlx::query("UPDATE media SET runtime = ? WHERE id = ? AND (runtime IS NULL OR runtime = 0)")
+                    .bind(secs)
+                    .bind(id)
+                    .execute(&db_clone)
+                    .await;
+            });
+            return Some(secs);
+        }
+
+        None
+    }
+
     /// Build a minimal Media stub with just id and title — used when preloaded
     /// parent/grandparent data is constructed inline rather than fetched from DB.
     pub fn stub(id: Uuid, title: impl Into<String>) -> Arc<Self> {

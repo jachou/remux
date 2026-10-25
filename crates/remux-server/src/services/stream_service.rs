@@ -1470,13 +1470,22 @@ impl StreamService {
                             let user_id = self.user_id;
                             let db_pool = self.ctx.db.clone();
                             let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
-                            let head_size = crate::fast_start::calculate_fast_start_head_size(
-                                url,
-                                si.size.map(|s| s as u64),
-                                Some(is_4k),
-                            );
+                            let stream_size = si.size.map(|s| s as u64);
                             tokio::spawn(async move {
                                 let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
+                                let head_size = if resume_pos.is_some() {
+                                    crate::fast_start::calculate_fast_start_resume_head_size(
+                                        &url_clone,
+                                        stream_size,
+                                        Some(is_4k),
+                                    )
+                                } else {
+                                    crate::fast_start::calculate_fast_start_head_size(
+                                        &url_clone,
+                                        stream_size,
+                                        Some(is_4k),
+                                    )
+                                };
                                 crate::fast_start::prewarm_fast_start(
                                     Some(item_id),
                                     &url_clone,
@@ -1742,12 +1751,20 @@ pub fn spawn_preemptive_probe_opts(
                             if !si.descriptor.is_known_dead() {
                                 if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
                                     let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
-                                    let head_size = crate::fast_start::calculate_fast_start_head_size(
-                                        url,
-                                        si.size.map(|s| s as u64),
-                                        Some(is_4k),
-                                    );
                                     let resume_pos = crate::fast_start::lookup_resume_position(&ctx.db, user_id, Some(item_id)).await;
+                                    let head_size = if resume_pos.is_some() {
+                                        crate::fast_start::calculate_fast_start_resume_head_size(
+                                            url,
+                                            si.size.map(|s| s as u64),
+                                            Some(is_4k),
+                                        )
+                                    } else {
+                                        crate::fast_start::calculate_fast_start_head_size(
+                                            url,
+                                            si.size.map(|s| s as u64),
+                                            Some(is_4k),
+                                        )
+                                    };
                                     crate::fast_start::prewarm_fast_start(
                                         Some(item_id),
                                         url,
@@ -1820,11 +1837,17 @@ async fn prefetch_subtitles_for_media(
         .clone()
         .unwrap_or_default();
 
-    let target_stream = primary_candidate.cloned().or_else(|| {
-        streams_res.as_ref().ok().and_then(|streams| {
-            quality_ordered_probe_pool(streams).first().cloned()
+    let target_stream = streams_res
+        .as_ref()
+        .ok()
+        .and_then(|streams| {
+            if let Some(cand) = primary_candidate {
+                streams.iter().find(|s| s.id == cand.id).cloned()
+            } else {
+                quality_ordered_probe_pool(streams).first().cloned()
+            }
         })
-    });
+        .or_else(|| primary_candidate.cloned());
 
     // If Candidate #1 already has matching embedded subtitles in its probe data,
     // skip prefetching external subtitles!
@@ -1898,6 +1921,16 @@ pub fn spawn_next_episode_probe(
     user_id: Uuid,
     trigger: &'static str,
 ) {
+    spawn_next_episode_probe_opts(ctx, current_item_id, user_id, trigger, false);
+}
+
+pub fn spawn_next_episode_probe_opts(
+    ctx: &crate::AppContext,
+    current_item_id: Uuid,
+    user_id: Uuid,
+    trigger: &'static str,
+    skip_if_cached_and_fresh: bool,
+) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
         let Ok(Some(current)) = db::Media::get_by_id(&ctx.db, &current_item_id).await else {
@@ -1936,6 +1969,16 @@ pub fn spawn_next_episode_probe(
         };
 
         if let Some(next_id) = target_id {
+            if skip_if_cached_and_fresh {
+                let fresh_threshold = std::time::Duration::from_secs(30 * 60);
+                if crate::fast_start::is_item_cached_and_fresh(next_id, fresh_threshold) {
+                    tracing::info!(%next_id, trigger, "next episode stream already cached and fresh in RAM (<30m); skipping redundant stop probe");
+                    return;
+                } else {
+                    tracing::info!(%next_id, trigger, "next episode stream uncached or freshness expired (>30m); running probe as safety net");
+                }
+            }
+
             tracing::info!(%next_id, trigger, "{}: auto-probing next episode in background", trigger);
             let force_refresh = trigger.contains("80%") || trigger.contains("5m");
             spawn_preemptive_probe_opts(&ctx, next_id, Some(user_id), force_refresh);

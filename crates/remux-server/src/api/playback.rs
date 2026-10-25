@@ -166,18 +166,11 @@ pub(crate) async fn load_saved_selections(
     user_id: &uuid::Uuid,
     media_id: &uuid::Uuid,
 ) -> (Option<i64>, Option<i64>) {
-    let media = crate::db::Media::get_by_id(db, media_id)
-        .await
-        .ok()
-        .flatten();
-    let Some(media) = media else {
-        return (None, None);
-    };
     match sqlx::query_as::<_, crate::db::UserMediaState>(
         "SELECT * FROM user_media_state WHERE user_id = ?1 AND media_id = ?2",
     )
     .bind(user_id)
-    .bind(media.id)
+    .bind(media_id)
     .fetch_optional(db)
     .await
     {
@@ -524,13 +517,17 @@ async fn items_playbackinfo_inner(
                 let item_id = id;
                 let user_id = Some(session.user.id);
                 let db_pool = state.ctx.db.clone();
-                let head_size = crate::fast_start::calculate_fast_start_head_size(
-                    url,
-                    si.size.map(|s| s as u64),
-                    None,
-                );
+                let is_4k = first.stream.probe_data.as_ref().map_or(false, |pd| {
+                    pd.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160)
+                });
+                let stream_size = si.size.map(|s| s as u64);
                 tokio::spawn(async move {
                     let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
+                    let head_size = if resume_pos.is_some() {
+                        crate::fast_start::calculate_fast_start_resume_head_size(&url_clone, stream_size, Some(is_4k))
+                    } else {
+                        crate::fast_start::calculate_fast_start_head_size(&url_clone, stream_size, Some(is_4k))
+                    };
                     crate::fast_start::prewarm_fast_start(
                         Some(item_id),
                         &url_clone,

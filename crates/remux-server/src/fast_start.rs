@@ -264,6 +264,184 @@ static PREWARM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
         .expect("failed to build fast-start prewarm client")
 });
 
+async fn refresh_cached_resume_and_head(
+    item_id: Option<Uuid>,
+    original_url: &str,
+    request_headers: &HashMap<String, String>,
+    is_4k_hint: Option<bool>,
+    resume_position_secs: Option<f64>,
+) -> bool {
+    let Some(entry) = FAST_START_CACHE.get(original_url) else {
+        return false;
+    };
+
+    // Attach item_id if previously missing (e.g. from probe)
+    if entry.item_id.is_none() && item_id.is_some() {
+        let mut updated = entry.clone();
+        updated.item_id = item_id;
+        FAST_START_CACHE.insert(original_url.to_string(), updated);
+    }
+
+    if let Some(pos_secs) = resume_position_secs {
+        if pos_secs > 10.0 {
+            let is_4k = is_4k_stream(original_url, Some(entry.total_size), is_4k_hint);
+            let target_resume_head = if is_4k {
+                FAST_START_RESUME_HEAD_SIZE_4K
+            } else {
+                FAST_START_RESUME_HEAD_SIZE_1080P
+            };
+
+            // Expand cached head buffer to 64MB if previously cached with smaller head
+            if is_4k && entry.head_bytes.len() < target_resume_head && entry.total_size > entry.head_bytes.len() as u64 {
+                let head_lock_key = format!("head:{}", original_url);
+                let _head_guard = PREWARM_LOCKS.lock(head_lock_key).await;
+                if let Some(current_entry) = FAST_START_CACHE.get(original_url) {
+                    if current_entry.head_bytes.len() < target_resume_head && current_entry.total_size > current_entry.head_bytes.len() as u64 {
+                        let missing_start = current_entry.head_bytes.len();
+                        let missing_end = (target_resume_head as u64 - 1).min(current_entry.total_size - 1);
+                        let missing_range = format!("bytes={}-{}", missing_start, missing_end);
+                        let mut head_req = PREWARM_CLIENT.get(&current_entry.direct_cdn_url);
+                        for (k, v) in request_headers {
+                            head_req = head_req.header(k.as_str(), v.as_str());
+                        }
+                        head_req = head_req.header(header::RANGE, missing_range.clone());
+                        let head_resp = match head_req.send().await {
+                            Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => Ok(r),
+                            _ => {
+                                let mut fallback_req = PREWARM_CLIENT.get(original_url);
+                                for (k, v) in request_headers {
+                                    fallback_req = fallback_req.header(k.as_str(), v.as_str());
+                                }
+                                fallback_req.header(header::RANGE, missing_range).send().await
+                            }
+                        };
+                        if let Ok(resp) = head_resp {
+                            if resp.status() == StatusCode::PARTIAL_CONTENT {
+                                if let Ok(extra) = resp.bytes().await {
+                                    if let Some(mut updated) = FAST_START_CACHE.get(original_url) {
+                                        if updated.head_bytes.len() == missing_start {
+                                            let mut combined = BytesMut::with_capacity(updated.head_bytes.len() + extra.len());
+                                            combined.extend_from_slice(&updated.head_bytes);
+                                            combined.extend_from_slice(&extra);
+                                            updated.head_bytes = combined.freeze();
+                                            FAST_START_CACHE.insert(original_url.to_string(), updated);
+                                            info!(
+                                                %original_url,
+                                                new_head_len = FAST_START_CACHE.get(original_url).map(|e| e.head_bytes.len()).unwrap_or(0),
+                                                "[FAST-START] Expanded cached head buffer to 64MB for 4K resume"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let entry = FAST_START_CACHE.get(original_url).unwrap_or_else(|| entry.clone());
+
+            if let Some(ref tail) = entry.tail_bytes {
+                if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
+                    let preroll_bytes = if is_4k {
+                        FAST_START_RESUME_PREROLL_BYTES_4K as u64
+                    } else {
+                        FAST_START_RESUME_PREROLL_BYTES_1080P as u64
+                    };
+                    let resume_buffer_size = if is_4k {
+                        FAST_START_RESUME_BUFFER_SIZE_4K
+                    } else {
+                        FAST_START_RESUME_BUFFER_SIZE_1080P
+                    };
+                    let already_covered = entry.resume_buffer.as_ref().map(|(start, bytes)| {
+                        let end = *start + bytes.len() as u64;
+                        let min_start = target_offset.saturating_sub(preroll_bytes / 2);
+                        target_offset >= *start && target_offset < end && *start <= min_start
+                    }).unwrap_or(false);
+
+                    if !already_covered {
+                        let resume_lock_key = format!("resume:{}", original_url);
+                        let _guard = PREWARM_LOCKS.lock(resume_lock_key).await;
+                        // Re-check after acquiring lock in case a concurrent task already refreshed it
+                        if let Some(current_entry) = FAST_START_CACHE.get(original_url) {
+                            let covered_now = current_entry.resume_buffer.as_ref().map(|(start, bytes)| {
+                                let end = *start + bytes.len() as u64;
+                                let min_start = target_offset.saturating_sub(preroll_bytes / 2);
+                                target_offset >= *start && target_offset < end && *start <= min_start
+                            }).unwrap_or(false);
+                            if covered_now {
+                                return true;
+                            }
+                        }
+
+                        let current_entry = FAST_START_CACHE.get(original_url).unwrap_or(entry.clone());
+                        let start_byte = target_offset.saturating_sub(preroll_bytes).max(current_entry.head_bytes.len() as u64);
+                        let end_byte = (start_byte + resume_buffer_size as u64 - 1).min(current_entry.total_size - 1);
+                        let resume_range = format!("bytes={}-{}", start_byte, end_byte);
+
+                        let mut res_req = PREWARM_CLIENT.get(&current_entry.direct_cdn_url);
+                        for (k, v) in request_headers {
+                            res_req = res_req.header(k.as_str(), v.as_str());
+                        }
+                        res_req = res_req.header(header::RANGE, resume_range.clone());
+                        let resp_res = match res_req.send().await {
+                            Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => Ok(r),
+                            other => {
+                                warn!(%original_url, status = ?other.as_ref().map(|r| r.status()), "[FAST-START] Direct CDN resume fetch failed or expired, falling back to original_url");
+                                let mut fallback_req = PREWARM_CLIENT.get(original_url);
+                                for (k, v) in request_headers {
+                                    fallback_req = fallback_req.header(k.as_str(), v.as_str());
+                                }
+                                fallback_req = fallback_req.header(header::RANGE, resume_range);
+                                match fallback_req.send().await {
+                                    Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
+                                        let fresh_cdn = r.url().as_str().to_string();
+                                        if let Some(mut updated) = FAST_START_CACHE.get(original_url) {
+                                            updated.direct_cdn_url = fresh_cdn;
+                                            FAST_START_CACHE.insert(original_url.to_string(), updated);
+                                        }
+                                        Ok(r)
+                                    }
+                                    err => err,
+                                }
+                            }
+                        };
+                        if let Ok(resp) = resp_res {
+                            if resp.status() == StatusCode::PARTIAL_CONTENT {
+                                if let Ok(b) = resp.bytes().await {
+                                    let resume_size_bytes = b.len();
+                                    if let Some(mut updated) = FAST_START_CACHE.get(original_url) {
+                                        if updated.item_id.is_none() && item_id.is_some() {
+                                            updated.item_id = item_id;
+                                        }
+                                        updated.resume_buffer = Some((start_byte, b));
+                                        FAST_START_CACHE.insert(original_url.to_string(), updated);
+                                        info!(
+                                            %original_url,
+                                            item = ?item_id,
+                                            start_byte,
+                                            end_byte,
+                                            resume_size_bytes,
+                                            "[FAST-START] Refreshed resume buffer into RAM for cached stream"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    debug!(
+        %original_url,
+        item = ?item_id,
+        head_bytes = entry.head_bytes.len(),
+        "[FAST-START] Stream already cached; skipping prewarm"
+    );
+    true
+}
+
 /// Pre-warms the head buffer (32 MB or 8 MB resume), tail index (2 MB), and keyframe resume chunk (24/48 MB) for an upstream stream.
 ///
 /// Runs asynchronously in the background. Follows upstream redirects (e.g. Stremthru -> Torbox CDN),
@@ -276,83 +454,18 @@ pub async fn prewarm_fast_start(
     head_size: Option<usize>,
     resume_position_secs: Option<f64>,
 ) -> bool {
+    let is_4k_hint = head_size.map(|sz| sz >= FAST_START_RESUME_HEAD_SIZE_4K);
+
     // If already pre-warmed and cached: check if resume buffer needs to be appended or refreshed
-    if let Some(entry) = FAST_START_CACHE.get(original_url) {
-        if let Some(pos_secs) = resume_position_secs {
-            if pos_secs > 10.0 {
-                if let Some(ref tail) = entry.tail_bytes {
-                    if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
-                        let is_4k = is_4k_stream(original_url, Some(entry.total_size), None);
-                        let preroll_bytes = if is_4k {
-                            FAST_START_RESUME_PREROLL_BYTES_4K as u64
-                        } else {
-                            FAST_START_RESUME_PREROLL_BYTES_1080P as u64
-                        };
-                        let resume_buffer_size = if is_4k {
-                            FAST_START_RESUME_BUFFER_SIZE_4K
-                        } else {
-                            FAST_START_RESUME_BUFFER_SIZE_1080P
-                        };
-                        let already_covered = entry.resume_buffer.as_ref().map(|(start, bytes)| {
-                            let end = *start + bytes.len() as u64;
-                            let min_start = target_offset.saturating_sub(preroll_bytes / 2);
-                            target_offset >= *start && target_offset < end && *start <= min_start
-                        }).unwrap_or(false);
-
-                        if !already_covered {
-                            let resume_lock_key = format!("resume:{}", original_url);
-                            let _guard = PREWARM_LOCKS.lock(resume_lock_key).await;
-                            // Re-check after acquiring lock in case a concurrent task already refreshed it
-                            if let Some(current_entry) = FAST_START_CACHE.get(original_url) {
-                                let covered_now = current_entry.resume_buffer.as_ref().map(|(start, bytes)| {
-                                    let end = *start + bytes.len() as u64;
-                                    let min_start = target_offset.saturating_sub(preroll_bytes / 2);
-                                    target_offset >= *start && target_offset < end && *start <= min_start
-                                }).unwrap_or(false);
-                                if covered_now {
-                                    return true;
-                                }
-                            }
-
-                            let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
-                            let end_byte = (start_byte + resume_buffer_size as u64 - 1).min(entry.total_size - 1);
-                            let resume_range = format!("bytes={}-{}", start_byte, end_byte);
-                            let mut res_req = PREWARM_CLIENT.get(&entry.direct_cdn_url);
-                            for (k, v) in request_headers {
-                                res_req = res_req.header(k.as_str(), v.as_str());
-                            }
-                            res_req = res_req.header(header::RANGE, resume_range);
-                            if let Ok(resp) = res_req.send().await {
-                                if resp.status() == StatusCode::PARTIAL_CONTENT {
-                                    if let Ok(b) = resp.bytes().await {
-                                        let resume_size_bytes = b.len();
-                                        if let Some(mut updated) = FAST_START_CACHE.get(original_url) {
-                                            updated.resume_buffer = Some((start_byte, b));
-                                            FAST_START_CACHE.insert(original_url.to_string(), updated);
-                                            info!(
-                                                %original_url,
-                                                item = ?item_id,
-                                                start_byte,
-                                                end_byte,
-                                                resume_size_bytes,
-                                                "[FAST-START] Refreshed resume buffer into RAM for cached stream"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        debug!(
-            %original_url,
-            item = ?item_id,
-            head_bytes = entry.head_bytes.len(),
-            "[FAST-START] Stream already cached; skipping prewarm"
-        );
-        return true;
+    if FAST_START_CACHE.get(original_url).is_some() {
+        return refresh_cached_resume_and_head(
+            item_id,
+            original_url,
+            request_headers,
+            is_4k_hint,
+            resume_position_secs,
+        )
+        .await;
     }
 
     // If FORCE_DIRECT_307 is enabled, do NOT download 32MB head or 2MB tail into RAM!
@@ -457,7 +570,14 @@ pub async fn prewarm_fast_start(
 
     // Re-check cache before acquiring active lock (in case a High-priority task finished while Low was queued)
     if FAST_START_CACHE.get(original_url).is_some() {
-        return true;
+        return refresh_cached_resume_and_head(
+            item_id,
+            original_url,
+            request_headers,
+            is_4k_hint,
+            resume_position_secs,
+        )
+        .await;
     }
 
     // Coalesce concurrent active downloads for the same stream URL
@@ -465,7 +585,14 @@ pub async fn prewarm_fast_start(
 
     // Double check cache after acquiring active lock
     if FAST_START_CACHE.get(original_url).is_some() {
-        return true;
+        return refresh_cached_resume_and_head(
+            item_id,
+            original_url,
+            request_headers,
+            is_4k_hint,
+            resume_position_secs,
+        )
+        .await;
     }
 
     let notify = Arc::new(tokio::sync::Notify::new());
@@ -488,9 +615,9 @@ pub async fn prewarm_fast_start(
 
     let is_resuming = resume_position_secs.map(|p| p > 10.0).unwrap_or(false);
     let target_head_size = if is_resuming {
-        calculate_fast_start_resume_head_size(original_url, None, None)
+        calculate_fast_start_resume_head_size(original_url, None, is_4k_hint)
     } else {
-        head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, None))
+        head_size.unwrap_or_else(|| calculate_fast_start_head_size(original_url, None, is_4k_hint))
     };
 
     info!(
@@ -696,7 +823,7 @@ pub async fn prewarm_fast_start(
     let resume_buffer = if let (Some(pos_secs), Some(tb)) = (resume_position_secs, &tail_bytes) {
         if pos_secs > 10.0 {
             if let Some(target_offset) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
-                let is_4k = is_4k_stream(original_url, Some(total_size), None);
+                let is_4k = is_4k_stream(original_url, Some(total_size), is_4k_hint);
                 let preroll_bytes = if is_4k {
                     FAST_START_RESUME_PREROLL_BYTES_4K as u64
                 } else {
@@ -1789,6 +1916,19 @@ pub fn purge_resume_buffer_for_item(item_id: Uuid) {
             tracing::info!(%url, %item_id, "[FAST-START] Purged resume buffer from RAM for completed item");
         }
     }
+}
+
+/// Returns whether an item has an active entry in `FAST_START_CACHE` with valid head bytes
+/// that was prewarmed/refreshed within `max_age`.
+pub fn is_item_cached_and_fresh(item_id: Uuid, max_age: Duration) -> bool {
+    for (_, entry) in FAST_START_CACHE.iter() {
+        if entry.item_id == Some(item_id) && !entry.head_bytes.is_empty() {
+            if entry.created_at.elapsed() < max_age {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Heuristically detects the MIME type from the file extension in a URL.

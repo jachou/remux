@@ -569,7 +569,8 @@ impl PlaybackSessionManager {
         if let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await {
             let position_seconds = position_ticks / 10_000_000;
             if media.kind == db::MediaKind::Episode {
-                if let Some(runtime) = media.runtime {
+                let effective_runtime = media.effective_runtime(db).await;
+                if let Some(runtime) = effective_runtime {
                     if runtime > 0 {
                         let crossed_80 = position_seconds >= (runtime * 80) / 100;
                         let near_end = runtime.saturating_sub(position_seconds) <= 300;
@@ -706,6 +707,7 @@ impl PlaybackSessionManager {
         let Ok(Some(media)) = db::Media::get_by_id(db, &item_id).await else {
             return Ok(false);
         };
+        let effective_runtime = media.effective_runtime(db).await;
         db::UserMediaState::update_playback(
             db,
             user,
@@ -713,7 +715,7 @@ impl PlaybackSessionManager {
             final_ticks,
             None, // don't overwrite stream selections on stop
             None,
-            media.runtime, // Some(runtime) triggers watched-threshold check
+            effective_runtime, // Some(runtime) triggers watched-threshold check
         )
         .await
     }

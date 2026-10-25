@@ -358,6 +358,9 @@ pub async fn report_playback_stopped(
         };
         let pctx =
             PlaybackContext::from_parts(&session, &data, playback.as_ref(), Some(psid));
+        let already_probed_next = playback.as_ref().map_or(false, |p| {
+            p.probed_next_episode_at_80 || p.probed_next_episode_near_end
+        });
         // Whether this counted as a watch is decided by the threshold check
         // inside `stopped`, so its answer is carried out rather than inferred
         // from `played_at`, which stays set from every earlier watch.
@@ -394,11 +397,12 @@ pub async fn report_playback_stopped(
 
             if played {
                 crate::fast_start::purge_resume_buffer_for_item(item_id);
-                crate::services::stream_service::spawn_next_episode_probe(
+                crate::services::stream_service::spawn_next_episode_probe_opts(
                     &state.ctx,
                     item_id,
                     session.user.id,
                     "Trigger 2 (on playback stopped)",
+                    already_probed_next,
                 );
             } else {
                 // Stopped mid-way: immediately pre-warm / refill the resume buffer at the new stop position!
