@@ -1726,42 +1726,42 @@ pub fn spawn_preemptive_probe(
             if let Some(cached) = &primary.probe_data {
                 if is_reusable_probe_cache(cached) {
                     tracing::info!(%item_id, stream_id = %primary.id, "Candidate #1 already probed in DB; pre-warming liveness & fast-start in parallel");
-                    if let Some(si) = &primary.stream_info {
-                        if !si.descriptor.is_known_dead() {
-                            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                                let url_clone = url.clone();
-                                let headers_clone = request_headers.clone();
-                                let db_pool = ctx.db.clone();
-                                let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
-                                let head_size = crate::fast_start::calculate_fast_start_head_size(
-                                    url,
-                                    si.size.map(|s| s as u64),
-                                    Some(is_4k),
-                                );
-                                tokio::spawn(async move {
-                                    let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
+                    let fast_start_fut = async {
+                        if let Some(si) = &primary.stream_info {
+                            if !si.descriptor.is_known_dead() {
+                                if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                                    let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
+                                    let head_size = crate::fast_start::calculate_fast_start_head_size(
+                                        url,
+                                        si.size.map(|s| s as u64),
+                                        Some(is_4k),
+                                    );
+                                    let resume_pos = crate::fast_start::lookup_resume_position(&ctx.db, user_id, Some(item_id)).await;
                                     crate::fast_start::prewarm_fast_start(
                                         Some(item_id),
-                                        &url_clone,
-                                        &headers_clone,
+                                        url,
+                                        request_headers,
                                         crate::fast_start::PrewarmPriority::Low,
                                         Some(head_size),
                                         resume_pos,
                                     )
                                     .await;
-                                });
+                                }
                             }
                         }
-                    }
-                    let is_alive = if let Some(si) = &primary.stream_info {
-                        if si.descriptor.is_liveness_expiring_soon() {
-                            si.descriptor.refresh_liveness().await
-                        } else {
-                            si.descriptor.is_alive().await
-                        }
-                    } else {
-                        true
                     };
+                    let liveness_fut = async {
+                        if let Some(si) = &primary.stream_info {
+                            if si.descriptor.is_liveness_expiring_soon() {
+                                si.descriptor.refresh_liveness().await
+                            } else {
+                                si.descriptor.is_alive().await
+                            }
+                        } else {
+                            true
+                        }
+                    };
+                    let (_, is_alive) = tokio::join!(fast_start_fut, liveness_fut);
                     if is_alive {
                         drop(active_guard);
                         prefetch_subtitles_for_media(&ctx, &media, Some(&primary), user_id).await;

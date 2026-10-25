@@ -617,7 +617,7 @@ impl PlaybackSessionManager {
                 position_ticks,
                 audio_idx,
                 subtitle_idx,
-                media.runtime,
+                None, // Progress heartbeats must not trigger watched threshold check mid-stream
             )
             .await?;
         }

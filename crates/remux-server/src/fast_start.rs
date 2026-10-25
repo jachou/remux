@@ -300,6 +300,20 @@ pub async fn prewarm_fast_start(
                         }).unwrap_or(false);
 
                         if !already_covered {
+                            let resume_lock_key = format!("resume:{}", original_url);
+                            let _guard = PREWARM_LOCKS.lock(resume_lock_key).await;
+                            // Re-check after acquiring lock in case a concurrent task already refreshed it
+                            if let Some(current_entry) = FAST_START_CACHE.get(original_url) {
+                                let covered_now = current_entry.resume_buffer.as_ref().map(|(start, bytes)| {
+                                    let end = *start + bytes.len() as u64;
+                                    let min_start = target_offset.saturating_sub(preroll_bytes / 2);
+                                    target_offset >= *start && target_offset < end && *start <= min_start
+                                }).unwrap_or(false);
+                                if covered_now {
+                                    return true;
+                                }
+                            }
+
                             let start_byte = target_offset.saturating_sub(preroll_bytes).max(entry.head_bytes.len() as u64);
                             let end_byte = (start_byte + resume_buffer_size as u64 - 1).min(entry.total_size - 1);
                             let resume_range = format!("bytes={}-{}", start_byte, end_byte);
@@ -312,17 +326,18 @@ pub async fn prewarm_fast_start(
                                 if resp.status() == StatusCode::PARTIAL_CONTENT {
                                     if let Ok(b) = resp.bytes().await {
                                         let resume_size_bytes = b.len();
-                                        let mut updated = entry.clone();
-                                        updated.resume_buffer = Some((start_byte, b));
-                                        FAST_START_CACHE.insert(original_url.to_string(), updated);
-                                        info!(
-                                            %original_url,
-                                            item = ?item_id,
-                                            start_byte,
-                                            end_byte,
-                                            resume_size_bytes,
-                                            "[FAST-START] Refreshed resume buffer into RAM for cached stream"
-                                        );
+                                        if let Some(mut updated) = FAST_START_CACHE.get(original_url) {
+                                            updated.resume_buffer = Some((start_byte, b));
+                                            FAST_START_CACHE.insert(original_url.to_string(), updated);
+                                            info!(
+                                                %original_url,
+                                                item = ?item_id,
+                                                start_byte,
+                                                end_byte,
+                                                resume_size_bytes,
+                                                "[FAST-START] Refreshed resume buffer into RAM for cached stream"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -870,7 +885,8 @@ async fn serve_from_in_flight(
                 .unwrap_or((0, in_flight.total_size.saturating_sub(1)));
 
             let max_chunk_end = req_start + (FAST_START_HEAD_SERVE_CHUNK_SIZE as u64).saturating_sub(1);
-            let end_offset = (req_start + in_flight.target_head_size as u64 - 1)
+            let max_head_end = (in_flight.target_head_size as u64).saturating_sub(1);
+            let end_offset = max_head_end
                 .min(max_chunk_end)
                 .min(req_end)
                 .min(in_flight.total_size - 1);
@@ -2221,6 +2237,52 @@ mod tests {
         assert_eq!(body_bytes.len(), target_size);
         assert_eq!(&body_bytes[0..4], &[0, 0, 0, 0]);
         assert_eq!(&body_bytes[256 * 1024..256 * 1024 + 4], &[1, 1, 1, 1]);
+
+        IN_FLIGHT_PREWARMS.remove(test_url);
+    }
+
+    #[tokio::test]
+    async fn in_flight_sub_range_does_not_overflow_target_head_size() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+        let test_url = "http://127.0.0.1:9999/in-flight-overflow-test.mkv";
+        let target_size = 32 * 1024 * 1024;
+        let total_size = 5_000_000_000u64;
+
+        let in_flight = Arc::new(InFlightHead {
+            item_id: Some(Uuid::nil()),
+            original_url: test_url.to_string(),
+            direct_cdn_url: "http://cdn.example.com/inflight.mkv".to_string(),
+            total_size,
+            target_head_size: target_size,
+            content_type: "video/x-matroska".to_string(),
+            buffer: RwLock::new(BytesMut::new()),
+            tail_bytes: RwLock::new(None),
+            notify: tokio::sync::Notify::new(),
+            tail_notify: tokio::sync::Notify::new(),
+            is_done: AtomicBool::new(false),
+            has_error: AtomicBool::new(false),
+        });
+        IN_FLIGHT_PREWARMS.insert(test_url.to_string(), in_flight.clone());
+
+        // Client requests a range starting at 28 MB (inside 32 MB target_head_size)
+        // With 16 MB chunking, 28 MB + 16 MB = 44 MB, which would overshoot 32 MB!
+        // It must be clamped to byte 32 MB - 1 = 33554431.
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, HeaderValue::from_static("bytes=29360128-")); // 28 MB
+        let resp = handle_playback_request(Uuid::nil(), test_url, &headers, None)
+            .await
+            .expect("should hit in-flight streaming");
+
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers().get(header::CONTENT_RANGE).unwrap().to_str().unwrap(),
+            "bytes 29360128-33554431/5000000000"
+        );
+        assert_eq!(
+            resp.headers().get(header::CONTENT_LENGTH).unwrap().to_str().unwrap(),
+            "4194304" // exactly 4 MB remaining, not 16 MB!
+        );
 
         IN_FLIGHT_PREWARMS.remove(test_url);
     }
