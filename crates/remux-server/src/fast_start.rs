@@ -36,6 +36,13 @@ pub const FAST_START_RESUME_HEAD_SIZE_4K: usize = 64 * 1024 * 1024;
 /// Backward-compatible alias for 4K resume head size.
 pub const FAST_START_RESUME_HEAD_SIZE: usize = FAST_START_RESUME_HEAD_SIZE_4K;
 
+/// Maximum chunk size in bytes served over LAN per head range request: 16 MB.
+/// Remux buffers up to 64 MB in server RAM from WAN Debrid CDN to prevent probe eviction,
+/// but serving in 16 MB chunks over LAN ensures low-bitrate titles and standard resumes
+/// only transfer ~16 MB across the client's Wi-Fi link before seeking, while 4K titles
+/// requiring more probe bytes seamlessly fetch subsequent 16 MB slices directly from RAM.
+pub const FAST_START_HEAD_SERVE_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
 /// Resume buffer size in bytes for standard 1080p Continue Watching streams: 48 MB.
 pub const FAST_START_RESUME_BUFFER_SIZE_1080P: usize = 56 * 1024 * 1024;
 
@@ -862,7 +869,10 @@ async fn serve_from_in_flight(
             let (req_start, req_end) = parse_range_bounds(rng, in_flight.total_size)
                 .unwrap_or((0, in_flight.total_size.saturating_sub(1)));
 
+            let max_chunk_end = req_start + (FAST_START_HEAD_SERVE_CHUNK_SIZE as u64).saturating_sub(1);
             let end_offset = (req_start + in_flight.target_head_size as u64 - 1)
+                .min(max_chunk_end)
+                .min(req_end)
                 .min(in_flight.total_size - 1);
             let content_len = end_offset.saturating_sub(req_start) + 1;
 
@@ -937,7 +947,7 @@ async fn serve_from_in_flight(
         // Case 2: No range header specified (treat as head probe)
         None => {
             METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
-            let target_head_size = in_flight.target_head_size;
+            let target_head_size = in_flight.target_head_size.min(FAST_START_HEAD_SERVE_CHUNK_SIZE);
             let end_offset = (target_head_size as u64).min(in_flight.total_size).saturating_sub(1);
             let content_len = end_offset + 1;
 
@@ -1209,7 +1219,10 @@ pub async fn handle_playback_request(
                 parse_range_bounds(rng, entry.total_size).unwrap_or((0, entry.total_size.saturating_sub(1)));
 
             let start_idx = req_start as usize;
-            let end_idx = (req_end as usize).min(head_len.saturating_sub(1));
+            let max_chunk_end = (start_idx + FAST_START_HEAD_SERVE_CHUNK_SIZE).saturating_sub(1);
+            let end_idx = (req_end as usize)
+                .min(max_chunk_end)
+                .min(head_len.saturating_sub(1));
             let slice = entry.head_bytes.slice(start_idx..=end_idx);
             let slice_len = slice.len();
             let end_offset = req_start + (slice_len as u64).saturating_sub(1);
@@ -1221,8 +1234,9 @@ pub async fn handle_playback_request(
                 req_start,
                 end_offset,
                 slice_len,
+                head_len,
                 total_size = entry.total_size,
-                "[FAST-START] Buffer hit (head): serving {} bytes locally over LAN",
+                "[FAST-START] Buffer hit (head): serving {} bytes locally over LAN (chunked)",
                 slice_len
             );
 
@@ -1246,13 +1260,18 @@ pub async fn handle_playback_request(
         None => {
             METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
             let head_len = entry.head_bytes.len();
-            METRICS.bytes_served_lan.fetch_add(head_len as u64, Ordering::Relaxed);
+            let chunk_len = head_len.min(FAST_START_HEAD_SERVE_CHUNK_SIZE);
+            let slice = entry.head_bytes.slice(0..chunk_len);
+            let end_offset = (chunk_len as u64).saturating_sub(1);
+            METRICS.bytes_served_lan.fetch_add(chunk_len as u64, Ordering::Relaxed);
 
             info!(
                 %item_id,
+                chunk_len,
                 head_len,
                 total_size = entry.total_size,
-                "[FAST-START] Buffer hit (no range): serving head bytes locally over LAN"
+                "[FAST-START] Buffer hit (no range): serving {} head bytes locally over LAN (chunked)",
+                chunk_len
             );
 
             let resp = Response::builder()
@@ -1260,12 +1279,12 @@ pub async fn handle_playback_request(
                 .header(header::CONTENT_TYPE, &entry.content_type)
                 .header(
                     header::CONTENT_RANGE,
-                    format!("bytes 0-{}/{}", head_len.saturating_sub(1), entry.total_size),
+                    format!("bytes 0-{}/{}", end_offset, entry.total_size),
                 )
-                .header(header::CONTENT_LENGTH, head_len.to_string())
+                .header(header::CONTENT_LENGTH, chunk_len.to_string())
                 .header(header::ACCEPT_RANGES, "bytes")
                 .header("X-Remux-FastStart", "hit-head")
-                .body(Body::from(entry.head_bytes.clone()))
+                .body(Body::from(slice))
                 .unwrap();
 
             Some(resp)
@@ -1898,6 +1917,80 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&body_bytes[..], &head_data[8154..16384]);
+    }
+
+    #[tokio::test]
+    async fn head_requests_chunked_to_16mb_over_lan() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+        let test_url = "http://127.0.0.1:9999/chunked-16mb-test.mkv";
+        let head_size = 36 * 1024 * 1024;
+        let head_data: Vec<u8> = vec![0x33; head_size];
+        FAST_START_CACHE.insert(
+            test_url.to_string(),
+            FastStartEntry {
+                item_id: Some(Uuid::nil()),
+                original_url: test_url.to_string(),
+                direct_cdn_url: "http://cdn.example.com/test.mkv".to_string(),
+                head_bytes: Bytes::from(head_data.clone()),
+                tail_bytes: None,
+                resume_buffer: None,
+                total_size: 5_000_000_000,
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+
+        // 1. Client requests open-ended byte 0: should be capped to first 16 MB chunk
+        let mut headers1 = HeaderMap::new();
+        headers1.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+        let resp1 = handle_playback_request(Uuid::nil(), test_url, &headers1, None)
+            .await
+            .expect("should hit head buffer");
+
+        assert_eq!(resp1.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp1.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 0-16777215/5000000000"
+        );
+        assert_eq!(
+            resp1.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "16777216"
+        );
+
+        // 2. Client requests second chunk (bytes 16777216-): should return next 16 MB chunk
+        let mut headers2 = HeaderMap::new();
+        headers2.insert(header::RANGE, HeaderValue::from_static("bytes=16777216-"));
+        let resp2 = handle_playback_request(Uuid::nil(), test_url, &headers2, None)
+            .await
+            .expect("should hit head buffer");
+
+        assert_eq!(resp2.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp2.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 16777216-33554431/5000000000"
+        );
+        assert_eq!(
+            resp2.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "16777216"
+        );
+
+        // 3. Client requests third chunk (bytes 33554432-): should return remaining 4 MB chunk
+        let mut headers3 = HeaderMap::new();
+        headers3.insert(header::RANGE, HeaderValue::from_static("bytes=33554432-"));
+        let resp3 = handle_playback_request(Uuid::nil(), test_url, &headers3, None)
+            .await
+            .expect("should hit head buffer");
+
+        assert_eq!(resp3.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp3.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 33554432-37748735/5000000000"
+        );
+        assert_eq!(
+            resp3.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "4194304"
+        );
     }
 
     #[tokio::test]
