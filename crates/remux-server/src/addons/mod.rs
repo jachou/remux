@@ -3368,8 +3368,14 @@ impl AddonService {
             let candidate_alive = if let Some(si) = &primary.stream_info {
                 match &si.descriptor {
                     crate::stream::StreamDescriptor::Http { url, .. } => {
-                        crate::fast_start::FAST_START_CACHE.get(url).is_some()
-                            || crate::stream::STREAM_LIVENESS_CACHE.get(url).is_some_and(|e| e.alive)
+                        let is_err = crate::stream::is_error_video_url(url);
+                        !is_err
+                            && (crate::fast_start::FAST_START_CACHE.get(url).is_some_and(|e| {
+                                e.total_size >= 2 * 1024 * 1024
+                                    && !crate::stream::is_error_video_url(&e.direct_cdn_url)
+                            }) || crate::stream::STREAM_LIVENESS_CACHE
+                                .get(url)
+                                .is_some_and(|e| e.alive))
                     }
                     _ => true,
                 }

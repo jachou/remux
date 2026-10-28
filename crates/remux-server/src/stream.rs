@@ -167,7 +167,17 @@ pub fn is_error_video_url(url: &str) -> bool {
             return true;
         }
     }
-    if lower.contains("timeout.mp4")
+    if lower.contains("download_failed")
+        || lower.contains("download-failed")
+        || lower.contains("downloadfailed")
+        || lower.contains("torrent_failed")
+        || lower.contains("torrent-failed")
+        || lower.contains("stream_failed")
+        || lower.contains("stream-failed")
+        || lower.contains("failed.mp4")
+        || lower.contains("failure.mp4")
+        || lower.contains("error.mp4")
+        || lower.contains("timeout.mp4")
         || lower.contains("too-many-requests")
         || lower.contains("too_many_requests")
         || lower.contains("debrid-error")
@@ -176,6 +186,10 @@ pub fn is_error_video_url(url: &str) -> bool {
         || lower.contains("cooldown.mp4")
         || lower.contains("account-expired")
     {
+        return true;
+    }
+    // Static asset directory serving mp4 from resolver addons (e.g. /v0/store/_/static/....mp4)
+    if lower.contains("/static/") && (lower.ends_with(".mp4") || lower.contains(".mp4?")) {
         return true;
     }
     false
@@ -237,6 +251,10 @@ mod error_video_tests {
         assert!(is_error_video_url("https://some-addon.com/videos/too-many-requests.mp4"));
         assert!(is_error_video_url("https://some-addon.com/videos/account-expired.mp4"));
         assert!(is_error_video_url("https://some-addon.com/videos/cooldown.mp4"));
+        assert!(is_error_video_url("https://stremthrufortheweebs.midnightignite.me/v0/store/_/static/download_failed.mp4"));
+        assert!(is_error_video_url("https://stremthru.example.com/v0/store/_/static/torrent_failed.mp4"));
+        assert!(is_error_video_url("https://addon.example.com/static/error.mp4"));
+        assert!(is_error_video_url("https://addon.example.com/download-failed.mp4"));
     }
 
     #[test]
@@ -428,17 +446,32 @@ impl StreamDescriptor {
                 let elapsed = start.elapsed();
                 if is_ok {
                     let direct_url = r.url().as_str().to_string();
-                    if is_error_video_url(&direct_url) || is_error_video_url(url) {
+                    let total_size = r
+                        .headers()
+                        .get(http::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|cr| cr.split('/').last())
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .or_else(|| {
+                            r.headers()
+                                .get(http::header::CONTENT_LENGTH)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                        });
+
+                    let is_tiny_video = total_size.is_some_and(|sz| sz < 2 * 1024 * 1024);
+                    if is_error_video_url(&direct_url) || is_error_video_url(url) || is_tiny_video {
                         tracing::warn!(
                             %url,
                             direct_url = %direct_url,
+                            ?total_size,
                             ?status,
                             ?elapsed,
                             "liveness check rejected upstream error placeholder video"
                         );
                         STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
                         crate::fast_start::FAST_START_CACHE.invalidate(url);
-                        trip_preemptive_circuit_breaker(None, "liveness check detected upstream error video URL");
+                        trip_preemptive_circuit_breaker(None, "liveness check detected upstream error video URL or tiny payload");
                         return false;
                     }
 
@@ -448,14 +481,28 @@ impl StreamDescriptor {
                     // Keep Fast-Start RAM buffer synchronized: if direct CDN redirect URL changed, refresh it in-place
                     if let Some(mut fs_entry) = crate::fast_start::FAST_START_CACHE.get(url) {
                         if fs_entry.direct_cdn_url != direct_url {
-                            tracing::info!(
-                                %url,
-                                old_cdn = %fs_entry.direct_cdn_url,
-                                new_cdn = %direct_url,
-                                "[FAST-START] Refreshed CDN edge redirect URL from liveness check"
-                            );
-                            fs_entry.direct_cdn_url = direct_url;
-                            crate::fast_start::FAST_START_CACHE.insert(url.clone(), fs_entry);
+                            let was_error = fs_entry.total_size < 2 * 1024 * 1024
+                                || is_error_video_url(&fs_entry.direct_cdn_url);
+                            let old_path = url::Url::parse(&fs_entry.direct_cdn_url).ok().map(|u| (u.host_str().map(str::to_string), u.path().to_string()));
+                            let new_path = url::Url::parse(&direct_url).ok().map(|u| (u.host_str().map(str::to_string), u.path().to_string()));
+                            if was_error || old_path != new_path {
+                                tracing::info!(
+                                    %url,
+                                    old_cdn = %fs_entry.direct_cdn_url,
+                                    new_cdn = %direct_url,
+                                    "[FAST-START] CDN stream target changed or recovered from error; invalidating stale RAM buffer"
+                                );
+                                crate::fast_start::FAST_START_CACHE.invalidate(url);
+                            } else {
+                                tracing::info!(
+                                    %url,
+                                    old_cdn = %fs_entry.direct_cdn_url,
+                                    new_cdn = %direct_url,
+                                    "[FAST-START] Refreshed CDN edge redirect URL from liveness check"
+                                );
+                                fs_entry.direct_cdn_url = direct_url;
+                                crate::fast_start::FAST_START_CACHE.insert(url.clone(), fs_entry);
+                            }
                         }
                     }
                 } else {

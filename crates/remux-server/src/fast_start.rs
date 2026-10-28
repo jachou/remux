@@ -510,8 +510,18 @@ pub async fn prewarm_fast_start(
         }
 
         let direct_cdn_url = head_resp.url().as_str().to_string();
-        if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) {
-            warn!(%original_url, direct_url = %direct_cdn_url, "[FAST-START] Upstream resolved to error video URL; marking dead");
+        let total_size = head_resp
+            .headers()
+            .get(header::CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|cr| cr.split('/').last())
+            .and_then(|s| s.parse::<u64>().ok())
+            .or_else(|| head_resp.content_length())
+            .unwrap_or(0);
+
+        let is_tiny = total_size > 0 && total_size < 2 * 1024 * 1024;
+        if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) || is_tiny {
+            warn!(%original_url, direct_url = %direct_cdn_url, total_size, "[FAST-START] Upstream resolved to error video URL or tiny payload; marking dead");
             crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 error video URL");
             crate::stream::STREAM_LIVENESS_CACHE.insert(
                 original_url.to_string(),
@@ -524,13 +534,6 @@ pub async fn prewarm_fast_start(
             original_url.to_string(),
             crate::stream::LivenessEntry::new(true),
         );
-        let total_size = head_resp
-            .headers()
-            .get(header::CONTENT_RANGE)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|cr| cr.split('/').last())
-            .and_then(|s| s.parse::<u64>().ok())
-            .unwrap_or(0);
         let content_type = detect_content_type(original_url).to_string();
 
         let entry = FastStartEntry {
@@ -747,29 +750,6 @@ pub async fn prewarm_fast_start(
     // Capture the direct CDN edge URL after Stremthru redirect
     let direct_cdn_url = head_resp.url().as_str().to_string();
 
-    if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) {
-        METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
-        warn!(
-            %original_url,
-            direct_url = %direct_cdn_url,
-            "[FAST-START] Upstream resolved to error placeholder video URL; marking dead"
-        );
-        crate::stream::trip_preemptive_circuit_breaker(None, "fast-start upstream error placeholder video detected");
-        crate::stream::STREAM_LIVENESS_CACHE.insert(
-            original_url.to_string(),
-            crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
-        );
-        notify.notify_waiters();
-        return false;
-    }
-
-    // Stream responded with 200/206: populate STREAM_LIVENESS_CACHE immediately so liveness checks are instant
-    crate::stream::STREAM_LIVENESS_CACHE.insert(
-        original_url.to_string(),
-        crate::stream::LivenessEntry::new(true),
-    );
-    notify.notify_waiters();
-
     // Parse total file size from Content-Range header: bytes 0-16777215/4694973563
     let total_size = head_resp
         .headers()
@@ -787,6 +767,32 @@ pub async fn prewarm_fast_start(
             return false;
         }
     };
+
+    let is_tiny_video = total_size < 2 * 1024 * 1024;
+    if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) || is_tiny_video {
+        METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
+        warn!(
+            %original_url,
+            direct_url = %direct_cdn_url,
+            total_size,
+            "[FAST-START] Upstream resolved to error placeholder video URL or tiny payload; marking dead"
+        );
+        crate::stream::trip_preemptive_circuit_breaker(None, "fast-start upstream error placeholder video detected");
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            original_url.to_string(),
+            crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+        );
+        crate::fast_start::FAST_START_CACHE.invalidate(original_url);
+        notify.notify_waiters();
+        return false;
+    }
+
+    // Stream responded with 200/206 and valid size: populate STREAM_LIVENESS_CACHE immediately so liveness checks are instant
+    crate::stream::STREAM_LIVENESS_CACHE.insert(
+        original_url.to_string(),
+        crate::stream::LivenessEntry::new(true),
+    );
+    notify.notify_waiters();
 
     // Safety guard against OOM: if upstream returned 200 OK (ignored Range), only allow if file is small (<= target_head_size + 1024)
     if is_ok && total_size > (target_head_size + 1024) as u64 {
@@ -1443,6 +1449,17 @@ pub async fn handle_playback_request(
     }
 
     let entry = entry?;
+
+    if entry.total_size < 2 * 1024 * 1024 || crate::stream::is_error_video_url(&entry.direct_cdn_url) {
+        warn!(
+            %item_id,
+            direct_cdn = %entry.direct_cdn_url,
+            total_size = entry.total_size,
+            "[FAST-START] Refusing to serve cached error placeholder video from RAM; invalidating"
+        );
+        FAST_START_CACHE.invalidate(url);
+        return None;
+    }
 
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
