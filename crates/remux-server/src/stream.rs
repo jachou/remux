@@ -195,10 +195,45 @@ pub fn is_error_video_url(url: &str) -> bool {
     false
 }
 
+/// Returns true if the URL points specifically to an upstream rate limit or account lock error video.
+pub fn is_upstream_rate_limit_url(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    lower.contains("rate-limit")
+        || lower.contains("too-many-requests")
+        || lower.contains("too_many_requests")
+        || lower.contains("public-rate-limit-exceeded")
+        || lower.contains("cooldown.mp4")
+        || lower.contains("account-expired")
+        || lower.contains("debrid-error")
+}
+
 /// Global circuit breaker timestamp: epoch milliseconds until which preemptive background
-/// probing is throttled/paused due to upstream rate limits (429), timeouts (>4.5s/504), or error videos.
+/// probing is throttled/paused due to upstream rate limits (429), gateway outages (503/504), or rate-limit error videos.
 static PREEMPTIVE_CIRCUIT_BREAKER_UNTIL: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Consecutive upstream timeouts counter. Trips the global breaker after 3 in a row.
+static CONSECUTIVE_TIMEOUTS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Records a successful upstream response, clearing the consecutive timeout counter.
+pub fn record_upstream_success() {
+    CONSECUTIVE_TIMEOUTS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Records an upstream timeout. Trips the global circuit breaker if 3 consecutive timeouts occur.
+pub fn record_upstream_timeout(reason: &str) {
+    let count = CONSECUTIVE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+    if count >= 3 {
+        trip_preemptive_circuit_breaker(None, reason);
+    } else {
+        tracing::warn!(
+            count,
+            reason,
+            "[CIRCUIT-BREAKER] Upstream timeout recorded (will trip circuit breaker at 3 consecutive)"
+        );
+    }
+}
 
 /// Default circuit breaker duration: 120 seconds (configurable via REMUX_CIRCUIT_BREAKER_SECS).
 pub fn default_circuit_breaker_duration() -> std::time::Duration {
@@ -211,6 +246,7 @@ pub fn default_circuit_breaker_duration() -> std::time::Duration {
 
 /// Trips the preemptive probe circuit breaker for `duration` (or default if None).
 pub fn trip_preemptive_circuit_breaker(duration: Option<std::time::Duration>, reason: &str) {
+    CONSECUTIVE_TIMEOUTS.store(0, std::sync::atomic::Ordering::Relaxed);
     let d = duration.unwrap_or_else(default_circuit_breaker_duration);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -255,6 +291,19 @@ mod error_video_tests {
         assert!(is_error_video_url("https://stremthru.example.com/v0/store/_/static/torrent_failed.mp4"));
         assert!(is_error_video_url("https://addon.example.com/static/error.mp4"));
         assert!(is_error_video_url("https://addon.example.com/download-failed.mp4"));
+    }
+
+    #[test]
+    fn classifies_upstream_rate_limits_vs_item_failures() {
+        assert!(is_upstream_rate_limit_url("https://meteorfortheweebs.midnightignite.me/status/video/rate-limit.mp4"));
+        assert!(is_upstream_rate_limit_url("https://elfhosted.com/assets/public-rate-limit-exceeded.mp4"));
+        assert!(is_upstream_rate_limit_url("https://some-addon.com/videos/too-many-requests.mp4"));
+        assert!(is_upstream_rate_limit_url("https://some-addon.com/videos/account-expired.mp4"));
+        assert!(is_upstream_rate_limit_url("https://some-addon.com/videos/cooldown.mp4"));
+        // Item-level torrent failures should NOT be classified as rate limits:
+        assert!(!is_upstream_rate_limit_url("https://stremthrufortheweebs.midnightignite.me/v0/store/_/static/download_failed.mp4"));
+        assert!(!is_upstream_rate_limit_url("https://stremthru.example.com/v0/store/_/static/torrent_failed.mp4"));
+        assert!(!is_upstream_rate_limit_url("https://addon.example.com/download-failed.mp4"));
     }
 
     #[test]
@@ -471,10 +520,13 @@ impl StreamDescriptor {
                         );
                         STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
                         crate::fast_start::FAST_START_CACHE.invalidate(url);
-                        trip_preemptive_circuit_breaker(None, "liveness check detected upstream error video URL or tiny payload");
+                        if is_upstream_rate_limit_url(&direct_url) || is_upstream_rate_limit_url(url) {
+                            trip_preemptive_circuit_breaker(None, "liveness check detected upstream rate limit video URL");
+                        }
                         return false;
                     }
 
+                    record_upstream_success();
                     tracing::info!(%url, ?status, ?elapsed, direct_url = %direct_url, "liveness check passed, cached");
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(true));
 
@@ -511,7 +563,12 @@ impl StreamDescriptor {
                         || status == http::StatusCode::GATEWAY_TIMEOUT
                         || status == http::StatusCode::SERVICE_UNAVAILABLE;
                     if is_rate_or_gw {
-                        trip_preemptive_circuit_breaker(None, "liveness check hit rate limit or gateway error (429/504/503)");
+                        let retry_after = r.headers()
+                            .get(http::header::RETRY_AFTER)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .map(std::time::Duration::from_secs);
+                        trip_preemptive_circuit_breaker(retry_after, "liveness check hit rate limit or gateway error (429/504/503)");
                         STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
                     } else {
                         STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
@@ -525,7 +582,7 @@ impl StreamDescriptor {
                 tracing::warn!(%url, error = %e, ?elapsed, "liveness check request error");
                 let is_timeout = e.is_timeout() || elapsed >= std::time::Duration::from_millis(8000);
                 if is_timeout {
-                    trip_preemptive_circuit_breaker(None, "liveness check timed out");
+                    record_upstream_timeout("liveness check timed out");
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
                 } else {
                     STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));

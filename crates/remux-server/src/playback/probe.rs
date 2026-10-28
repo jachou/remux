@@ -1750,7 +1750,7 @@ where
             }
             Err(_) => {
                 warn!(url = %url, timeout = timeout_secs, "probe timed out");
-                crate::stream::trip_preemptive_circuit_breaker(None, "probe timed out");
+                crate::stream::record_upstream_timeout("probe timed out");
             }
         }
 

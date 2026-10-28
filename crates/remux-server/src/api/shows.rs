@@ -256,82 +256,18 @@ pub async fn shows_episodes(
 }
 
 fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a api::BaseItemDto> {
-    let now = chrono::Utc::now();
-    let regular_released: Vec<&'a api::BaseItemDto> = items
+    // Only pre-emptively probe an episode from the season list if it is actively in-progress.
+    // Series-level next-up/unplayed episodes are already accurately probed by `shows_seasons`.
+    // Probing episode 1 of unplayed seasons during bulk season fetching floods upstream APIs.
+    items
         .iter()
         .filter(|i| {
-            let is_regular = i.parent_index_number.map_or(true, |s| s > 0);
-            let is_released = i.premiere_date.map_or(true, |d| d <= now);
-            is_regular && is_released
-        })
-        .collect();
-
-    let pool: Vec<&'a api::BaseItemDto> = if !regular_released.is_empty() {
-        regular_released
-    } else {
-        items
-            .iter()
-            .filter(|i| i.premiere_date.map_or(true, |d| d <= now))
-            .collect()
-    };
-
-    if pool.is_empty() {
-        return Vec::new();
-    }
-
-    // 1. Check for in-progress episode
-    if let Some(pos) = pool.iter().position(|i| {
-        i.user_data
-            .as_ref()
-            .map_or(false, |u| !u.played && u.playback_position_ticks > 0)
-    }) {
-        return pool[pos..].iter().take(1).copied().collect();
-    }
-
-    // 2. Check for most recently played episode
-    if let Some((_, last_played_item)) = pool
-        .iter()
-        .filter_map(|i| {
             i.user_data
                 .as_ref()
-                .and_then(|u| u.last_played_date)
-                .map(|d| (d, *i))
+                .map_or(false, |u| !u.played && u.playback_position_ticks > 0)
         })
-        .max_by_key(|(d, _)| *d)
-    {
-        if let Some(pos) = pool.iter().position(|i| i.id == last_played_item.id) {
-            let start = if last_played_item.user_data.as_ref().map_or(false, |u| u.played) {
-                pos + 1
-            } else {
-                pos
-            };
-            if start < pool.len() {
-                let targets: Vec<&'a api::BaseItemDto> = pool[start..]
-                    .iter()
-                    .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
-                    .take(1)
-                    .copied()
-                    .collect();
-                if !targets.is_empty() {
-                    return targets;
-                }
-            }
-        }
-    }
-
-    // 3. Fallback: first unplayed regular episode from the start
-    let unplayed: Vec<&'a api::BaseItemDto> = pool
-        .iter()
-        .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
         .take(1)
-        .copied()
-        .collect();
-
-    if !unplayed.is_empty() {
-        unplayed
-    } else {
-        pool.iter().take(1).copied().collect()
-    }
+        .collect()
 }
 
 fn is_unreleased_episode(ep: &db::Media, threshold: chrono::NaiveDateTime) -> bool {
@@ -2815,116 +2751,79 @@ pub(crate) mod test {
     }
 
     #[test]
-    fn select_preemptive_probe_targets_prefers_regular_season_over_specials() {
-        let special_ep = api::BaseItemDto {
+    fn select_preemptive_probe_targets_probes_in_progress_episode() {
+        let in_progress_ep = api::BaseItemDto {
             id: uuid::Uuid::new_v4(),
-            name: Some("Special Ep 1".to_string()),
-            parent_index_number: Some(0),
-            user_data: Some(api::UserItemDataDto {
-                played: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let reg_ep1 = api::BaseItemDto {
-            id: uuid::Uuid::new_v4(),
-            name: Some("S1 Episode 1".to_string()),
+            name: Some("In-Progress Ep".to_string()),
             parent_index_number: Some(1),
             user_data: Some(api::UserItemDataDto {
                 played: false,
+                playback_position_ticks: 5000,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let reg_ep2 = api::BaseItemDto {
+        let unplayed_ep = api::BaseItemDto {
             id: uuid::Uuid::new_v4(),
-            name: Some("S1 Episode 2".to_string()),
+            name: Some("Unplayed Ep".to_string()),
             parent_index_number: Some(1),
             user_data: Some(api::UserItemDataDto {
                 played: false,
+                playback_position_ticks: 0,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let items = vec![special_ep, reg_ep1.clone(), reg_ep2.clone()];
+        let items = vec![in_progress_ep.clone(), unplayed_ep];
         let targets = super::select_preemptive_probe_targets(&items);
         assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].id, reg_ep1.id);
+        assert_eq!(targets[0].id, in_progress_ep.id);
     }
 
     #[test]
-    fn select_preemptive_probe_targets_skips_played_regular_episodes() {
-        let special_ep = api::BaseItemDto {
+    fn select_preemptive_probe_targets_skips_unplayed_seasons() {
+        let ep1 = api::BaseItemDto {
             id: uuid::Uuid::new_v4(),
-            name: Some("Special Ep 1".to_string()),
-            parent_index_number: Some(0),
+            name: Some("S2 Episode 1".to_string()),
+            parent_index_number: Some(2),
             user_data: Some(api::UserItemDataDto {
                 played: false,
+                playback_position_ticks: 0,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let reg_ep1 = api::BaseItemDto {
+        let ep2 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S2 Episode 2".to_string()),
+            parent_index_number: Some(2),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                playback_position_ticks: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = vec![ep1, ep2];
+        let targets = super::select_preemptive_probe_targets(&items);
+        assert!(targets.is_empty(), "Should not probe unplayed seasons on bulk season fetching");
+    }
+
+    #[test]
+    fn select_preemptive_probe_targets_skips_played_episodes() {
+        let ep1 = api::BaseItemDto {
             id: uuid::Uuid::new_v4(),
             name: Some("S1 Episode 1".to_string()),
             parent_index_number: Some(1),
             user_data: Some(api::UserItemDataDto {
                 played: true,
+                playback_position_ticks: 0,
                 ..Default::default()
             }),
             ..Default::default()
         };
-        let reg_ep2 = api::BaseItemDto {
-            id: uuid::Uuid::new_v4(),
-            name: Some("S1 Episode 2".to_string()),
-            parent_index_number: Some(1),
-            user_data: Some(api::UserItemDataDto {
-                played: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let reg_ep3 = api::BaseItemDto {
-            id: uuid::Uuid::new_v4(),
-            name: Some("S1 Episode 3".to_string()),
-            parent_index_number: Some(1),
-            user_data: Some(api::UserItemDataDto {
-                played: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let items = vec![special_ep, reg_ep1, reg_ep2.clone(), reg_ep3.clone()];
+        let items = vec![ep1];
         let targets = super::select_preemptive_probe_targets(&items);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].id, reg_ep2.id);
-    }
-
-    #[test]
-    fn select_preemptive_probe_targets_falls_back_when_only_specials_present() {
-        let special_ep1 = api::BaseItemDto {
-            id: uuid::Uuid::new_v4(),
-            name: Some("Special Ep 1".to_string()),
-            parent_index_number: Some(0),
-            user_data: Some(api::UserItemDataDto {
-                played: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let special_ep2 = api::BaseItemDto {
-            id: uuid::Uuid::new_v4(),
-            name: Some("Special Ep 2".to_string()),
-            parent_index_number: Some(0),
-            user_data: Some(api::UserItemDataDto {
-                played: false,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-        let items = vec![special_ep1.clone(), special_ep2.clone()];
-        let targets = super::select_preemptive_probe_targets(&items);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(targets[0].id, special_ep1.id);
+        assert!(targets.is_empty());
     }
 }

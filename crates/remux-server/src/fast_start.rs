@@ -490,7 +490,7 @@ pub async fn prewarm_fast_start(
                 METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
                 warn!(%original_url, error = %e, "[FAST-START] Direct-307 resolution request failed");
                 if e.is_timeout() {
-                    crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 timeout");
+                    crate::stream::record_upstream_timeout("fast-start direct-307 timeout");
                 }
                 return false;
             }
@@ -501,7 +501,13 @@ pub async fn prewarm_fast_start(
             || status == StatusCode::GATEWAY_TIMEOUT
             || status == StatusCode::SERVICE_UNAVAILABLE
         {
-            crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 rate-limit/gateway error");
+            let retry_after = head_resp
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<u64>().ok())
+                .map(std::time::Duration::from_secs);
+            crate::stream::trip_preemptive_circuit_breaker(retry_after, "fast-start direct-307 rate-limit/gateway error");
             crate::stream::STREAM_LIVENESS_CACHE.insert(
                 original_url.to_string(),
                 crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
@@ -522,13 +528,17 @@ pub async fn prewarm_fast_start(
         let is_tiny = total_size > 0 && total_size < 2 * 1024 * 1024;
         if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) || is_tiny {
             warn!(%original_url, direct_url = %direct_cdn_url, total_size, "[FAST-START] Upstream resolved to error video URL or tiny payload; marking dead");
-            crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 error video URL");
+            if crate::stream::is_upstream_rate_limit_url(&direct_cdn_url) || crate::stream::is_upstream_rate_limit_url(original_url) {
+                crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 rate-limit video URL");
+            }
             crate::stream::STREAM_LIVENESS_CACHE.insert(
                 original_url.to_string(),
                 crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
             );
             return false;
         }
+
+        crate::stream::record_upstream_success();
 
         crate::stream::STREAM_LIVENESS_CACHE.insert(
             original_url.to_string(),
@@ -692,7 +702,7 @@ pub async fn prewarm_fast_start(
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
             warn!(%original_url, error = %e, "[FAST-START] Pre-warm head request failed");
             if e.is_timeout() {
-                crate::stream::trip_preemptive_circuit_breaker(None, "fast-start head request timeout");
+                crate::stream::record_upstream_timeout("fast-start head request timeout");
                 crate::stream::STREAM_LIVENESS_CACHE.insert(
                     original_url.to_string(),
                     crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
@@ -709,7 +719,7 @@ pub async fn prewarm_fast_start(
         Err(_) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
             warn!(%original_url, timeout_secs = prewarm_timeout_secs, "[FAST-START] Pre-warm head request timed out");
-            crate::stream::trip_preemptive_circuit_breaker(None, "fast-start head request timed out");
+            crate::stream::record_upstream_timeout("fast-start head request timed out");
             crate::stream::STREAM_LIVENESS_CACHE.insert(
                 original_url.to_string(),
                 crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
@@ -727,7 +737,13 @@ pub async fn prewarm_fast_start(
         || status == StatusCode::GATEWAY_TIMEOUT
         || status == StatusCode::SERVICE_UNAVAILABLE
     {
-        crate::stream::trip_preemptive_circuit_breaker(None, "fast-start pre-warm rate-limit/gateway error");
+        let retry_after = head_resp
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs);
+        crate::stream::trip_preemptive_circuit_breaker(retry_after, "fast-start pre-warm rate-limit/gateway error");
         crate::stream::STREAM_LIVENESS_CACHE.insert(
             original_url.to_string(),
             crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
@@ -777,7 +793,9 @@ pub async fn prewarm_fast_start(
             total_size,
             "[FAST-START] Upstream resolved to error placeholder video URL or tiny payload; marking dead"
         );
-        crate::stream::trip_preemptive_circuit_breaker(None, "fast-start upstream error placeholder video detected");
+        if crate::stream::is_upstream_rate_limit_url(&direct_cdn_url) || crate::stream::is_upstream_rate_limit_url(original_url) {
+            crate::stream::trip_preemptive_circuit_breaker(None, "fast-start upstream rate-limit video detected");
+        }
         crate::stream::STREAM_LIVENESS_CACHE.insert(
             original_url.to_string(),
             crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
@@ -786,6 +804,8 @@ pub async fn prewarm_fast_start(
         notify.notify_waiters();
         return false;
     }
+
+    crate::stream::record_upstream_success();
 
     // Stream responded with 200/206 and valid size: populate STREAM_LIVENESS_CACHE immediately so liveness checks are instant
     crate::stream::STREAM_LIVENESS_CACHE.insert(
