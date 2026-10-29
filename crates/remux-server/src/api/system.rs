@@ -117,10 +117,15 @@ pub async fn system_ping(State(state): State<AppState>) -> Result<impl IntoRespo
     Ok(Json(json!("Remux Server")))
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct IsHealthCheck;
+
 /// Healthcheck endpoint for orchestrators (e.g. docker compose)
 #[get("/health")]
-pub async fn health() -> &'static str {
-    "Healthy"
+pub async fn health() -> impl IntoResponse {
+    let mut resp = "Healthy".into_response();
+    resp.extensions_mut().insert(IsHealthCheck);
+    resp
 }
 
 #[get("/web/manifest.json")]
@@ -900,6 +905,20 @@ mod test {
     use axum_test::expect_json;
     use http::header::HeaderValue;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn health_endpoint_test() {
+        let (server, _ctx) = new_test_server()
+            .await
+            .unwrap();
+
+        let resp = server
+            .get("/health")
+            .await;
+
+        resp.assert_status_ok();
+        assert_eq!(resp.text(), "Healthy");
+    }
 
     #[tokio::test]
     async fn web_manifest_test() {

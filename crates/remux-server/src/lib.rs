@@ -35,7 +35,7 @@ use tower_http::{
     cors::{Any, CorsLayer},
     services::{ServeDir, ServeFile},
 };
-use tracing::{self, debug, error, info, instrument, warn};
+use tracing::{self, debug, error, info, instrument, trace, warn};
 use tracing_subscriber::{
     EnvFilter, Layer as TracingLayer, fmt, layer::SubscriberExt,
     util::SubscriberInitExt,
@@ -465,10 +465,22 @@ pub async fn init_app(
                         Some(q) => format!("{path}?{q}"),
                         None => path.to_string(),
                     };
-                    debug!(target: "remux_server::request", method = %request.method(), uri = %full, "→");
+                    if path == "/health" || path == "/health/" {
+                        trace!(target: "remux_server::request", method = %request.method(), uri = %full, "→");
+                    } else {
+                        debug!(target: "remux_server::request", method = %request.method(), uri = %full, "→");
+                    }
                 })
                 .on_response(|response: &axum::http::Response<axum::body::Body>, latency: std::time::Duration, _span: &tracing::Span| {
-                    debug!(target: "remux_server::request", status = %response.status().as_u16(), latency_ms = %latency.as_millis(), "←");
+                    let is_health = response
+                        .extensions()
+                        .get::<crate::api::system::IsHealthCheck>()
+                        .is_some();
+                    if is_health && response.status().is_success() {
+                        trace!(target: "remux_server::request", status = %response.status().as_u16(), latency_ms = %latency.as_millis(), "←");
+                    } else {
+                        debug!(target: "remux_server::request", status = %response.status().as_u16(), latency_ms = %latency.as_millis(), "←");
+                    }
                 })
                 .on_failure(()),
         )
