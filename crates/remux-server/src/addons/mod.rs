@@ -3363,7 +3363,7 @@ impl AddonService {
 
         // Fast path 2: If existing streams are already in DB and candidate #1 is confirmed alive
         // (or warm in Fast-Start RAM cache), skip the slow synchronous upstream scrape.
-        let existing = media.streams(&ctx.db).await.unwrap_or_default();
+        let mut existing = media.streams(&ctx.db).await.unwrap_or_default();
         if let Some(primary) = existing.first() {
             let candidate_alive = if let Some(si) = &primary.stream_info {
                 match &si.descriptor {
@@ -3396,6 +3396,10 @@ impl AddonService {
                     .execute(&ctx.db)
                     .await;
                 media.streams_refreshed_at = Some(now);
+                for s in &mut existing {
+                    s.updated_at = now;
+                }
+                media.sources = Some(existing);
                 debug!(
                     title = %media.title,
                     "existing stream candidate is warm and alive; skipping blocking addon scrape"
@@ -3403,6 +3407,10 @@ impl AddonService {
                 return Ok(());
             }
         }
+
+        // Fast path 2 was not taken — reset cached sources so caller or concurrent
+        // tasks never see stale or empty pre-scrape stream state.
+        media.sources = None;
 
         // Acquire per-media lock to prevent concurrent refreshes.
         let _guard = STREAM_LOCKS
@@ -3421,6 +3429,8 @@ impl AddonService {
         .flatten();
         if is_fresh(refreshed_at) {
             media.streams_refreshed_at = refreshed_at;
+            media.sources = None;
+            let _ = media.streams(&ctx.db).await;
             return Ok(());
         }
 
@@ -3523,6 +3533,8 @@ impl AddonService {
         };
         info!(streams = deduped.len(), ?sources, elapsed = ?instant.elapsed(), "streams synced");
         if deduped.is_empty() {
+            media.sources = None;
+            let _ = media.streams(&ctx.db).await;
             return Ok(());
         }
 
@@ -3575,6 +3587,9 @@ impl AddonService {
         .bind(media.id)
         .execute(&ctx.db)
         .await?;
+
+        media.sources = None;
+        let _ = media.streams(&ctx.db).await;
         Ok(())
     }
 
@@ -5095,5 +5110,88 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(AddonService::stream_cache_ttl_secs(&no_date_media), 12 * 3600);
+    }
+
+    struct MockRefreshStreamAddon;
+
+    #[async_trait]
+    impl StreamAddon for MockRefreshStreamAddon {
+        fn supports(&self, _media: &db::Media) -> bool {
+            true
+        }
+        async fn get_streams(
+            &self,
+            _media: &db::Media,
+            _ctx: &AppContext,
+            _id_prefixes: Option<&[String]>,
+        ) -> Result<Vec<crate::stream::StreamInfo>> {
+            Ok(vec![crate::stream::StreamInfo {
+                descriptor: crate::stream::StreamDescriptor::Http {
+                    url: "http://example.com/test_movie.mkv".to_string(),
+                    request_headers: Default::default(),
+                    response_headers: Default::default(),
+                },
+                filename: Some("test_movie.mkv".to_string()),
+                ..Default::default()
+            }])
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_streams_populates_sources_for_cold_item() {
+        use crate::integration_test::authenticated_server;
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+
+        let now = chrono::Utc::now().naive_utc();
+        let runtime = AddonRuntime {
+            row: addon::Addon {
+                id: Uuid::new_v4(),
+                name: "mock-stream-addon".into(),
+                preset: AddonPresetRef {
+                    kind: "scripted".into(),
+                    config: serde_json::Value::Null.into(),
+                },
+                resources: vec![ResourceType::Stream],
+                types: vec![],
+                enabled: true,
+                priority: 0,
+                created_at: now,
+                updated_at: now,
+                system: true,
+                is_default: false,
+                http_redirect_stream: false,
+                subtitle_extraction: false,
+                probe_on_scan: false,
+                service_filter: vec![],
+            },
+            caps: AddonCapabilities {
+                stream: Some(std::sync::Arc::new(MockRefreshStreamAddon)),
+                ..Default::default()
+            },
+        };
+
+        let service = AddonService {
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(vec![runtime])),
+        };
+
+        let mut movie = crate::integration_test::seed_movie(ctx).await;
+
+        assert!(movie.sources.is_none());
+
+        service.refresh_streams(&mut movie, ctx, None).await.unwrap();
+
+        // Regression check: media.sources must be populated and not left as empty Some(vec![])
+        assert!(
+            movie.sources.is_some(),
+            "refresh_streams must populate media.sources"
+        );
+        let expected_stream_id = movie.sources.as_ref().unwrap()[0].id;
+        assert_eq!(movie.sources.as_ref().unwrap().len(), 1, "expected 1 synced stream");
+
+        // Subsequent media.streams() call must return the freshly populated streams
+        let from_db = movie.streams(&ctx.db).await.unwrap();
+        assert_eq!(from_db.len(), 1);
+        assert_eq!(from_db[0].id, expected_stream_id);
     }
 }
