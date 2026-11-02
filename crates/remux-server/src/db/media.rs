@@ -1090,6 +1090,9 @@ impl ExternalIds {
             }
         }
         if !id.is_empty() {
+            if id.starts_with("aiostreamserror.") || id.starts_with("error:") {
+                return Self::default();
+            }
             return Self {
                 custom_stremio_id: Some(id.to_string()),
                 ..Default::default()
@@ -1316,11 +1319,20 @@ impl ExternalIds {
         merge_option(&mut self.youtube_id, &source.youtube_id, replace);
         merge_option(&mut self.iptv_source_id, &source.iptv_source_id, replace);
         merge_option(&mut self.iptv_group, &source.iptv_group, replace);
-        merge_option(
-            &mut self.custom_stremio_id,
-            &source.custom_stremio_id,
-            replace,
-        );
+        if let Some(ref cid) = self.custom_stremio_id {
+            if cid.starts_with("aiostreamserror.") || cid.starts_with("error:") {
+                self.custom_stremio_id = None;
+            }
+        }
+        if let Some(ref cid) = source.custom_stremio_id {
+            if !cid.starts_with("aiostreamserror.") && !cid.starts_with("error:") {
+                merge_option(
+                    &mut self.custom_stremio_id,
+                    &source.custom_stremio_id,
+                    replace,
+                );
+            }
+        }
         merge_option(
             &mut self.custom_stremio_type,
             &source.custom_stremio_type,

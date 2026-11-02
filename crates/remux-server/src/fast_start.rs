@@ -933,7 +933,7 @@ pub async fn prewarm_fast_start(
         Ok(b) => b,
         Err(e) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
-            warn!(%original_url, error = %e, "[FAST-START] Failed reading head response body");
+            warn!(%original_url, error = %e, "[FAST-START] Failed reading head response body (falling back to direct CDN streaming)");
             return false;
         }
     };
@@ -956,40 +956,54 @@ pub async fn prewarm_fast_start(
                 let start_byte = target_offset.saturating_sub(preroll_bytes).max(head_bytes.len() as u64);
                 let end_byte = (start_byte + target_resume_buffer_size as u64 - 1).min(total_size - 1);
                 let resume_range = format!("bytes={}-{}", start_byte, end_byte);
-                let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
-                for (k, v) in request_headers {
-                    res_req = res_req.header(k.as_str(), v.as_str());
-                }
-                res_req = res_req.header(header::RANGE, resume_range);
+                let mut resume_res: Option<(u64, Bytes)> = None;
+                for attempt in 1..=2 {
+                    let mut res_req = PREWARM_CLIENT.get(&direct_cdn_url);
+                    for (k, v) in request_headers {
+                        res_req = res_req.header(k.as_str(), v.as_str());
+                    }
+                    res_req = res_req.header(header::RANGE, resume_range.clone());
 
-                match res_req.send().await {
-                    Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
-                        match r.bytes().await {
-                            Ok(b) => {
-                                info!(
-                                    %original_url,
-                                    start_byte,
-                                    end_byte,
-                                    resume_size_bytes = b.len(),
-                                    "[FAST-START] Successfully pre-warmed resume chunk into RAM"
-                                );
-                                Some((start_byte, b))
-                            }
-                            Err(e) => {
-                                warn!(%original_url, error = %e, "[FAST-START] Failed reading resume chunk body");
-                                None
+                    match res_req.send().await {
+                        Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
+                            match r.bytes().await {
+                                Ok(b) => {
+                                    info!(
+                                        %original_url,
+                                        start_byte,
+                                        end_byte,
+                                        resume_size_bytes = b.len(),
+                                        attempt,
+                                        "[FAST-START] Successfully pre-warmed resume chunk into RAM"
+                                    );
+                                    resume_res = Some((start_byte, b));
+                                    break;
+                                }
+                                Err(e) => {
+                                    if attempt < 2 {
+                                        tracing::debug!(%original_url, error = %e, "[FAST-START] Resume chunk read failed, retrying once...");
+                                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                        continue;
+                                    }
+                                    warn!(%original_url, error = %e, "[FAST-START] Failed reading resume chunk body");
+                                }
                             }
                         }
-                    }
-                    Ok(r) => {
-                        warn!(%original_url, status = ?r.status(), "[FAST-START] Resume fetch returned non-206 status");
-                        None
-                    }
-                    Err(e) => {
-                        warn!(%original_url, error = %e, "[FAST-START] Resume fetch request error");
-                        None
+                        Ok(r) => {
+                            warn!(%original_url, status = ?r.status(), "[FAST-START] Resume fetch returned non-206 status");
+                            break;
+                        }
+                        Err(e) => {
+                            if attempt < 2 {
+                                tracing::debug!(%original_url, error = %e, "[FAST-START] Resume fetch request error, retrying once...");
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                continue;
+                            }
+                            warn!(%original_url, error = %e, "[FAST-START] Resume fetch request error");
+                        }
                     }
                 }
+                resume_res
             } else {
                 None
             }

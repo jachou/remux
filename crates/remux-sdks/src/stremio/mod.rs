@@ -595,10 +595,16 @@ impl Meta {
     }
 
     pub fn is_error(&self) -> bool {
+        if self.id.starts_with("aiostreamserror.") || self.id.starts_with("error:") {
+            return true;
+        }
         let name = self
             .get_name()
             .unwrap_or_default();
-        name.starts_with("[✗]") || name.starts_with("[❌]") || name.starts_with("[X]")
+        name.starts_with("[✗]")
+            || name.starts_with("[❌]")
+            || name.starts_with("[X]")
+            || name.to_lowercase().contains("rate limit")
     }
 }
 
@@ -1361,5 +1367,24 @@ mod tests {
         let valid_stream: Stream = serde_json::from_str(valid_json).unwrap();
         assert!(!valid_stream.is_error());
         assert!(valid_stream.is_valid());
+    }
+
+    #[test]
+    fn meta_is_error_with_aiostreamserror_or_rate_limit() {
+        let err_meta_json = r#"{
+            "id": "aiostreamserror.%7B%22errorTitle%22%3A%22%5B%E2%9D%8C%5D%20AIOMetadata%22%2C%22errorDescription%22%3A%22429%20-%20Too%20Many%20Requests%22%7D",
+            "type": "movie",
+            "name": "429 - Too Many Requests"
+        }"#;
+        let err_meta: Meta = serde_json::from_str(err_meta_json).unwrap();
+        assert!(err_meta.is_error());
+
+        let valid_meta_json = r#"{
+            "id": "tt0133093",
+            "type": "movie",
+            "name": "The Matrix"
+        }"#;
+        let valid_meta: Meta = serde_json::from_str(valid_meta_json).unwrap();
+        assert!(!valid_meta.is_error());
     }
 }
