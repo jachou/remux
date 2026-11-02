@@ -154,7 +154,14 @@ impl StremioService {
                     kind: media_type,
                     id: id.into(),
                 })
-                .with_cache(Duration::from_secs(300)),
+                .with_cache(Duration::from_secs(300))
+                .should_cache(|response: &sdks::stremio::StreamsResponse| {
+                    let has_valid = response
+                        .streams
+                        .iter()
+                        .any(|s| s.is_valid() && !s.is_error());
+                    has_valid.then_some(Duration::from_secs(300))
+                }),
             )
             .await?
             .streams)

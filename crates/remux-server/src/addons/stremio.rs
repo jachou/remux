@@ -1859,6 +1859,27 @@ async fn stremio_streams(
             .await
         {
             Ok(s) => {
+                let has_error = s.iter().any(|st| st.is_error());
+                let has_valid = s.iter().any(|st| st.is_valid());
+                if has_error && !has_valid {
+                    let err_msg = s
+                        .iter()
+                        .find_map(|st| {
+                            if st.is_error() {
+                                st.description.clone().or_else(|| st.name.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_else(|| "upstream stremio error stream".to_string());
+                    if err_msg.to_lowercase().contains("rate limit") {
+                        crate::stream::trip_preemptive_circuit_breaker(
+                            Some(std::time::Duration::from_secs(15)),
+                            "upstream stremio stream rate limit",
+                        );
+                    }
+                    return Err(anyhow!("upstream stremio error: {}", err_msg));
+                }
                 streams_opt = Some(s);
                 break;
             }

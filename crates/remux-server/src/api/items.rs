@@ -1834,16 +1834,18 @@ async fn item_for_user(
         let user_id = session.user.id;
         let ctx = state.ctx.clone();
         tokio::spawn(async move {
+            // Only pre-emptively probe an episode from the season if it is actively in-progress.
+            // Series-level next-up/unplayed episodes are already accurately probed by `shows_seasons`.
+            // Probing episode 1 of unplayed seasons during bulk season fetching floods upstream APIs.
             if let Ok(Some(next_ep_id)) = sqlx::query_scalar::<_, Uuid>(
                 "SELECT m.id FROM media m \
                  LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
                  WHERE m.parent_id = ?2 \
                    AND m.kind = 'episode' \
                    AND COALESCE(ums.play_count, 0) = 0 \
+                   AND COALESCE(ums.playback_position, 0) > 0 \
                    AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
-                 ORDER BY \
-                   CASE WHEN COALESCE(ums.playback_position, 0) > 0 THEN 0 ELSE 1 END ASC, \
-                   COALESCE(m.idx, 9999) ASC \
+                 ORDER BY COALESCE(m.idx, 9999) ASC \
                  LIMIT 1",
             )
             .bind(user_id)

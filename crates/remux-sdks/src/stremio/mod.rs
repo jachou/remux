@@ -1017,12 +1017,35 @@ impl Stream {
             .as_deref()
     }
 
+    pub fn is_error(&self) -> bool {
+        if let Some(ref data) = self.stream_data {
+            if data.kind.as_deref() == Some("error") {
+                return true;
+            }
+        }
+        if let Some(ref name) = self.name {
+            if name.starts_with("[✗]") || name.starts_with("[❌]") || name.starts_with("[X]") {
+                return true;
+            }
+        }
+        if let Some(ref desc) = self.description {
+            if desc.to_lowercase().contains("rate limit") {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn is_torrent(&self) -> bool {
         self.info_hash
             .is_some()
     }
 
     pub fn is_valid(&self) -> bool {
+        if self.is_error() {
+            return false;
+        }
+
         if self
             .info_hash
             .is_some()
@@ -1310,5 +1333,33 @@ mod tests {
                 end: 2025
             }
         );
+    }
+
+    #[test]
+    fn stream_is_error_and_is_valid() {
+        let err_json = r#"{
+            "name": "[❌] AIOStreams",
+            "description": "Rate Limit Exceeded",
+            "externalUrl": "https://github.com/Viren070/AIOStreams",
+            "streamData": {
+                "type": "error",
+                "error": {
+                    "title": "[❌] AIOStreams",
+                    "description": "Rate Limit Exceeded"
+                }
+            }
+        }"#;
+        let err_stream: Stream = serde_json::from_str(err_json).unwrap();
+        assert!(err_stream.is_error());
+        assert!(!err_stream.is_valid());
+
+        let valid_json = r#"{
+            "name": "[TB⚡] Torrentio",
+            "title": "Movie 1080p",
+            "url": "https://torbox.app/stream/test.mkv"
+        }"#;
+        let valid_stream: Stream = serde_json::from_str(valid_json).unwrap();
+        assert!(!valid_stream.is_error());
+        assert!(valid_stream.is_valid());
     }
 }
