@@ -799,7 +799,13 @@ pub async fn get_items(
 
     // Safety cap: if an unbounded or top-level query omitted limit, default to 250
     // so an unpaged query never triggers an unbounded full-table scan on hundreds of thousands of items.
-    if q.limit.is_none() {
+    let is_scoped = (q.parent_id.is_some() && q.parent_id != Some(VIRTUAL_ROOT_ID))
+        || q.series_id.is_some()
+        || q.season_id.is_some()
+        || q.ids.is_some()
+        || q.album_ids.is_some()
+        || q.artist_ids.is_some();
+    if q.limit.is_none() && !is_scoped {
         q.limit = Some(250);
     }
 

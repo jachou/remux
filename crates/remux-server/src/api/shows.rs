@@ -2826,4 +2826,31 @@ pub(crate) mod test {
         let targets = super::select_preemptive_probe_targets(&items);
         assert!(targets.is_empty());
     }
+
+    #[tokio::test]
+    async fn shows_episodes_unbounded_by_default_limit_for_large_series() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard.0.db;
+
+        let titles: Vec<String> = (1..=260).map(|i| format!("Episode {i}")).collect();
+        let title_refs: Vec<&str> = titles.iter().map(|s| s.as_str()).collect();
+        let (series, _episodes) = test::insert_series_with_episodes(db, "Large Series", &title_refs).await;
+
+        let resp = server
+            .get(&format!("/shows/{}/episodes", series.id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(body["TotalRecordCount"], 260);
+        assert_eq!(body["Items"].as_array().unwrap().len(), 260);
+    }
 }
