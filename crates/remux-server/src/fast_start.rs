@@ -982,7 +982,7 @@ pub async fn prewarm_fast_start(
                                 Err(e) => {
                                     if attempt < 2 {
                                         tracing::debug!(%original_url, error = %e, "[FAST-START] Resume chunk read failed, retrying once...");
-                                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                         continue;
                                     }
                                     warn!(%original_url, error = %e, "[FAST-START] Failed reading resume chunk body");
@@ -996,7 +996,7 @@ pub async fn prewarm_fast_start(
                         Err(e) => {
                             if attempt < 2 {
                                 tracing::debug!(%original_url, error = %e, "[FAST-START] Resume fetch request error, retrying once...");
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                                 continue;
                             }
                             warn!(%original_url, error = %e, "[FAST-START] Resume fetch request error");
