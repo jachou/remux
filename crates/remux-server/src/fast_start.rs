@@ -1430,22 +1430,23 @@ pub async fn handle_playback_request(
     headers: &HeaderMap,
     upstream_headers: Option<&HashMap<String, String>>,
 ) -> Option<Response> {
-    if is_remote_client(headers) {
-        METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
-        info!(
-            %item_id,
-            %url,
-            "[FAST-START] Remote client detected: redirecting directly to upstream resolver from byte 0 (307)"
-        );
-        let mut redirect = Redirect::temporary(url).into_response();
-        redirect.headers_mut().insert(
-            "X-Remux-FastStart",
-            HeaderValue::from_static("remote-direct-resolver"),
-        );
-        return Some(redirect);
-    }
+    let is_remote = is_remote_client(headers);
 
     if is_force_direct_307() {
+        if is_remote {
+            METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            info!(
+                %item_id,
+                %url,
+                "[FAST-START] FORCE_DIRECT_307=true (remote): redirecting directly to upstream resolver (307)"
+            );
+            let mut redirect = Redirect::temporary(url).into_response();
+            redirect.headers_mut().insert(
+                "X-Remux-FastStart",
+                HeaderValue::from_static("remote-direct-resolver"),
+            );
+            return Some(redirect);
+        }
         if let Some(entry) = FAST_START_CACHE.get(url) {
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -1480,6 +1481,14 @@ pub async fn handle_playback_request(
     }
 
     if is_browser_video_request(headers) {
+        if is_remote {
+            let mut redirect = Redirect::temporary(url).into_response();
+            redirect.headers_mut().insert(
+                "X-Remux-FastStart",
+                HeaderValue::from_static("remote-direct-resolver-browser"),
+            );
+            return Some(redirect);
+        }
         if let Some(entry) = FAST_START_CACHE.get(url) {
             info!(
                 %item_id,
@@ -1528,7 +1537,23 @@ pub async fn handle_playback_request(
         }
 
         if entry.is_none() {
-            // Uncached and nothing in-flight: don't block this request.
+            // For remote clients, do not stall on uncached items: immediately 307 to upstream resolver
+            if is_remote {
+                METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    %item_id,
+                    %url,
+                    "[FAST-START] Remote client request uncached: redirecting directly to upstream resolver from byte 0 (307)"
+                );
+                let mut redirect = Redirect::temporary(url).into_response();
+                redirect.headers_mut().insert(
+                    "X-Remux-FastStart",
+                    HeaderValue::from_static("remote-direct-resolver-uncached"),
+                );
+                return Some(redirect);
+            }
+
+            // Uncached and nothing in-flight (LAN): don't block this request.
             // Spawn pre-warm in background for this exact URL so subsequent seeks benefit, but immediately fall through to 307 redirect.
             info!(%item_id, %url, "[FAST-START] Uncached & not in-flight: spawning background pre-warm and immediately falling back to direct redirect");
             let url_str = url.to_string();
@@ -1681,16 +1706,19 @@ pub async fn handle_playback_request(
                 }
             }
 
-            // Fall through to direct CDN redirect if tail is missing or sub-range not covered
+            // Fall through to direct redirect if tail is missing or sub-range not covered
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            let redirect_target = if is_remote { url } else { &entry.direct_cdn_url };
             info!(
                 %item_id,
                 range = %rng,
-                direct_cdn = %entry.direct_cdn_url,
-                "[FAST-START] Redirecting tail request directly to Debrid CDN (307)"
+                target = %redirect_target,
+                is_remote,
+                "[FAST-START] Redirecting tail request (307)"
             );
-            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
-            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static("redirect-direct-cdn"));
+            let mut redirect = Redirect::temporary(redirect_target).into_response();
+            let header_tag = if is_remote { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }
 
@@ -1739,31 +1767,39 @@ pub async fn handle_playback_request(
                 }
             }
 
-            // Fall through to direct CDN redirect if resume chunk doesn't cover
+            // Fall through to redirect if resume chunk doesn't cover
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            let redirect_target = if is_remote { url } else { &entry.direct_cdn_url };
             info!(
                 %item_id,
                 range = %rng,
-                direct_cdn = %entry.direct_cdn_url,
-                "[FAST-START] Resume range miss: redirecting to Debrid CDN (307)"
+                target = %redirect_target,
+                is_remote,
+                "[FAST-START] Resume range miss: redirecting (307)"
             );
-            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
-            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static("redirect-direct-cdn"));
+            let mut redirect = Redirect::temporary(redirect_target).into_response();
+            let header_tag = if is_remote { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }
 
         // Case 5: Video cluster stream / seek / continuous playback
-        // Issue 307 Temporary Redirect DIRECTLY to Debrid CDN edge
+        // Issue 307 Temporary Redirect:
+        // - For remote clients: to upstream resolver URL (mints CDN token for remote IP)
+        // - For LAN clients: DIRECTLY to Debrid CDN edge (skips resolver 302 hop)
         Some(rng) => {
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+            let redirect_target = if is_remote { url } else { &entry.direct_cdn_url };
             info!(
                 %item_id,
                 range = %rng,
-                direct_cdn = %entry.direct_cdn_url,
-                "[FAST-START] Direct CDN handoff: issuing 307 directly to CDN edge (0 Mbps server upload)"
+                target = %redirect_target,
+                is_remote,
+                "[FAST-START] Direct handoff outside buffer: issuing 307 redirect"
             );
-            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
-            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static("redirect-direct-cdn"));
+            let mut redirect = Redirect::temporary(redirect_target).into_response();
+            let header_tag = if is_remote { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }
     }

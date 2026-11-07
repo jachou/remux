@@ -1611,6 +1611,7 @@ async fn videos_stream_inner(
     if q.static_
         .unwrap_or(false)
         || resolved_codecs.direct_play_only
+        || crate::fast_start::is_remote_client(&headers)
     {
         record_served(ServedPlayback::Direct);
         // If the producing addon has http_redirect_stream enabled, issue a 302
@@ -1641,14 +1642,14 @@ async fn videos_stream_inner(
                     })
                     .unwrap_or(false)
             {
-                if crate::fast_start::is_remote_client(&headers) {
-                    tracing::info!(item = %id, url = %url, "remote client detected: redirecting directly to upstream resolver (307)");
-                    return Ok(axum::response::Redirect::temporary(url).into_response());
-                }
-
-                // Fast-Start acceleration: serve head/tail buffer from RAM, or redirect directly to CDN
+                // Fast-Start acceleration: serve head/tail buffer from RAM, or redirect directly to CDN/resolver
                 if let Some(resp) = crate::fast_start::handle_playback_request(id, url, &headers, Some(request_headers)).await {
                     return Ok(resp);
+                }
+
+                if crate::fast_start::is_remote_client(&headers) {
+                    tracing::info!(item = %id, url = %url, "remote client uncached: redirecting directly to upstream resolver (307)");
+                    return Ok(axum::response::Redirect::temporary(url).into_response());
                 }
 
                 // If Fast-Start could not serve from buffer:
