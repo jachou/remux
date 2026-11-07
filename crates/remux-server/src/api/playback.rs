@@ -1416,11 +1416,20 @@ async fn videos_stream_inner(
     let mut media = match media {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(
-                item = %id,
-                media_source = ?q.media_source_id,
-                "stream lookup failed; serving no-streams placeholder: {e:#}"
-            );
+            let err_msg = e.to_string();
+            if err_msg.contains("unreleased") {
+                tracing::debug!(
+                    item = %id,
+                    media_source = ?q.media_source_id,
+                    "stream lookup skipped (unreleased episode); serving no-streams placeholder"
+                );
+            } else {
+                tracing::warn!(
+                    item = %id,
+                    media_source = ?q.media_source_id,
+                    "stream lookup failed; serving no-streams placeholder: {e:#}"
+                );
+            }
             if q.static_ == Some(true) {
                 return Ok(StatusCode::NOT_FOUND.into_response());
             }

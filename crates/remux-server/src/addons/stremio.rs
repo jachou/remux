@@ -374,7 +374,7 @@ impl CatalogAddon for StremioAddon {
         // much higher than is sane for this; capped independently so a large
         // `meta_concurrency` can't turn a one-page catalog into a burst of
         // speculative requests (and avoidable 429s) against one addon.
-        const MAX_CATALOG_PAGE_CONCURRENCY: usize = 5;
+        const MAX_CATALOG_PAGE_CONCURRENCY: usize = 3;
         let page_concurrency = db::Settings::get_config_or_default(&ctx.db)
             .await
             .meta_concurrency

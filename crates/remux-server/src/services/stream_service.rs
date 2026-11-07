@@ -448,6 +448,15 @@ impl StreamService {
             | db::MediaKind::TvProgram => {
                 let mut media = media;
                 let media_id = media.id;
+                if media.kind == db::MediaKind::Episode {
+                    let is_unreleased = media
+                        .digital_released_at
+                        .or(media.released_at)
+                        .map_or(false, |r| r > chrono::Utc::now().naive_utc());
+                    if is_unreleased {
+                        return Err(anyhow::anyhow!("episode is unreleased"));
+                    }
+                }
                 let _ = ctx
                     .addons
                     .refresh_streams(&mut media, ctx, user_id)
@@ -1101,11 +1110,15 @@ impl StreamService {
             {
                 match media_info_from_probe(&source, &effective_stream, item.as_ref()) {
                     Ok(mi) => {
-                        debug!(id = %effective_stream.id, url, "remuxdb: submitting mediainfo");
-                        let token = probe_cfg
-                            .remuxdb_token
-                            .clone();
-                        tokio::spawn(mi.submit(url, token));
+                        if mi.tracks.is_empty() {
+                            debug!(id = %effective_stream.id, "remuxdb: skipping submission: no tracks extracted from probe");
+                        } else {
+                            debug!(id = %effective_stream.id, url, "remuxdb: submitting mediainfo");
+                            let token = probe_cfg
+                                .remuxdb_token
+                                .clone();
+                            tokio::spawn(mi.submit(url, token));
+                        }
                     }
                     Err(reason) => {
                         warn!(id = %effective_stream.id, reason, "remuxdb: skipping submission");
@@ -1695,6 +1708,17 @@ pub fn spawn_preemptive_probe_opts(
 
         if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
             return;
+        }
+
+        if media.kind == db::MediaKind::Episode {
+            let is_unreleased = media
+                .digital_released_at
+                .or(media.released_at)
+                .map_or(false, |r| r > chrono::Utc::now().naive_utc());
+            if is_unreleased {
+                tracing::debug!(%item_id, "preemptive probe skipped: episode is unreleased");
+                return;
+            }
         }
 
         let _permit = match tokio::time::timeout(

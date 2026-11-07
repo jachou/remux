@@ -132,6 +132,10 @@ pub struct SubtitleTrackPayload {
 
 impl MediaInfoPayload {
     pub async fn submit(self, base_url: String, token: Option<String>) {
+        if self.tracks.is_empty() {
+            debug!("remuxdb: skipping mediainfo submission: tracks list is empty");
+            return;
+        }
         let url = format!("{}/api/mediainfo", base_url.trim_end_matches('/'));
         let body = match serde_json::to_string(&self) {
             Ok(b) => b,

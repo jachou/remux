@@ -3348,6 +3348,17 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<()> {
+        if media.kind == db::MediaKind::Episode {
+            let is_unreleased = media
+                .digital_released_at
+                .or(media.released_at)
+                .map_or(false, |r| r > chrono::Utc::now().naive_utc());
+            if is_unreleased {
+                tracing::debug!(item_id = %media.id, title = %media.title, "skipping stream refresh for unreleased episode");
+                return Ok(());
+            }
+        }
+
         let ttl_secs = Self::stream_cache_ttl_secs(media);
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 

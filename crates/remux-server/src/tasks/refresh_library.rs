@@ -150,7 +150,10 @@ impl Task for RefreshLibraryTask {
         // `cumulative` advances by the real count too, so later catalogs'
         // base offsets aren't thrown off by earlier ones' estimates.
         let mut cumulative: usize = 0;
-        for (cat_info, max) in &work {
+        for (i, (cat_info, max)) in work.iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+            }
             let catalog_item_progress =
                 item_progress.child(catalog_base + cumulative, *max);
 

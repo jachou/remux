@@ -5,6 +5,7 @@ use axum::{
 use axum_anyhow::{ApiError, ApiResult as Result};
 use http::StatusCode;
 use remux_sdks::{BearerAuth, RestClient, deezer as dz};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -78,6 +79,13 @@ fn movie_ids_endpoint(tmdb_id: i64) -> sdks::tmdb::MovieEndpoint {
     }
 }
 
+static TMDB_NOT_FOUND_CACHE: LazyLock<moka::sync::Cache<(i64, bool), ()>> = LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .time_to_live(Duration::from_secs(86400 * 7)) // 7 days negative cache
+        .max_capacity(10_000)
+        .build()
+});
+
 pub struct MediaResolveService;
 
 impl MediaResolveService {
@@ -92,6 +100,58 @@ impl MediaResolveService {
         .await
     }
 
+    async fn fetch_tmdb_series_ids<A: sdks::Auth + Clone>(
+        tmdb_id: i64,
+        client: &RestClient<A>,
+    ) -> Option<sdks::tmdb::Series> {
+        if TMDB_NOT_FOUND_CACHE.contains_key(&(tmdb_id, true)) {
+            debug!(tmdb_id, "TMDB series in negative cache (404), skipping lookup");
+            return None;
+        }
+        match client
+            .execute(series_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
+            .await
+        {
+            Ok(series) => Some(series),
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("404") || s.contains("NotFound") {
+                    TMDB_NOT_FOUND_CACHE.insert((tmdb_id, true), ());
+                    debug!(tmdb_id, "TMDB series not found (404), cached negative response");
+                } else {
+                    warn!(tmdb_id, error = %e, "TMDB series lookup failed");
+                }
+                None
+            }
+        }
+    }
+
+    async fn fetch_tmdb_movie_ids<A: sdks::Auth + Clone>(
+        tmdb_id: i64,
+        client: &RestClient<A>,
+    ) -> Option<sdks::tmdb::Movie> {
+        if TMDB_NOT_FOUND_CACHE.contains_key(&(tmdb_id, false)) {
+            debug!(tmdb_id, "TMDB movie in negative cache (404), skipping lookup");
+            return None;
+        }
+        match client
+            .execute(movie_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
+            .await
+        {
+            Ok(movie) => Some(movie),
+            Err(e) => {
+                let s = e.to_string();
+                if s.contains("404") || s.contains("NotFound") {
+                    TMDB_NOT_FOUND_CACHE.insert((tmdb_id, false), ());
+                    debug!(tmdb_id, "TMDB movie not found (404), cached negative response");
+                } else {
+                    warn!(tmdb_id, error = %e, "TMDB movie lookup failed");
+                }
+                None
+            }
+        }
+    }
+
     async fn resolve_media_imdb(media: &mut db::Media, ctx: &AppContext) -> bool {
         if media
             .external_ids
@@ -100,7 +160,10 @@ impl MediaResolveService {
         {
             return true;
         }
-        let is_tv = matches!(media.kind, db::MediaKind::Series);
+        let is_tv = matches!(
+            media.kind,
+            db::MediaKind::Series | db::MediaKind::Season | db::MediaKind::Episode
+        );
         let Some(client) = Self::tmdb(ctx).await else {
             return false;
         };
@@ -127,37 +190,27 @@ impl MediaResolveService {
 
         if let Some(tmdb_id) = ids.tmdb {
             if is_tv {
-                match client
-                    .execute(series_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
-                    .await
-                {
-                    Ok(series) => {
-                        if let Some(imdb) = series
-                            .external_ids
-                            .and_then(|e| e.imdb_id)
-                            .and_then(|s| db::NonEmptyString::try_new(s).ok())
-                        {
-                            return Some(imdb);
-                        }
-                        debug!(tmdb_id, "TMDB series has no imdb_id in external_ids");
+                if let Some(series) = Self::fetch_tmdb_series_ids(tmdb_id, client).await {
+                    if let Some(imdb) = series
+                        .external_ids
+                        .as_ref()
+                        .and_then(|e| e.imdb_id.as_deref())
+                        .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok())
+                    {
+                        return Some(imdb);
                     }
-                    Err(e) => warn!(tmdb_id, error = %e, "TMDB series lookup failed"),
+                    debug!(tmdb_id, "TMDB series has no imdb_id in external_ids");
                 }
             } else {
-                match client
-                    .execute(movie_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
-                    .await
-                {
-                    Ok(movie) => {
-                        if let Some(imdb) = movie
-                            .imdb_id
-                            .and_then(|s| db::NonEmptyString::try_new(s).ok())
-                        {
-                            return Some(imdb);
-                        }
-                        debug!(tmdb_id, "TMDB movie has no imdb_id");
+                if let Some(movie) = Self::fetch_tmdb_movie_ids(tmdb_id, client).await {
+                    if let Some(imdb) = movie
+                        .imdb_id
+                        .as_deref()
+                        .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok())
+                    {
+                        return Some(imdb);
                     }
-                    Err(e) => warn!(tmdb_id, error = %e, "TMDB movie lookup failed"),
+                    debug!(tmdb_id, "TMDB movie has no imdb_id");
                 }
             }
         }
@@ -229,22 +282,18 @@ impl MediaResolveService {
         client: &RestClient<A>,
     ) -> Option<db::NonEmptyString> {
         if is_tv {
-            let series = client
-                .execute(series_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
-                .await
-                .ok()?;
+            let series = Self::fetch_tmdb_series_ids(tmdb_id, client).await?;
             series
                 .external_ids
-                .and_then(|e| e.imdb_id)
-                .and_then(|s| db::NonEmptyString::try_new(s).ok())
+                .as_ref()
+                .and_then(|e| e.imdb_id.as_deref())
+                .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok())
         } else {
-            let movie = client
-                .execute(movie_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
-                .await
-                .ok()?;
+            let movie = Self::fetch_tmdb_movie_ids(tmdb_id, client).await?;
             movie
                 .imdb_id
-                .and_then(|s| db::NonEmptyString::try_new(s).ok())
+                .as_deref()
+                .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok())
         }
     }
 
@@ -460,10 +509,8 @@ impl MediaResolveService {
 
         if force_refresh || needs_imdb || needs_tvdb {
             if is_tv {
-                if let Ok(series) = client
-                    .execute(series_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
-                    .await
-                    && let Some(e) = series.external_ids
+                if let Some(series) = Self::fetch_tmdb_series_ids(tmdb_id, &client).await
+                    && let Some(e) = &series.external_ids
                 {
                     if force_refresh
                         || media
@@ -475,7 +522,8 @@ impl MediaResolveService {
                             .external_ids
                             .imdb = e
                             .imdb_id
-                            .and_then(|s| db::NonEmptyString::try_new(s).ok());
+                            .as_deref()
+                            .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok());
                     }
                     if force_refresh
                         || media
@@ -489,15 +537,14 @@ impl MediaResolveService {
                     }
                 }
             } else if (force_refresh || needs_imdb)
-                && let Ok(movie) = client
-                    .execute(movie_ids_endpoint(tmdb_id).with_cache(ID_CACHE_TTL))
-                    .await
+                && let Some(movie) = Self::fetch_tmdb_movie_ids(tmdb_id, &client).await
             {
                 media
                     .external_ids
                     .imdb = movie
                     .imdb_id
-                    .and_then(|s| db::NonEmptyString::try_new(s).ok());
+                    .as_deref()
+                    .and_then(|s| db::NonEmptyString::try_new(s.to_string()).ok());
             }
         }
     }

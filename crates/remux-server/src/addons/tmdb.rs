@@ -1817,7 +1817,12 @@ async fn fetch_tmdb_season_meta(
             .external_ids
             .merge(&tmdb_external_ids(season.id, Some(&ids)), true),
         Err(error) => {
-            warn!(%error, series_id = tmdb_id, season = season_idx, "TMDB season external IDs unavailable")
+            let err_str = error.to_string();
+            if err_str.contains("404") || err_str.contains("NotFound") {
+                debug!(%error, series_id = tmdb_id, season = season_idx, "TMDB season external IDs not found (404)");
+            } else {
+                warn!(%error, series_id = tmdb_id, season = season_idx, "TMDB season external IDs unavailable");
+            }
         }
     }
     Ok(Some(patch))
