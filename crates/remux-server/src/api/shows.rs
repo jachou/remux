@@ -93,7 +93,7 @@ pub async fn shows_seasons(
                            AND m.kind = 'episode' \
                            AND m.parent_idx > 0 \
                            AND COALESCE(ums.play_count, 0) = 0 \
-                           AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
+                           AND ((m.released_at IS NOT NULL AND m.released_at <= CURRENT_TIMESTAMP) OR (m.released_at IS NULL AND EXISTS (SELECT 1 FROM media p WHERE p.id = m.parent_id AND ((p.released_at IS NOT NULL AND p.released_at <= CURRENT_TIMESTAMP) OR (p.digital_released_at IS NOT NULL AND p.digital_released_at <= CURRENT_TIMESTAMP))))) \
                            AND ((m.parent_idx = ?3 AND m.idx > ?4) OR (m.parent_idx > ?3)) \
                          ORDER BY m.parent_idx ASC, m.idx ASC \
                          LIMIT 1",
@@ -116,7 +116,7 @@ pub async fn shows_seasons(
                        AND m.kind = 'episode' \
                        AND m.parent_idx > 0 \
                        AND COALESCE(ums.play_count, 0) = 0 \
-                       AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
+                       AND ((m.released_at IS NOT NULL AND m.released_at <= CURRENT_TIMESTAMP) OR (m.released_at IS NULL AND EXISTS (SELECT 1 FROM media p WHERE p.id = m.parent_id AND ((p.released_at IS NOT NULL AND p.released_at <= CURRENT_TIMESTAMP) OR (p.digital_released_at IS NOT NULL AND p.digital_released_at <= CURRENT_TIMESTAMP))))) \
                      ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
                      LIMIT 1",
                 )
@@ -135,7 +135,7 @@ pub async fn shows_seasons(
                          WHERE m.grandparent_id = ?2 \
                            AND m.kind = 'episode' \
                            AND COALESCE(ums.play_count, 0) = 0 \
-                           AND (m.released_at IS NULL OR m.released_at <= CURRENT_TIMESTAMP) \
+                           AND ((m.released_at IS NOT NULL AND m.released_at <= CURRENT_TIMESTAMP) OR (m.released_at IS NULL AND EXISTS (SELECT 1 FROM media p WHERE p.id = m.parent_id AND ((p.released_at IS NOT NULL AND p.released_at <= CURRENT_TIMESTAMP) OR (p.digital_released_at IS NOT NULL AND p.digital_released_at <= CURRENT_TIMESTAMP))))) \
                          ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
                          LIMIT 1",
                     )
@@ -271,8 +271,23 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
 }
 
 fn is_unreleased_episode(ep: &db::Media, threshold: chrono::NaiveDateTime) -> bool {
-    let dates = [ep.digital_released_at, ep.released_at];
-    dates.iter().any(|d| d.is_some()) && dates.iter().filter_map(|&d| d).all(|d| d > threshold)
+    let dates: Vec<chrono::NaiveDateTime> = [ep.digital_released_at, ep.released_at]
+        .into_iter()
+        .flatten()
+        .collect();
+    if dates.is_empty() {
+        if let Some(ref p) = ep.parent {
+            let parent_dates: Vec<chrono::NaiveDateTime> = [p.digital_released_at, p.released_at]
+                .into_iter()
+                .flatten()
+                .collect();
+            if !parent_dates.is_empty() {
+                return parent_dates.iter().all(|&d| d > threshold);
+            }
+        }
+        return true;
+    }
+    dates.iter().all(|&d| d > threshold)
 }
 
 #[get("/shows/nextup")]

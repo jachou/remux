@@ -89,7 +89,7 @@ pub async fn remote_search_movie(
                 provider_ids,
                 premiere_date: r
                     .release_date
-                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .and_then(|d| d.and_hms_opt(12, 0, 0))
                     .map(|ndt| {
                         ndt.and_utc()
                             .to_rfc3339()
@@ -151,7 +151,7 @@ pub async fn remote_search_series(
                 provider_ids,
                 premiere_date: r
                     .first_air_date
-                    .and_then(|d| d.and_hms_opt(0, 0, 0))
+                    .and_then(|d| d.and_hms_opt(12, 0, 0))
                     .map(|ndt| {
                         ndt.and_utc()
                             .to_rfc3339()

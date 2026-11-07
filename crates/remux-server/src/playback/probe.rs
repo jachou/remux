@@ -1510,7 +1510,7 @@ async fn check_liveness_with_fallback(
         "all liveness attempts failed for '{}' (tried {attempts} of {total_available} streams)",
         primary.full_title()
     ))
-    .context_internal("stream liveness check failed — no usable streams found")
+    .context_not_found("stream liveness check failed — no usable streams found")
 }
 
 fn select_candidates(
@@ -1778,7 +1778,7 @@ where
         "all probe attempts failed for '{}' (tried {attempts} of {total_available} streams)",
         primary.full_title()
     ))
-    .context_internal("stream probe failed — no usable streams found")
+    .context_not_found("stream probe failed — no usable streams found")
 }
 
 #[cfg(test)]

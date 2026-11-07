@@ -1641,6 +1641,11 @@ async fn videos_stream_inner(
                     })
                     .unwrap_or(false)
             {
+                if crate::fast_start::is_remote_client(&headers) {
+                    tracing::info!(item = %id, url = %url, "remote client detected: redirecting directly to upstream resolver (307)");
+                    return Ok(axum::response::Redirect::temporary(url).into_response());
+                }
+
                 // Fast-Start acceleration: serve head/tail buffer from RAM, or redirect directly to CDN
                 if let Some(resp) = crate::fast_start::handle_playback_request(id, url, &headers, Some(request_headers)).await {
                     return Ok(resp);

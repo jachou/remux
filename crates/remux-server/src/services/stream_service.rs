@@ -448,14 +448,8 @@ impl StreamService {
             | db::MediaKind::TvProgram => {
                 let mut media = media;
                 let media_id = media.id;
-                if media.kind == db::MediaKind::Episode {
-                    let is_unreleased = media
-                        .digital_released_at
-                        .or(media.released_at)
-                        .map_or(false, |r| r > chrono::Utc::now().naive_utc());
-                    if is_unreleased {
-                        return Err(anyhow::anyhow!("episode is unreleased"));
-                    }
+                if media.is_unreleased(&ctx.db).await {
+                    return Err(anyhow::anyhow!("episode is unreleased"));
                 }
                 let _ = ctx
                     .addons
@@ -1710,15 +1704,9 @@ pub fn spawn_preemptive_probe_opts(
             return;
         }
 
-        if media.kind == db::MediaKind::Episode {
-            let is_unreleased = media
-                .digital_released_at
-                .or(media.released_at)
-                .map_or(false, |r| r > chrono::Utc::now().naive_utc());
-            if is_unreleased {
-                tracing::debug!(%item_id, "preemptive probe skipped: episode is unreleased");
-                return;
-            }
+        if media.is_unreleased(&ctx.db).await {
+            tracing::debug!(%item_id, "preemptive probe skipped: episode is unreleased");
+            return;
         }
 
         let _permit = match tokio::time::timeout(

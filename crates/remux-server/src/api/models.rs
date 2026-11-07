@@ -500,7 +500,13 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
         premiere_date: media
             .released_at
             .clone()
-            .map(|d| d.and_utc()),
+            .map(|d| {
+                if d.time() == chrono::NaiveTime::MIN {
+                    d.date().and_hms_opt(12, 0, 0).unwrap_or(d).and_utc()
+                } else {
+                    d.and_utc()
+                }
+            }),
         production_year: media
             .released_at
             .map(|d| d.year() as i64),
@@ -558,6 +564,13 @@ pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
             }),
         end_date: media
             .end_date
+            .map(|d| {
+                if d.time() == chrono::NaiveTime::MIN {
+                    d.date().and_hms_opt(12, 0, 0).unwrap_or(d)
+                } else {
+                    d
+                }
+            })
             .or(media.live_end)
             .map(|d| {
                 d.and_utc()

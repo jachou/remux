@@ -1378,6 +1378,48 @@ async fn serve_from_in_flight(
     }
 }
 
+/// Returns true when the incoming request originated from outside the local network
+/// (e.g. through a Cloudflare Tunnel or public WAN).
+pub fn is_remote_client(headers: &HeaderMap) -> bool {
+    // 1. Cloudflare Tunnel (cloudflared) injects cf-connecting-ip or cf-ray for external traffic
+    if headers.contains_key("cf-connecting-ip") || headers.contains_key("cf-ray") {
+        return true;
+    }
+
+    // 2. Check X-Forwarded-For if present
+    if let Some(xff) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
+        if let Some(first_ip) = xff.split(',').next().map(str::trim) {
+            if let Ok(ip) = first_ip.parse::<std::net::IpAddr>() {
+                if !ip.is_loopback() && !is_private_ip(&ip) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    // 3. Check Host header — if it targets a public domain rather than local LAN IP / hostname
+    if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
+        let host_name = host.split(':').next().unwrap_or(host);
+        if !host_name.starts_with("192.168.")
+            && !host_name.starts_with("10.")
+            && !host_name.starts_with("127.")
+            && host_name != "localhost"
+            && !host_name.ends_with(".local")
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_private_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_private(),
+        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    }
+}
+
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///
@@ -1388,6 +1430,21 @@ pub async fn handle_playback_request(
     headers: &HeaderMap,
     upstream_headers: Option<&HashMap<String, String>>,
 ) -> Option<Response> {
+    if is_remote_client(headers) {
+        METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+        info!(
+            %item_id,
+            %url,
+            "[FAST-START] Remote client detected: redirecting directly to upstream resolver from byte 0 (307)"
+        );
+        let mut redirect = Redirect::temporary(url).into_response();
+        redirect.headers_mut().insert(
+            "X-Remux-FastStart",
+            HeaderValue::from_static("remote-direct-resolver"),
+        );
+        return Some(redirect);
+    }
+
     if is_force_direct_307() {
         if let Some(entry) = FAST_START_CACHE.get(url) {
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);

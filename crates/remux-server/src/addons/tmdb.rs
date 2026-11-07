@@ -307,7 +307,7 @@ fn movie_result_to_stub(m: sdks::tmdb::MovieSearchResult) -> db::Media {
         kind: db::MediaKind::Movie,
         released_at: m
             .release_date
-            .and_then(|d| d.and_hms_opt(0, 0, 0)),
+            .and_then(|d| d.and_hms_opt(12, 0, 0)),
         external_ids: db::ExternalIds {
             tmdb: Some(m.id),
             ..Default::default()
@@ -333,7 +333,7 @@ fn series_result_to_stub(s: sdks::tmdb::SeriesSearchResult) -> db::Media {
         kind: db::MediaKind::Series,
         released_at: s
             .first_air_date
-            .and_then(|d| d.and_hms_opt(0, 0, 0)),
+            .and_then(|d| d.and_hms_opt(12, 0, 0)),
         external_ids: db::ExternalIds {
             tmdb: Some(s.id),
             ..Default::default()
@@ -509,7 +509,7 @@ impl From<&sdks::tmdb::Season> for db::Media {
     fn from(s: &sdks::tmdb::Season) -> Self {
         let air_date = s
             .air_date
-            .and_then(|d| d.and_hms_opt(0, 0, 0));
+            .and_then(|d| d.and_hms_opt(12, 0, 0));
         let mut media = db::Media {
             kind: db::MediaKind::Season,
             title: crate::addons::season_title(s.season_number),
@@ -569,7 +569,7 @@ impl From<&sdks::tmdb::Episode> for db::Media {
             ),
             released_at: ep
                 .air_date
-                .and_then(|d| d.and_hms_opt(0, 0, 0)),
+                .and_then(|d| d.and_hms_opt(12, 0, 0)),
             runtime: ep
                 .runtime
                 .map(|r| r * 60),
@@ -1352,7 +1352,7 @@ async fn fetch_tmdb_meta(
                     description: movie_details.overview,
                     released_at: movie_details
                         .release_date
-                        .and_then(|d| d.and_hms_opt(0, 0, 0)),
+                        .and_then(|d| d.and_hms_opt(12, 0, 0)),
                     digital_released_at,
                     runtime: movie_details
                         .runtime
@@ -1532,7 +1532,7 @@ async fn fetch_tmdb_meta(
                         .and_then(|s| {
                             chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").ok()
                         })
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                        .and_then(|d| d.and_hms_opt(12, 0, 0))
                 } else {
                     None
                 };
@@ -1541,7 +1541,7 @@ async fn fetch_tmdb_meta(
                     description: tv_details.overview,
                     released_at: tv_details
                         .first_air_date
-                        .and_then(|d| d.and_hms_opt(0, 0, 0)),
+                        .and_then(|d| d.and_hms_opt(12, 0, 0)),
                     rating_audience: external_ratings.audience_rating(),
                     external_ratings: Some(external_ratings),
                     certification,
@@ -1724,7 +1724,7 @@ async fn fetch_tmdb_meta(
                 .and_then(|b| {
                     chrono::NaiveDate::parse_from_str(b, "%Y-%m-%d")
                         .ok()
-                        .and_then(|d| d.and_hms_opt(0, 0, 0))
+                        .and_then(|d| d.and_hms_opt(12, 0, 0))
                 });
             let mut patch = db::Media {
                 description: details

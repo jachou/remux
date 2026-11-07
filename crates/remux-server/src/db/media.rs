@@ -2289,6 +2289,31 @@ impl Media {
             .is_live_tv()
     }
 
+    pub async fn is_unreleased(&self, db: &sqlx::SqlitePool) -> bool {
+        if self.kind != MediaKind::Episode {
+            return false;
+        }
+        let now = chrono::Utc::now().naive_utc();
+        if let Some(r) = self.digital_released_at.or(self.released_at) {
+            return r > now;
+        }
+        if let Some(ref parent) = self.parent {
+            return parent
+                .digital_released_at
+                .or(parent.released_at)
+                .map_or(true, |r| r > now);
+        }
+        if let Some(pid) = self.parent_id {
+            if let Ok(Some(parent)) = Media::get_by_id(db, &pid).await {
+                return parent
+                    .digital_released_at
+                    .or(parent.released_at)
+                    .map_or(true, |r| r > now);
+            }
+        }
+        true
+    }
+
     pub fn is_track(&self) -> bool {
         self.kind == MediaKind::Track
     }
