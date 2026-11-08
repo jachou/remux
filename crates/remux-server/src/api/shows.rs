@@ -37,125 +37,6 @@ pub async fn shows_seasons(
     ResolvedItem(item): ResolvedItem,
     Query(mut q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
-    let series_id = item.id;
-    let user_id = session.user.id;
-    let ctx = state.ctx.clone();
-    tokio::spawn(async move {
-        // 1. First, check if there is an in-progress episode
-        let in_progress_id = sqlx::query_scalar::<_, Uuid>(
-            "SELECT m.id FROM media m \
-             JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
-             WHERE m.grandparent_id = ?2 \
-               AND m.kind = 'episode' \
-               AND m.parent_idx > 0 \
-               AND ums.playback_position > 0 \
-               AND COALESCE(ums.play_count, 0) = 0 \
-             ORDER BY ums.last_played_at DESC \
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(series_id)
-        .fetch_optional(&ctx.db)
-        .await
-        .ok()
-        .flatten();
-
-        let target_ep_id = if let Some(id) = in_progress_id {
-            Some(id)
-        } else {
-            // 2. Check for the most recently active episode in the show
-            let recent = sqlx::query_as::<_, (Option<i64>, Option<i64>, i64, Uuid)>(
-                "SELECT m.parent_idx, m.idx, COALESCE(ums.play_count, 0), m.id FROM media m \
-                 JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
-                 WHERE m.grandparent_id = ?2 \
-                   AND m.kind = 'episode' \
-                   AND m.parent_idx > 0 \
-                   AND ums.last_played_at IS NOT NULL \
-                 ORDER BY ums.last_played_at DESC \
-                 LIMIT 1",
-            )
-            .bind(user_id)
-            .bind(series_id)
-            .fetch_optional(&ctx.db)
-            .await
-            .ok()
-            .flatten();
-
-            if let Some((Some(p_idx), Some(idx), play_count, ep_id)) = recent {
-                if play_count == 0 {
-                    Some(ep_id)
-                } else {
-                    // Next episode after recently completed
-                    sqlx::query_scalar::<_, Uuid>(
-                        "SELECT m.id FROM media m \
-                         LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
-                         WHERE m.grandparent_id = ?2 \
-                           AND m.kind = 'episode' \
-                           AND m.parent_idx > 0 \
-                           AND COALESCE(ums.play_count, 0) = 0 \
-                           AND ((m.released_at IS NOT NULL AND m.released_at <= CURRENT_TIMESTAMP) OR (m.released_at IS NULL AND EXISTS (SELECT 1 FROM media p WHERE p.id = m.parent_id AND ((p.released_at IS NOT NULL AND p.released_at <= CURRENT_TIMESTAMP) OR (p.digital_released_at IS NOT NULL AND p.digital_released_at <= CURRENT_TIMESTAMP))))) \
-                           AND ((m.parent_idx = ?3 AND m.idx > ?4) OR (m.parent_idx > ?3)) \
-                         ORDER BY m.parent_idx ASC, m.idx ASC \
-                         LIMIT 1",
-                    )
-                    .bind(user_id)
-                    .bind(series_id)
-                    .bind(p_idx)
-                    .bind(idx)
-                    .fetch_optional(&ctx.db)
-                    .await
-                    .ok()
-                    .flatten()
-                }
-            } else {
-                // 3. Fallback: first unplayed regular episode from Season 1+
-                let ep = sqlx::query_scalar::<_, Uuid>(
-                    "SELECT m.id FROM media m \
-                     LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
-                     WHERE m.grandparent_id = ?2 \
-                       AND m.kind = 'episode' \
-                       AND m.parent_idx > 0 \
-                       AND COALESCE(ums.play_count, 0) = 0 \
-                       AND ((m.released_at IS NOT NULL AND m.released_at <= CURRENT_TIMESTAMP) OR (m.released_at IS NULL AND EXISTS (SELECT 1 FROM media p WHERE p.id = m.parent_id AND ((p.released_at IS NOT NULL AND p.released_at <= CURRENT_TIMESTAMP) OR (p.digital_released_at IS NOT NULL AND p.digital_released_at <= CURRENT_TIMESTAMP))))) \
-                     ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
-                     LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(series_id)
-                .fetch_optional(&ctx.db)
-                .await
-                .ok()
-                .flatten();
-
-                if ep.is_none() {
-                    // Fallback to specials (Season 0) if no regular episodes
-                    sqlx::query_scalar::<_, Uuid>(
-                        "SELECT m.id FROM media m \
-                         LEFT JOIN user_media_state ums ON ums.media_id = m.id AND ums.user_id = ?1 \
-                         WHERE m.grandparent_id = ?2 \
-                           AND m.kind = 'episode' \
-                           AND COALESCE(ums.play_count, 0) = 0 \
-                           AND ((m.released_at IS NOT NULL AND m.released_at <= CURRENT_TIMESTAMP) OR (m.released_at IS NULL AND EXISTS (SELECT 1 FROM media p WHERE p.id = m.parent_id AND ((p.released_at IS NOT NULL AND p.released_at <= CURRENT_TIMESTAMP) OR (p.digital_released_at IS NOT NULL AND p.digital_released_at <= CURRENT_TIMESTAMP))))) \
-                         ORDER BY COALESCE(m.parent_idx, 9999) ASC, COALESCE(m.idx, 9999) ASC \
-                         LIMIT 1",
-                    )
-                    .bind(user_id)
-                    .bind(series_id)
-                    .fetch_optional(&ctx.db)
-                    .await
-                    .ok()
-                    .flatten()
-                } else {
-                    ep
-                }
-            }
-        };
-
-        if let Some(ep_id) = target_ep_id {
-            crate::services::stream_service::spawn_preemptive_probe(&ctx, ep_id, Some(user_id));
-        }
-    });
-
     q.parent_id = Some(item.id);
     q.include_item_types = Some(vec![api::MediaType::Season]);
     if q.sort_by
@@ -266,18 +147,78 @@ pub async fn shows_episodes(
 }
 
 fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a api::BaseItemDto> {
-    // Only pre-emptively probe an episode from the season list if it is actively in-progress.
-    // Series-level next-up/unplayed episodes are already accurately probed by `shows_seasons`.
-    // Probing episode 1 of unplayed seasons during bulk season fetching floods upstream APIs.
-    items
+    let now = chrono::Utc::now();
+    let regular_released: Vec<&'a api::BaseItemDto> = items
         .iter()
         .filter(|i| {
+            let is_regular = i.parent_index_number.map_or(true, |s| s > 0);
+            let is_released = i.premiere_date.map_or(true, |d| d <= now);
+            is_regular && is_released
+        })
+        .collect();
+
+    let pool: Vec<&'a api::BaseItemDto> = if !regular_released.is_empty() {
+        regular_released
+    } else {
+        items
+            .iter()
+            .filter(|i| i.premiere_date.map_or(true, |d| d <= now))
+            .collect()
+    };
+
+    if pool.is_empty() {
+        return Vec::new();
+    }
+
+    // 1. Check for in-progress episode
+    if let Some(pos) = pool.iter().position(|i| {
+        i.user_data
+            .as_ref()
+            .map_or(false, |u| !u.played && u.playback_position_ticks > 0)
+    }) {
+        return pool[pos..].iter().take(1).copied().collect();
+    }
+
+    // 2. Check for most recently played episode
+    if let Some((_, last_played_item)) = pool
+        .iter()
+        .filter_map(|i| {
             i.user_data
                 .as_ref()
-                .map_or(false, |u| !u.played && u.playback_position_ticks > 0)
+                .and_then(|u| u.last_played_date)
+                .map(|d| (d, *i))
         })
+        .max_by_key(|(d, _)| *d)
+    {
+        if let Some(pos) = pool.iter().position(|i| i.id == last_played_item.id) {
+            let start = if last_played_item.user_data.as_ref().map_or(false, |u| u.played) {
+                pos + 1
+            } else {
+                pos
+            };
+            if start < pool.len() {
+                let targets: Vec<&'a api::BaseItemDto> = pool[start..]
+                    .iter()
+                    .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
+                    .take(1)
+                    .copied()
+                    .collect();
+                if !targets.is_empty() {
+                    return targets;
+                }
+            }
+        }
+    }
+
+    // 3. Fallback: first unplayed regular episode from the start (e.g. S01E01 for a new show)
+    let unplayed: Vec<&'a api::BaseItemDto> = pool
+        .iter()
+        .filter(|i| i.user_data.as_ref().map_or(true, |u| !u.played))
         .take(1)
-        .collect()
+        .copied()
+        .collect();
+
+    unplayed
 }
 
 fn is_unreleased_episode(ep: &db::Media, threshold: chrono::NaiveDateTime) -> bool {
@@ -2824,7 +2765,7 @@ pub(crate) mod test {
     }
 
     #[test]
-    fn select_preemptive_probe_targets_skips_unplayed_seasons() {
+    fn select_preemptive_probe_targets_probes_first_unplayed_episode() {
         let ep1 = api::BaseItemDto {
             id: uuid::Uuid::new_v4(),
             name: Some("S2 Episode 1".to_string()),
@@ -2847,9 +2788,72 @@ pub(crate) mod test {
             }),
             ..Default::default()
         };
-        let items = vec![ep1, ep2];
+        let items = vec![ep1.clone(), ep2];
         let targets = super::select_preemptive_probe_targets(&items);
-        assert!(targets.is_empty(), "Should not probe unplayed seasons on bulk season fetching");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, ep1.id);
+    }
+
+    #[test]
+    fn select_preemptive_probe_targets_prefers_regular_over_specials() {
+        let special_ep = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("Special Ep 1".to_string()),
+            parent_index_number: Some(0),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                playback_position_ticks: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let reg_ep = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 1".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                playback_position_ticks: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = vec![special_ep, reg_ep.clone()];
+        let targets = super::select_preemptive_probe_targets(&items);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, reg_ep.id);
+    }
+
+    #[test]
+    fn select_preemptive_probe_targets_probes_next_unplayed_after_played() {
+        let now = chrono::Utc::now();
+        let ep1 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 1".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: true,
+                playback_position_ticks: 0,
+                last_played_date: Some(now - chrono::Duration::hours(1)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let ep2 = api::BaseItemDto {
+            id: uuid::Uuid::new_v4(),
+            name: Some("S1 Episode 2".to_string()),
+            parent_index_number: Some(1),
+            user_data: Some(api::UserItemDataDto {
+                played: false,
+                playback_position_ticks: 0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let items = vec![ep1, ep2.clone()];
+        let targets = super::select_preemptive_probe_targets(&items);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].id, ep2.id);
     }
 
     #[test]
@@ -2868,6 +2872,100 @@ pub(crate) mod test {
         let items = vec![ep1];
         let targets = super::select_preemptive_probe_targets(&items);
         assert!(targets.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shows_seasons_does_not_probe_while_episodes_does() {
+        use chrono::Utc;
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard.0.db;
+        let now = Utc::now().naive_utc();
+        let past = now - chrono::Duration::days(10);
+
+        let series_ext = db::ExternalIds {
+            imdb: db::NonEmptyString::try_new("tt_test_no_season_probe_001".to_string()).ok(),
+            ..Default::default()
+        };
+        let series_id = uuid::Uuid::from(&db::MediaIdRaw {
+            kind: db::MediaKind::Series,
+            external_ids: series_ext.clone(),
+            season: None,
+            episode: None,
+        });
+        let mut series = db::Media {
+            id: series_id,
+            title: "NoSeasonProbeSeries".to_string(),
+            kind: db::MediaKind::Series,
+            external_ids: series_ext,
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        series.save(db).await.unwrap();
+
+        let season_id = uuid::Uuid::new_v4();
+        let mut season = db::Media {
+            id: season_id,
+            title: "Season 1".to_string(),
+            kind: db::MediaKind::Season,
+            grandparent_id: Some(series_id),
+            parent_id: Some(series_id),
+            idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        season.save(db).await.unwrap();
+
+        let ep1_id = uuid::Uuid::new_v4();
+        let mut ep1 = db::Media {
+            id: ep1_id,
+            title: "S01E01".to_string(),
+            kind: db::MediaKind::Episode,
+            grandparent_id: Some(series_id),
+            parent_id: Some(season_id),
+            idx: Some(1),
+            parent_idx: Some(1),
+            digital_released_at: Some(past),
+            released_at: Some(past),
+            ..Default::default()
+        };
+        ep1.save(db).await.unwrap();
+
+        // 1. Calling /shows/{id}/seasons must NOT insert ep1 into QUEUED_PROBES
+        let resp = server
+            .get(&format!("/shows/{}/seasons", series_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        assert_eq!(resp.status_code(), 200);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(
+            !crate::services::stream_service::QUEUED_PROBES.contains(&ep1_id),
+            "shows_seasons must NOT enqueue preemptive probes"
+        );
+
+        // 2. Calling /shows/{id}/episodes MUST probe the unplayed episode
+        let resp_ep = server
+            .get(&format!("/shows/{}/episodes", series_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await;
+        assert_eq!(resp_ep.status_code(), 200);
+        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        assert!(
+            crate::services::stream_service::QUEUED_PROBES.contains(&ep1_id),
+            "shows_episodes MUST enqueue preemptive probe for unplayed show entry"
+        );
+        crate::services::stream_service::QUEUED_PROBES.remove(&ep1_id);
     }
 
     #[tokio::test]

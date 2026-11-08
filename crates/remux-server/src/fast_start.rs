@@ -257,8 +257,10 @@ pub static FAST_START_PREWARM_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
 /// Dedicated reqwest client for pre-warming (follows HTTP 302/307 redirects to CDN).
 static PREWARM_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
     reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .tcp_keepalive(Some(Duration::from_secs(15)))
+        .pool_idle_timeout(Some(Duration::from_secs(90)))
         .redirect(reqwest::redirect::Policy::limited(10))
         .build()
         .expect("failed to build fast-start prewarm client")
