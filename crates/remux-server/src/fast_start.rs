@@ -2265,7 +2265,7 @@ mod tests {
         );
         assert_eq!(
             calculate_fast_start_head_size(url_4k, None, None),
-            32 * 1024 * 1024
+            64 * 1024 * 1024
         );
     }
 
@@ -2284,7 +2284,7 @@ mod tests {
                 head_bytes: Bytes::from(head_data.clone()),
                 tail_bytes: None,
                 resume_buffer: None,
-                total_size: 1_000_000,
+                total_size: 100_000_000,
                 content_type: "video/x-matroska".to_string(),
                 created_at: Instant::now(),
             },
@@ -2304,7 +2304,7 @@ mod tests {
         );
         assert_eq!(
             resp.headers().get(header::CONTENT_RANGE).unwrap(),
-            "bytes 8154-16383/1000000"
+            "bytes 8154-16383/100000000"
         );
         let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
             .await
@@ -2398,7 +2398,7 @@ mod tests {
                 Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header(header::CONTENT_TYPE, "video/x-matroska")
-                    .header(header::CONTENT_RANGE, "bytes 0-15/16")
+                    .header(header::CONTENT_RANGE, "bytes 0-15/5000000000")
                     .body(Body::from(vec![0x42u8; 16]))
                     .unwrap()
             }),
