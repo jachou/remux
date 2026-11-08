@@ -24,7 +24,7 @@ use crate::{
     services::MediaResolveService,
     signals::{
         Event, MarkFavoriteInfo, MarkPlayedInfo, MarkUnplayedInfo, RatingInfo,
-        UnmarkFavoriteInfo, UserDeletedInfo, UserUpdatedInfo,
+        UnmarkFavoriteInfo, UserDeletedInfo, UserFlagChangedInfo, UserUpdatedInfo,
     },
 };
 use axum_anyhow::ApiResult as Result;
@@ -223,11 +223,11 @@ fn require_self_or_admin(target_id: Uuid, session: &auth::AuthSession) -> Result
     Ok(())
 }
 
-fn build_auth_response(
-    data_dir: &std::path::Path,
+async fn build_auth_response(
+    state: &AppState,
     device: auth::Device,
     user: db::User,
-) -> Json<api::AuthenticationResult> {
+) -> Result<Json<api::AuthenticationResult>> {
     let session_info = api::SessionInfoDto {
         id: Some(
             device
@@ -272,11 +272,21 @@ fn build_auth_response(
     };
 
     let now = chrono::Utc::now();
-    let mut user_dto = api::db_user_to_dto(data_dir, user);
+    let mut user_dto = user_dto(
+        &state
+            .ctx
+            .db,
+        &state
+            .ctx
+            .config
+            .data_dir,
+        user,
+    )
+    .await?;
     user_dto.last_login_date = Some(now);
     user_dto.last_activity_date = Some(now);
 
-    Json(api::AuthenticationResult {
+    Ok(Json(api::AuthenticationResult {
         access_token: Some(
             device
                 .access_token
@@ -285,7 +295,7 @@ fn build_auth_response(
         server_id: server_id(),
         session_info: Some(session_info),
         user: Some(user_dto),
-    })
+    }))
 }
 
 #[post("/users/authenticatebyname")]
@@ -316,14 +326,7 @@ pub async fn users_authenticatebyname(
         )
         .await?;
 
-    Ok(build_auth_response(
-        &state
-            .ctx
-            .config
-            .data_dir,
-        device,
-        user,
-    ))
+    build_auth_response(&state, device, user).await
 }
 
 #[post("/users/authenticatewithquickconnect")]
@@ -398,14 +401,7 @@ pub async fn authenticate_with_quickconnect(
         .store
         .delete(format!("qc:code:{}", entry.code));
 
-    Ok(build_auth_response(
-        &state
-            .ctx
-            .config
-            .data_dir,
-        device,
-        user,
-    ))
+    build_auth_response(&state, device, user).await
 }
 
 #[get("/users")]
@@ -413,7 +409,7 @@ pub async fn users(
     State(state): State<AppState>,
     session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
-    let items = db::User::get_by_filter(
+    let users = db::User::get_by_filter(
         &state
             .ctx
             .db,
@@ -422,23 +418,21 @@ pub async fn users(
         },
     )
     .await?
-    .records
-    .into_iter()
-    .map(|x| {
-        let mut item = api::db_user_to_dto(
+    .records;
+
+    Ok(Json(
+        user_dtos(
+            &state
+                .ctx
+                .db,
             &state
                 .ctx
                 .config
                 .data_dir,
-            x,
-        );
-        //item.type_ = api::MediaType::CollectionFolder;
-        //item.collection_type = Some(api::CollectionType::Movies);
-        item
-    })
-    .collect::<Vec<api::UserDto>>();
-
-    Ok(Json(items))
+            users,
+        )
+        .await?,
+    ))
 }
 
 #[get("/users/me")]
@@ -446,13 +440,19 @@ pub async fn users_me(
     State(state): State<AppState>,
     session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
-    Ok(Json(api::db_user_to_dto(
-        &state
-            .ctx
-            .config
-            .data_dir,
-        session.user,
-    ))
+    Ok(Json(
+        user_dto(
+            &state
+                .ctx
+                .db,
+            &state
+                .ctx
+                .config
+                .data_dir,
+            session.user,
+        )
+        .await?,
+    )
     .into_response())
 }
 
@@ -614,6 +614,143 @@ pub async fn unmark_favorite_modern(
     Ok(Json(api::db_state_to_dto(s, &media)).into_response())
 }
 
+/// Sets or clears a remux-only mark (watchlist, ignored) for `user` and
+/// emits the signal that keeps WebSocket clients in step. Shared by the
+/// watchlist and ignore routes so neither can change the state silently.
+async fn set_user_flag(
+    state: AppState,
+    user: db::User,
+    id: Uuid,
+    flag: db::UserFlag,
+    on: bool,
+) -> Result<impl IntoResponse> {
+    let media = MediaResolveService::resolve_item(id, &state.ctx)
+        .await?
+        .context_not_found("Item not found")?;
+    let ms = media
+        .set_user_flag(
+            &state
+                .ctx
+                .db,
+            &user,
+            flag,
+            on,
+        )
+        .await?;
+    state
+        .ctx
+        .signals
+        .emit(Event::UserFlagChanged(UserFlagChangedInfo {
+            user_id: user.id,
+            media_id: media.id,
+            flag,
+            on,
+        }));
+    Ok(Json(api::RemuxUserFlags {
+        watchlist: ms.watchlist,
+        ignored: ms.ignored,
+    })
+    .into_response())
+}
+
+#[post("/remux/users/{user_id}/watchlist/{id}")]
+pub async fn add_to_watchlist(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    auth::TargetUser(user): auth::TargetUser,
+    Path((_, id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse> {
+    set_user_flag(state, user, id, db::UserFlag::Watchlist, true).await
+}
+
+#[delete("/remux/users/{user_id}/watchlist/{id}")]
+pub async fn remove_from_watchlist(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    auth::TargetUser(user): auth::TargetUser,
+    Path((_, id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse> {
+    set_user_flag(state, user, id, db::UserFlag::Watchlist, false).await
+}
+
+#[post("/remux/users/{user_id}/ignored/{id}")]
+pub async fn ignore_item(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    auth::TargetUser(user): auth::TargetUser,
+    Path((_, id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse> {
+    set_user_flag(state, user, id, db::UserFlag::Ignored, true).await
+}
+
+#[delete("/remux/users/{user_id}/ignored/{id}")]
+pub async fn unignore_item(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    auth::TargetUser(user): auth::TargetUser,
+    Path((_, id)): Path<(Uuid, Uuid)>,
+) -> Result<impl IntoResponse> {
+    set_user_flag(state, user, id, db::UserFlag::Ignored, false).await
+}
+
+/// Marks an item played or unplayed for `user` and emits the matching signal
+/// (webhooks, websocket, media tracker). Shared by every mark-played route
+/// (`/users/{user_id}/playeditems/{id}` and `/userplayeditems/{id}`) so none
+/// of them can update the state without telling the subscribers.
+pub(crate) async fn set_played(
+    state: &AppState,
+    user: &db::User,
+    id: Uuid,
+    played: bool,
+) -> Result<axum::response::Response> {
+    let media = MediaResolveService::resolve_item(id, &state.ctx)
+        .await?
+        .context_not_found("not found")?;
+    let (ms, event) = if played {
+        let server_config = db::Settings::get_config_or_default(
+            &state
+                .ctx
+                .db,
+        )
+        .await;
+        let ms = media
+            .mark_played(
+                &state
+                    .ctx
+                    .db,
+                user,
+                true,
+                server_config.release_date_threshold(),
+            )
+            .await?;
+        let info = MarkPlayedInfo {
+            user_id: user.id,
+            media_id: media.id,
+        };
+        (ms, Event::MarkPlayed(info))
+    } else {
+        let ms = media
+            .mark_unplayed(
+                &state
+                    .ctx
+                    .db,
+                user,
+                true,
+            )
+            .await?;
+        let info = MarkUnplayedInfo {
+            user_id: user.id,
+            media_id: media.id,
+        };
+        (ms, Event::MarkUnplayed(info))
+    };
+    state
+        .ctx
+        .signals
+        .emit(event);
+    Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
+}
+
 #[post("/users/{user_id}/playeditems/{id}")]
 pub async fn mark_played(
     State(state): State<AppState>,
@@ -621,33 +758,7 @@ pub async fn mark_played(
     auth::TargetUser(user): auth::TargetUser,
     Path((_, id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse> {
-    let media = MediaResolveService::resolve_item(id, &state.ctx)
-        .await?
-        .context_not_found("not found")?;
-    let server_config = db::Settings::get_config_or_default(
-        &state
-            .ctx
-            .db,
-    )
-    .await;
-    let ms = media
-        .mark_played(
-            &state
-                .ctx
-                .db,
-            &user,
-            true,
-            server_config.release_date_threshold(),
-        )
-        .await?;
-    state
-        .ctx
-        .signals
-        .emit(Event::MarkPlayed(MarkPlayedInfo {
-            user_id: user.id,
-            media_id: media.id,
-        }));
-    Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
+    set_played(&state, &user, id, true).await
 }
 
 #[delete("/users/{user_id}/playeditems/{id}")]
@@ -657,53 +768,7 @@ pub async fn unmark_played(
     auth::TargetUser(user): auth::TargetUser,
     Path((_, id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse> {
-    let media = MediaResolveService::resolve_item(id, &state.ctx)
-        .await?
-        .context_not_found("not found")?;
-    let ms = media
-        .mark_unplayed(
-            &state
-                .ctx
-                .db,
-            &user,
-            true,
-        )
-        .await?;
-    state
-        .ctx
-        .signals
-        .emit(Event::MarkUnplayed(MarkUnplayedInfo {
-            user_id: user.id,
-            media_id: media.id,
-        }));
-    Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
-}
-
-async fn unmark_played_inner(
-    state: AppState,
-    user: db::User,
-    id: Uuid,
-) -> Result<impl IntoResponse> {
-    let media = MediaResolveService::resolve_item(id, &state.ctx)
-        .await?
-        .context_not_found("not found")?;
-    let ms = media
-        .mark_unplayed(
-            &state
-                .ctx
-                .db,
-            &user,
-            true,
-        )
-        .await?;
-    state
-        .ctx
-        .signals
-        .emit(Event::MarkUnplayed(MarkUnplayedInfo {
-            user_id: user.id,
-            media_id: media.id,
-        }));
-    Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
+    set_played(&state, &user, id, false).await
 }
 
 #[get("/users/{user_id}/playeditems/{id}/delete")]
@@ -713,7 +778,7 @@ pub async fn unmark_played_get(
     auth::TargetUser(user): auth::TargetUser,
     Path((_, id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse> {
-    unmark_played_inner(state, user, id).await
+    set_played(&state, &user, id, false).await
 }
 
 #[post("/users/{user_id}/playeditems/{id}/delete")]
@@ -723,7 +788,7 @@ pub async fn unmark_played_post(
     auth::TargetUser(user): auth::TargetUser,
     Path((_, id)): Path<(Uuid, Uuid)>,
 ) -> Result<impl IntoResponse> {
-    unmark_played_inner(state, user, id).await
+    set_played(&state, &user, id, false).await
 }
 
 #[query]
@@ -1037,13 +1102,19 @@ pub async fn create_user(
         .emit(Event::UserUpdated(UserUpdatedInfo { user_id: user.id }));
     Ok((
         StatusCode::OK,
-        Json(api::db_user_to_dto(
-            &state
-                .ctx
-                .config
-                .data_dir,
-            user,
-        )),
+        Json(
+            user_dto(
+                &state
+                    .ctx
+                    .db,
+                &state
+                    .ctx
+                    .config
+                    .data_dir,
+                user,
+            )
+            .await?,
+        ),
     )
         .into_response())
 }
@@ -1228,7 +1299,23 @@ pub async fn update_user(
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context_bad_request("Invalid username")?;
     user.username = username.into_inner();
-    if let Some(config) = payload.configuration {
+    if let Some(mut config) = payload.configuration {
+        if force_default_view_order(
+            &state
+                .ctx
+                .db,
+        )
+        .await
+        {
+            config.ordered_views = user
+                .configuration
+                .as_ref()
+                .map(|c| {
+                    c.ordered_views
+                        .clone()
+                })
+                .unwrap_or_default();
+        }
         user.configuration = Some(sqlx::types::Json(config));
     }
     user.save(
@@ -1262,13 +1349,19 @@ pub async fn users_get_by_id(
             .user
             .id
     {
-        return Ok(Json(api::db_user_to_dto(
-            &state
-                .ctx
-                .config
-                .data_dir,
-            session.user,
-        ))
+        return Ok(Json(
+            user_dto(
+                &state
+                    .ctx
+                    .db,
+                &state
+                    .ctx
+                    .config
+                    .data_dir,
+                session.user,
+            )
+            .await?,
+        )
         .into_response());
     }
     if !session
@@ -1287,13 +1380,19 @@ pub async fn users_get_by_id(
     .ok_or_else(|| {
         anyhow::anyhow!("User not found").context_not_found("user not found")
     })?;
-    Ok(Json(api::db_user_to_dto(
-        &state
-            .ctx
-            .config
-            .data_dir,
-        user,
-    ))
+    Ok(Json(
+        user_dto(
+            &state
+                .ctx
+                .db,
+            &state
+                .ctx
+                .config
+                .data_dir,
+            user,
+        )
+        .await?,
+    )
     .into_response())
 }
 
@@ -1337,8 +1436,8 @@ pub async fn users_items_latest(
 }
 
 #[query]
-struct UserViewsQuery {
-    include_hidden: Option<bool>,
+pub(crate) struct UserViewsQuery {
+    pub(crate) include_hidden: Option<bool>,
 }
 
 /// The userview population in default (admin-controlled) order: promoted,
@@ -1422,6 +1521,81 @@ async fn default_userviews(
     Ok((libraries, has_channels))
 }
 
+async fn force_default_view_order(db: &sqlx::SqlitePool) -> bool {
+    db::Settings::get_config_or_default(db)
+        .await
+        .force_default_view_order
+        .unwrap_or(false)
+}
+
+/// User DTOs whose `Configuration.OrderedViews` matches what `/userviews`
+/// returns: with `ForceDefaultViewOrder` on, the saved override is replaced
+/// (in the response only) by the admin's default order, so clients that sort
+/// locally by it agree with the server. Ids use the same simple (no-dash)
+/// form as `/userviews` items. The order is computed per user, since smart
+/// collections and empty-collection pruning depend on the user.
+pub(crate) async fn user_dtos(
+    db: &sqlx::SqlitePool,
+    data_dir: &std::path::Path,
+    users: Vec<db::User>,
+) -> Result<Vec<api::UserDto>> {
+    let force = force_default_view_order(db).await;
+    let mut dtos = Vec::with_capacity(users.len());
+    for user in users {
+        let order = if force {
+            let excluded: Vec<Uuid> = user
+                .configuration
+                .as_ref()
+                .map(|c| {
+                    c.my_media_excludes
+                        .iter()
+                        .filter_map(|s| Uuid::parse_str(s).ok())
+                        .collect()
+                })
+                .unwrap_or_default();
+            let (libraries, _) = default_userviews(
+                db,
+                user.id,
+                user.policy
+                    .as_deref(),
+                (!excluded.is_empty()).then_some(excluded.as_slice()),
+            )
+            .await?;
+            Some(
+                libraries
+                    .into_iter()
+                    .map(|m| {
+                        m.id.simple()
+                            .to_string()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+        let mut dto = api::db_user_to_dto(data_dir, user);
+        if let (Some(order), Some(cfg)) = (
+            order,
+            dto.configuration
+                .as_mut(),
+        ) {
+            cfg.ordered_views = order;
+        }
+        dtos.push(dto);
+    }
+    Ok(dtos)
+}
+
+pub(crate) async fn user_dto(
+    db: &sqlx::SqlitePool,
+    data_dir: &std::path::Path,
+    user: db::User,
+) -> Result<api::UserDto> {
+    Ok(user_dtos(db, data_dir, vec![user])
+        .await?
+        .remove(0))
+}
+
 /// If `payload.ordered_views` (once parsed) is exactly the default order
 /// `target_id` would currently get with no override — see
 /// `default_userviews` — clear it to empty instead of persisting it
@@ -1444,6 +1618,19 @@ async fn normalize_ordered_views(
     target_id: Uuid,
     payload: &mut api::UserConfiguration,
 ) -> Result<()> {
+    // While the default order is forced, clients echo that forced order back
+    // when saving unrelated preferences. Keep the stored personal order so it
+    // is still there once forcing is turned off.
+    if force_default_view_order(db).await {
+        payload.ordered_views = db::User::get_by_id(db, &target_id)
+            .await?
+            .and_then(|u| u.configuration)
+            .map(|c| {
+                c.0.ordered_views
+            })
+            .unwrap_or_default();
+        return Ok(());
+    }
     if payload
         .ordered_views
         .is_empty()
@@ -1542,7 +1729,13 @@ pub(crate) async fn get_user_views_dtos(
 
     // Stable-sort by OrderedViews: configured IDs come first in their saved
     // order; any remaining views follow in their original DB order.
-    if let Some(cfg) = config {
+    let force_default_order = force_default_view_order(
+        &state
+            .ctx
+            .db,
+    )
+    .await;
+    if let Some(cfg) = config.filter(|_| !force_default_order) {
         if !cfg
             .ordered_views
             .is_empty()
@@ -1767,7 +1960,6 @@ async fn resume_items(
             .take(limit as usize)
             .collect();
     }
-
     if start == 0 {
         for target in items.iter().take(8) {
             crate::services::stream_service::spawn_preemptive_probe(
@@ -1778,12 +1970,11 @@ async fn resume_items(
         }
     }
 
-    Ok(Json(api::BaseItemDtoQueryResult {
-        items,
-        total_record_count: total,
-        start_index: start,
-        ..Default::default()
-    }))
+    Ok(Json(serde_json::json!({
+        "Items": super::items::serialize_item_list(&items, q.fields.as_deref()),
+        "TotalRecordCount": total,
+        "StartIndex": start,
+    })))
 }
 
 #[get("/users/{user_id}/items/resume")]
@@ -4432,6 +4623,337 @@ mod e2e_tests {
         assert_eq!(resp.json::<serde_json::Value>()["IsFavorite"], false);
     }
 
+    /// Watchlist and ignore are per-user marks: they show on `BaseItemDto`
+    /// under `Remux`, filter `/Items` (as `Filters=` values or `IsWatchlist=` /
+    /// `IsIgnored=`) and never leak to another user.
+    #[tokio::test]
+    async fn watchlist_and_ignored_marks_filter_items_per_user() {
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = auth_header_with_token(&token);
+        let user_id = get_user_id(&server, &auth).await;
+        let movie = |title: &str, imdb: &str| {
+            let external_ids = db::ExternalIds {
+                imdb: db::NonEmptyString::try_new(imdb.to_string()).ok(),
+                ..Default::default()
+            };
+            db::Media {
+                id: Uuid::from(&db::MediaIdRaw {
+                    kind: db::MediaKind::Movie,
+                    external_ids: external_ids.clone(),
+                    season: None,
+                    episode: None,
+                }),
+                title: title.into(),
+                kind: db::MediaKind::Movie,
+                external_ids,
+                // Items released in the future are hidden from listings.
+                released_at: Some(
+                    chrono::Utc::now().naive_utc() - chrono::Duration::days(365),
+                ),
+                ..Default::default()
+            }
+        };
+        let (mut a, mut b, mut c) = (
+            movie("Alpha", "tt3300001"),
+            movie("Bravo", "tt3300002"),
+            movie("Charlie", "tt3300003"),
+        );
+        for m in [&mut a, &mut b, &mut c] {
+            m.save(db)
+                .await
+                .unwrap();
+        }
+        let hdr = || {
+            (
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+        };
+
+        let resp = server
+            .post(&format!("/remux/users/{user_id}/watchlist/{}", a.id))
+            .add_header(hdr().0, hdr().1)
+            .await;
+        assert_eq!(resp.status_code(), http::StatusCode::OK);
+        let flags = resp.json::<serde_json::Value>();
+        assert_eq!(flags["Watchlist"], true);
+        assert_eq!(flags["Ignored"], false);
+        let resp = server
+            .post(&format!("/remux/users/{user_id}/ignored/{}", b.id))
+            .add_header(hdr().0, hdr().1)
+            .await;
+        assert_eq!(resp.json::<serde_json::Value>()["Ignored"], true);
+
+        let titles = |query: &'static [(&'static str, &'static str)]| {
+            let server = &server;
+            let auth = &auth;
+            let uid = &user_id;
+            async move {
+                let mut req = server
+                    .get("/items")
+                    .add_header(
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_str(auth).unwrap(),
+                    )
+                    .add_query_param("Recursive", "true")
+                    .add_query_param("SortBy", "SortName")
+                    .add_query_param("userId", uid.as_str());
+                for (k, v) in query {
+                    req = req.add_query_param(*k, *v);
+                }
+                let body = req
+                    .await
+                    .json::<serde_json::Value>();
+                body["Items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| {
+                        i["Name"]
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    // The test server also lists seeded views.
+                    .filter(|name| {
+                        ["Alpha", "Bravo", "Charlie"].contains(&name.as_str())
+                    })
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(titles(&[]).await, ["Alpha", "Bravo", "Charlie"]);
+        assert_eq!(titles(&[("Filters", "IsWatchlist")]).await, ["Alpha"]);
+        assert_eq!(titles(&[("IsWatchlist", "true")]).await, ["Alpha"]);
+        assert_eq!(
+            titles(&[("IsWatchlist", "false")]).await,
+            ["Bravo", "Charlie"]
+        );
+        assert_eq!(titles(&[("Filters", "IsIgnored")]).await, ["Bravo"]);
+        assert_eq!(
+            titles(&[("IsIgnored", "false")]).await,
+            ["Alpha", "Charlie"]
+        );
+        assert_eq!(
+            titles(&[("Filters", "IsFavorite")]).await,
+            Vec::<String>::new()
+        );
+
+        // The marks ride on every item under `Remux`.
+        let body = server
+            .get("/items")
+            .add_header(hdr().0, hdr().1)
+            .add_query_param("Recursive", "true")
+            .await
+            .json::<serde_json::Value>();
+        let mark = |name: &str, key: &str| {
+            body["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["Name"] == name)
+                .unwrap()["Remux"][key]
+                .clone()
+        };
+        assert_eq!(mark("Alpha", "Watchlist"), true);
+        assert_eq!(mark("Alpha", "Ignored"), false);
+        assert_eq!(mark("Bravo", "Ignored"), true);
+        assert_eq!(mark("Charlie", "Watchlist"), false);
+
+        // Another user sees none of it.
+        let mut other = db::User::new_with_password(
+            String::new(),
+            "flag-other".into(),
+            "test",
+            None,
+        )
+        .unwrap();
+        other
+            .save(db)
+            .await
+            .unwrap();
+        let other_state = db::UserMediaState::get_or_new(db, &other, &a)
+            .await
+            .unwrap();
+        assert!(!other_state.watchlist && !other_state.ignored);
+
+        // Removing the marks clears them again.
+        server
+            .delete(&format!("/remux/users/{user_id}/watchlist/{}", a.id))
+            .add_header(hdr().0, hdr().1)
+            .await;
+        server
+            .delete(&format!("/remux/users/{user_id}/ignored/{}", b.id))
+            .add_header(hdr().0, hdr().1)
+            .await;
+        assert!(
+            titles(&[("Filters", "IsWatchlist")])
+                .await
+                .is_empty()
+        );
+        assert!(
+            titles(&[("Filters", "IsIgnored")])
+                .await
+                .is_empty()
+        );
+    }
+
+    /// `Filters=Likes` and `Filters=Dislikes` filter on the personal rating the
+    /// way Jellyfin's `IsLiked` does: liked is a rating of at least 6.5,
+    /// disliked is everything else, unrated items included.
+    #[tokio::test]
+    async fn likes_and_dislikes_filters_follow_the_rating() {
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = auth_header_with_token(&token);
+        let user_id = get_user_id(&server, &auth).await;
+        let hdr = || {
+            (
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+        };
+        let names = ["Alpha", "Bravo", "Charlie", "Delta"];
+        let mut ids = Vec::new();
+        for (i, title) in names
+            .iter()
+            .enumerate()
+        {
+            let external_ids = db::ExternalIds {
+                imdb: db::NonEmptyString::try_new(format!("tt340000{i}")).ok(),
+                ..Default::default()
+            };
+            let mut movie = db::Media {
+                id: Uuid::from(&db::MediaIdRaw {
+                    kind: db::MediaKind::Movie,
+                    external_ids: external_ids.clone(),
+                    season: None,
+                    episode: None,
+                }),
+                title: title.to_string(),
+                kind: db::MediaKind::Movie,
+                external_ids,
+                released_at: Some(
+                    chrono::Utc::now().naive_utc() - chrono::Duration::days(365),
+                ),
+                ..Default::default()
+            };
+            movie
+                .save(db)
+                .await
+                .unwrap();
+            ids.push(movie.id);
+        }
+        // Alpha liked (10), Bravo disliked (1), Charlie rated 7 (above the
+        // like threshold), Delta never rated.
+        for (id, query) in [
+            (ids[0], "likes=true"),
+            (ids[1], "likes=false"),
+            (ids[2], "rating=7"),
+        ] {
+            server
+                .post(&format!("/useritems/{id}/rating?{query}"))
+                .add_header(hdr().0, hdr().1)
+                .await
+                .assert_status_ok();
+        }
+
+        let titles = |filter: &'static str| {
+            let server = &server;
+            let auth = &auth;
+            let uid = &user_id;
+            async move {
+                let body = server
+                    .get("/items")
+                    .add_header(
+                        http::header::AUTHORIZATION,
+                        HeaderValue::from_str(auth).unwrap(),
+                    )
+                    .add_query_param("Recursive", "true")
+                    .add_query_param("SortBy", "SortName")
+                    .add_query_param("userId", uid.as_str())
+                    .add_query_param("Filters", filter)
+                    .await
+                    .json::<serde_json::Value>();
+                body["Items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|i| {
+                        i["Name"]
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    // The test server also lists seeded views.
+                    .filter(|name| names.contains(&name.as_str()))
+                    .collect::<Vec<_>>()
+            }
+        };
+        assert_eq!(titles("Likes").await, ["Alpha", "Charlie"]);
+        assert_eq!(titles("Dislikes").await, ["Bravo", "Delta"]);
+    }
+
+    /// Another update to the same row (here a played-state change) must not
+    /// wipe the watchlist and ignore marks.
+    #[tokio::test]
+    async fn other_state_updates_keep_watchlist_and_ignored() {
+        let (_server, guard, _token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let mut media = db::Media {
+            id: Uuid::new_v4(),
+            title: "Keeper".into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt3300010".to_string()).ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        media
+            .save(db)
+            .await
+            .unwrap();
+        media
+            .set_user_flag(db, &user, db::UserFlag::Watchlist, true)
+            .await
+            .unwrap();
+        let first = media
+            .set_user_flag(db, &user, db::UserFlag::Ignored, true)
+            .await
+            .unwrap();
+        let added = first
+            .watchlisted_at
+            .expect("watchlist keeps when it was added");
+        // Adding again keeps the original time instead of moving to the front.
+        let again = media
+            .set_user_flag(db, &user, db::UserFlag::Watchlist, true)
+            .await
+            .unwrap();
+        assert_eq!(again.watchlisted_at, Some(added));
+
+        media
+            .mark_played(db, &user, false, None)
+            .await
+            .unwrap();
+        let state = db::UserMediaState::get_or_new(db, &user, &media)
+            .await
+            .unwrap();
+        assert!(state.watchlist && state.ignored);
+        assert_eq!(state.watchlisted_at, Some(added));
+        assert!(state.play_count > 0);
+    }
+
     #[tokio::test]
     async fn post_delete_unplayed_alias() {
         let (server, ctx, token) = authenticated_server().await;
@@ -4670,6 +5192,166 @@ mod e2e_tests {
             pos_second < pos_first,
             "OrderedViews ordering not respected"
         );
+    }
+
+    /// With `ForceDefaultViewOrder` on, a user's saved `OrderedViews` is ignored by
+    /// `/userviews` and replaced in the user DTO by the same default order; the
+    /// stored override is untouched and applies again once the setting is off.
+    #[tokio::test]
+    async fn force_default_view_order_ignores_saved_user_order() {
+        let (server, ctx, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+
+        let first = insert_promoted_collection(&ctx.0, "First").await;
+        let second = insert_promoted_collection(&ctx.0, "Second").await;
+        let user_id = get_user_id(&server, &auth).await;
+
+        async fn view_ids(server: &axum_test::TestServer, auth: &str) -> Vec<Uuid> {
+            server
+                .get("/userviews")
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(auth).unwrap(),
+                )
+                .await
+                .json::<serde_json::Value>()["Items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| {
+                    v["Id"]
+                        .as_str()
+                        .and_then(|s| Uuid::parse_str(s).ok())
+                })
+                .collect()
+        }
+
+        let default_ids = view_ids(&server, &auth).await;
+        // Save the reverse of the default so the override is observable.
+        let mut reversed = default_ids.clone();
+        reversed.reverse();
+        assert_ne!(reversed, default_ids);
+        server
+            .post(&format!("/users/{}/configuration", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "PlayDefaultAudioTrack": true,
+                "SubtitleMode": "Default",
+                "HidePlayedInLatest": true,
+                "RememberAudioSelections": true,
+                "RememberSubtitleSelections": true,
+                "EnableNextEpisodeAutoPlay": true,
+                "OrderedViews": reversed
+            }))
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+        assert_eq!(view_ids(&server, &auth).await, reversed);
+
+        let mut cfg = db::Settings::get_config_or_default(
+            &ctx.0
+                .db,
+        )
+        .await;
+        cfg.force_default_view_order = Some(true);
+        db::Settings::set_config(
+            &ctx.0
+                .db,
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(view_ids(&server, &auth).await, default_ids);
+        let default_strings: Vec<String> = default_ids
+            .iter()
+            .map(|id| {
+                id.simple()
+                    .to_string()
+            })
+            .collect();
+        let me = server
+            .get("/users/me")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json::<serde_json::Value>();
+        let reported: Vec<String> = me["Configuration"]["OrderedViews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        // Compare the serialized strings, not parsed UUIDs: clients match on text.
+        assert_eq!(reported, default_strings);
+        let listed = server
+            .get("/users")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .await
+            .json::<serde_json::Value>();
+        let listed_order: Vec<String> = listed[0]["Configuration"]["OrderedViews"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        assert_eq!(listed_order, default_strings);
+        assert!(
+            reported.contains(
+                &first
+                    .id
+                    .simple()
+                    .to_string()
+            ) && reported.contains(
+                &second
+                    .id
+                    .simple()
+                    .to_string()
+            )
+        );
+
+        // Reading the forced config and saving it back after an unrelated edit
+        // must not overwrite the stored personal order.
+        server
+            .post(&format!("/users/{}/configuration", user_id))
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth).unwrap(),
+            )
+            .json(&json!({
+                "PlayDefaultAudioTrack": false,
+                "SubtitleMode": "Default",
+                "HidePlayedInLatest": true,
+                "RememberAudioSelections": true,
+                "RememberSubtitleSelections": true,
+                "EnableNextEpisodeAutoPlay": true,
+                "OrderedViews": reported
+            }))
+            .await
+            .assert_status(http::StatusCode::NO_CONTENT);
+
+        cfg.force_default_view_order = Some(false);
+        db::Settings::set_config(
+            &ctx.0
+                .db,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        assert_eq!(view_ids(&server, &auth).await, reversed);
     }
 
     /// Saving `OrderedViews` that exactly restates the current default order
@@ -5051,5 +5733,129 @@ mod e2e_tests {
             ids.contains(&watched_col.id),
             "Watched collection missing after user2 watches an item"
         );
+    }
+}
+
+#[cfg(test)]
+mod played_items_signal_tests {
+    use crate::{
+        db,
+        integration_test::{auth_header_with_token, authenticated_server},
+    };
+    use http::header::HeaderValue;
+    use httpmock::{Method::POST, MockServer};
+    use remux_sdks::remux::{HttpWebhookConfig, WebhookDestination, WebhookEvent};
+    use sqlx::types::Json;
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    /// Every mark-played route has to reach the subscribers: a client built on
+    /// `@jellyfin/sdk` marks items through `/UserPlayedItems/{id}`, the web
+    /// client through `/Users/{id}/PlayedItems/{id}`. A `UserDataSaved`
+    /// webhook must fire for both, for played and for unplayed.
+    #[tokio::test]
+    async fn every_mark_played_route_fires_user_data_saved() {
+        let (server, guard, token) = authenticated_server().await;
+        let db = &guard
+            .0
+            .db;
+        let auth = HeaderValue::from_str(&auth_header_with_token(&token)).unwrap();
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let mut movie = db::Media {
+            id: Uuid::new_v4(),
+            title: "Movie".into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                imdb: db::NonEmptyString::try_new("tt3400001").ok(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        movie
+            .save(db)
+            .await
+            .unwrap();
+
+        let hook = MockServer::start_async().await;
+        let played = hook
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/hook")
+                    .body_contains("\"Played\":true");
+                then.status(204);
+            })
+            .await;
+        let unplayed = hook
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/hook")
+                    .body_contains("\"Played\":false");
+                then.status(204);
+            })
+            .await;
+        db::Webhook {
+            id: Uuid::new_v4(),
+            name: "played".into(),
+            enabled: true,
+            destination: Json(WebhookDestination::Http(HttpWebhookConfig {
+                url: hook.url("/hook"),
+                ..Default::default()
+            })),
+            events: Json(vec![WebhookEvent::UserDataSaved]),
+            send_all_properties: true,
+            ..Default::default()
+        }
+        .save(db)
+        .await
+        .unwrap();
+
+        let routes = [
+            format!("/users/{}/playeditems/{}", user.id, movie.id),
+            format!("/userplayeditems/{}", movie.id),
+        ];
+        let mut expected = 0;
+        for route in &routes {
+            server
+                .post(route)
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .await
+                .assert_status_ok();
+            server
+                .delete(route)
+                .add_header(http::header::AUTHORIZATION, auth.clone())
+                .await
+                .assert_status_ok();
+            expected += 1;
+            // Webhooks are delivered from a spawned task.
+            for _ in 0..100 {
+                if played
+                    .hits_async()
+                    .await
+                    >= expected
+                    && unplayed
+                        .hits_async()
+                        .await
+                        >= expected
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(
+                (
+                    played
+                        .hits_async()
+                        .await,
+                    unplayed
+                        .hits_async()
+                        .await
+                ),
+                (expected, expected),
+                "{route} did not fire UserDataSaved for played and unplayed"
+            );
+        }
     }
 }

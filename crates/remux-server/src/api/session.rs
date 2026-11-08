@@ -30,6 +30,67 @@ use crate::{
     },
 };
 
+/// Persist capabilities and keep DeviceProfile in its dedicated column. Empty
+/// profiles are ignored so a client that sends `{}` during startup cannot
+/// erase a useful profile already learned from PlaybackInfo.
+async fn save_session_capabilities(
+    db: &sqlx::SqlitePool,
+    user_id: Uuid,
+    device_id: &str,
+    caps: &api::ClientCapabilitiesDto,
+) {
+    let mut stored_caps = caps.clone();
+    stored_caps.device_profile = None;
+    let _ = auth::Device::save_capabilities(db, user_id, device_id, &stored_caps).await;
+
+    if let Some(profile) = caps
+        .device_profile
+        .as_ref()
+        .filter(|profile| device_profile_has_content(profile))
+    {
+        let _ =
+            auth::Device::save_device_profile(db, user_id, device_id, profile).await;
+    }
+}
+
+fn device_profile_has_content(profile: &remux_sdks::remux::DeviceProfile) -> bool {
+    profile
+        .name
+        .as_deref()
+        .is_some_and(|name| {
+            !name
+                .trim()
+                .is_empty()
+        })
+        || profile
+            .max_streaming_bitrate
+            .is_some()
+        || profile
+            .max_static_bitrate
+            .is_some()
+        || profile
+            .music_streaming_transcoding_bitrate
+            .is_some()
+        || profile
+            .max_static_music_bitrate
+            .is_some()
+        || !profile
+            .direct_play_profiles
+            .is_empty()
+        || !profile
+            .transcoding_profiles
+            .is_empty()
+        || !profile
+            .container_profiles
+            .is_empty()
+        || !profile
+            .codec_profiles
+            .is_empty()
+        || !profile
+            .subtitle_profiles
+            .is_empty()
+}
+
 #[post("/sessions/logout")]
 pub async fn sessions_logout(
     State(state): State<AppState>,
@@ -55,7 +116,7 @@ pub async fn sessions_capabilities(
     body: Option<Json<api::ClientCapabilitiesDto>>,
 ) -> Result<StatusCode> {
     if let Some(Json(caps)) = body {
-        let _ = auth::Device::save_capabilities(
+        save_session_capabilities(
             &state
                 .ctx
                 .db,
@@ -80,7 +141,10 @@ pub async fn sessions_capabilities_by_id(
     body: Option<Json<api::ClientCapabilitiesDto>>,
 ) -> Result<StatusCode> {
     if let Some(Json(caps)) = body {
-        let _ = auth::Device::save_capabilities(
+        // The path selects the target device; the authenticated user's id
+        // scopes the write, matching save_capabilities and preventing a
+        // shared device id from updating another user's row.
+        save_session_capabilities(
             &state
                 .ctx
                 .db,
@@ -192,6 +256,10 @@ pub async fn report_playback_progress(
                 .map(|s| s.play_session_id)
         });
     if let Some(ref psid) = effective_psid {
+        let before = state
+            .ctx
+            .sessions
+            .get(psid);
         let milestones = state
             .ctx
             .sessions
@@ -205,6 +273,15 @@ pub async fn report_playback_progress(
             )
             .await
             .context_internal("failed to update progress")?;
+        if let Some(before) = before.as_ref() {
+            crate::services::StreamService::remember_track_choice(
+                &state.ctx,
+                &session.user,
+                before,
+                &data,
+            )
+            .await;
+        }
         state
             .ctx
             .signals
@@ -491,7 +568,7 @@ pub async fn sessions_capabilities_full(
     body: Option<Json<api::ClientCapabilitiesDto>>,
 ) -> Result<StatusCode> {
     if let Some(Json(caps)) = body {
-        let _ = auth::Device::save_capabilities(
+        save_session_capabilities(
             &state
                 .ctx
                 .db,
@@ -516,7 +593,7 @@ pub async fn sessions_capabilities_full_by_id(
     body: Option<Json<api::ClientCapabilitiesDto>>,
 ) -> Result<StatusCode> {
     if let Some(Json(caps)) = body {
-        let _ = auth::Device::save_capabilities(
+        save_session_capabilities(
             &state
                 .ctx
                 .db,
@@ -1056,26 +1133,7 @@ pub async fn user_mark_played(
     auth::TargetUser(user): auth::TargetUser,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
-    let media = MediaResolveService::resolve_item(id, &state.ctx)
-        .await?
-        .context_not_found("not found")?;
-    let server_config = db::Settings::get_config_or_default(
-        &state
-            .ctx
-            .db,
-    )
-    .await;
-    let ms = media
-        .mark_played(
-            &state
-                .ctx
-                .db,
-            &user,
-            true,
-            server_config.release_date_threshold(),
-        )
-        .await?;
-    Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
+    api::users::set_played(&state, &user, id, true).await
 }
 
 #[delete("/userplayeditems/{id}")]
@@ -1085,19 +1143,7 @@ pub async fn user_unmark_played(
     auth::TargetUser(user): auth::TargetUser,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse> {
-    let media = MediaResolveService::resolve_item(id, &state.ctx)
-        .await?
-        .context_not_found("not found")?;
-    let ms = media
-        .mark_unplayed(
-            &state
-                .ctx
-                .db,
-            &user,
-            true,
-        )
-        .await?;
-    Ok(Json(api::db_state_to_dto(ms, &media)).into_response())
+    api::users::set_played(&state, &user, id, false).await
 }
 
 /// Jellyfin-compatible master HLS playlist endpoint.
@@ -1550,10 +1596,220 @@ mod tests {
 #[cfg(test)]
 mod e2e_tests {
     use crate::integration_test::{
-        auth_header_with_token, authenticated_server, seed_movie,
+        AUTH_HEADER, auth_header_with_token, authenticated_server, seed_movie,
     };
     use http::{StatusCode, header::HeaderValue};
     use serde_json::json;
+
+    async fn post_capabilities_full(
+        server: &axum_test::TestServer,
+        token: &str,
+        body: serde_json::Value,
+    ) {
+        post_capabilities_full_to(server, token, "/sessions/capabilities/full", body)
+            .await;
+    }
+
+    async fn post_capabilities_full_to(
+        server: &axum_test::TestServer,
+        token: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) {
+        server
+            .post(path)
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_str(&auth_header_with_token(token)).unwrap(),
+            )
+            .json(&body)
+            .await
+            .assert_status(StatusCode::NO_CONTENT);
+    }
+
+    fn browser_profile(name: &str) -> remux_sdks::remux::DeviceProfile {
+        serde_json::from_value(json!({
+            "Name": name,
+            "DirectPlayProfiles": [],
+            "TranscodingProfiles": [],
+            "CodecProfiles": [],
+            "SubtitleProfiles": []
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn capabilities_full_stores_nonempty_profile_and_preserves_it_on_empty_updates()
+     {
+        let (server, guard, token) = authenticated_server().await;
+        let profile = browser_profile("Remux Web");
+        post_capabilities_full(
+            &server,
+            &token,
+            json!({
+                "PlayableMediaTypes": ["Video"],
+                "SupportedCommands": [],
+                "SupportsMediaControl": false,
+                "SupportsPersistentIdentifier": true,
+                "DeviceProfile": profile,
+                "AppStoreUrl": "https://example.test/store",
+                "IconUrl": "https://example.test/icon.png"
+            }),
+        )
+        .await;
+
+        let mut device = crate::db::auth::Device::get_by_access_token(
+            &guard
+                .0
+                .db,
+            &token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            device
+                .parsed_device_profile()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Remux Web")
+        );
+        let stored_caps = serde_json::to_value(
+            device
+                .parsed_capabilities()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !stored_caps
+                .as_object()
+                .unwrap()
+                .contains_key("DeviceProfile"),
+            "the profile is stored only in devices.device_profile: {stored_caps}"
+        );
+        assert_eq!(stored_caps["AppStoreUrl"], "https://example.test/store");
+        assert_eq!(stored_caps["IconUrl"], "https://example.test/icon.png");
+
+        // Neither an omitted field nor an explicitly empty profile clears the
+        // useful profile learned during startup.
+        post_capabilities_full(
+            &server,
+            &token,
+            json!({ "PlayableMediaTypes": ["Video"] }),
+        )
+        .await;
+        post_capabilities_full(&server, &token, json!({ "DeviceProfile": {} })).await;
+
+        device = crate::db::auth::Device::get_by_access_token(
+            &guard
+                .0
+                .db,
+            &token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            device
+                .parsed_device_profile()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Remux Web")
+        );
+    }
+
+    #[tokio::test]
+    async fn capabilities_full_profile_write_is_scoped_to_the_authenticated_user() {
+        let (server, guard, token) = authenticated_server().await;
+        let mut second_user = crate::db::User::new_with_password(
+            String::new(),
+            "second-user".to_string(),
+            "password",
+            None,
+        )
+        .unwrap();
+        second_user
+            .save(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+
+        // Authentication creates the same DeviceId under the second user's
+        // separate (user_id, id) device key.
+        let response = server
+            .post("/users/authenticatebyname")
+            .add_header(
+                http::header::AUTHORIZATION,
+                HeaderValue::from_static(AUTH_HEADER),
+            )
+            .json(&json!({ "Username": "second-user", "Pw": "password" }))
+            .await;
+        response.assert_status_ok();
+        let second_token = response.json::<serde_json::Value>()["AccessToken"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let second_profile = browser_profile("Second user's profile");
+        crate::db::auth::Device::save_device_profile(
+            &guard
+                .0
+                .db,
+            second_user.id,
+            "test-device",
+            &second_profile,
+        )
+        .await
+        .unwrap();
+
+        post_capabilities_full_to(
+            &server,
+            &token,
+            "/sessions/test-device/capabilities/full",
+            json!({ "DeviceProfile": browser_profile("First user's profile") }),
+        )
+        .await;
+
+        let first_device = crate::db::auth::Device::get_by_access_token(
+            &guard
+                .0
+                .db,
+            &token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            first_device
+                .parsed_device_profile()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("First user's profile")
+        );
+
+        let second_device = crate::db::auth::Device::get_by_access_token(
+            &guard
+                .0
+                .db,
+            &second_token,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            second_device
+                .parsed_device_profile()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Second user's profile")
+        );
+    }
 
     /// Some clients never call `/sessions/playing` or
     /// `/sessions/playing/progress`; their only report is the stop, carrying

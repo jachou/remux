@@ -437,15 +437,24 @@ fn build_video_transcode(
     // If policy constraints reduced both codecs to copy, this would be a no-op
     // remux. If the source container already matches the transcoding target
     // there is nothing to do — upgrade to direct play.
+    //
+    // Only when the device can play that container as is. The transcoding
+    // profile's "ts" can mean HLS segments (the web client), which says nothing
+    // about the raw TS stream a source in "ts" is: a container the device's
+    // direct-play profiles do not list (`ContainerNotSupported`) must be
+    // transcoded, here remuxed to HLS, not handed over raw.
     let needs_hevc_retag = reasons.contains(
         &api::TranscodeReason::VideoCodecTagNotSupported(String::new()),
     );
     let needs_stream_filter =
         reasons.contains(&api::TranscodeReason::StreamCountExceedsLimit(String::new()));
+    let container_not_playable =
+        reasons.contains(&api::TranscodeReason::ContainerNotSupported(String::new()));
     if video_codec == "copy"
         && audio_codec == "copy"
         && !needs_hevc_retag
         && !needs_stream_filter
+        && !container_not_playable
     {
         let src = source
             .container
@@ -477,6 +486,13 @@ fn build_video_transcode(
     let sub_method = subtitle_method
         .map(|m| format!("&SubtitleMethod={m}"))
         .unwrap_or_default();
+    // The HLS request carries no PlaybackInfo body, so a channel cap the
+    // client asked for there has to travel on the URL.
+    let max_channels = q
+        .max_audio_channels
+        .filter(|&c| c > 0)
+        .map(|c| format!("&TranscodingMaxAudioChannels={c}"))
+        .unwrap_or_default();
     let start_time = q
         .start_time_ticks
         .map(|t| format!("&StartTimeTicks={t}"))
@@ -495,7 +511,7 @@ fn build_video_transcode(
 
     let url = if protocol.eq_ignore_ascii_case("hls") {
         format!(
-            "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}&ApiKey={}",
+            "/videos/{}/master.m3u8?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}{}&ApiKey={}",
             cfg.item_id,
             cfg.play_session_id,
             source.id,
@@ -507,6 +523,7 @@ fn build_video_transcode(
             sub_idx,
             sub_method,
             start_time,
+            max_channels,
             video_codec_tag,
             session
                 .device
@@ -515,7 +532,7 @@ fn build_video_transcode(
         )
     } else {
         format!(
-            "/videos/{}/stream.{}?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}&ApiKey={}",
+            "/videos/{}/stream.{}?PlaySessionId={}&MediaSourceId={}&VideoCodec={}&AudioCodec={}{}{}{}{}{}{}{}{}&ApiKey={}",
             cfg.item_id,
             container,
             cfg.play_session_id,
@@ -528,6 +545,7 @@ fn build_video_transcode(
             sub_idx,
             sub_method,
             start_time,
+            max_channels,
             video_codec_tag,
             session
                 .device
@@ -1227,6 +1245,34 @@ mod tests {
             panic!("expected a remux");
         };
         outcome
+    }
+
+    #[test]
+    fn requested_channel_cap_is_carried_on_the_transcoding_url() {
+        let session =
+            make_session_with_policy(remux_sdks::remux::UserPolicy::default());
+        let source = make_video_source(VideoContainer::Mkv);
+        let mut q = force_transcode_query();
+        q.device_profile = Some(api::DeviceProfile::default());
+        q.max_audio_channels = Some(2);
+        let TranscodeDecision::Transcode(outcome) = build_transcode_decision(
+            &source,
+            &api::TranscodeReasons::default(),
+            None,
+            &q,
+            &session,
+            &base_cfg(EncodingOptions::default()),
+            true,
+        ) else {
+            panic!("expected a transcode");
+        };
+        assert!(
+            outcome
+                .url
+                .contains("&TranscodingMaxAudioChannels=2"),
+            "{}",
+            outcome.url
+        );
     }
 
     #[test]

@@ -1,3 +1,155 @@
+# [0.40.0](https://github.com/lostb1t/remux/compare/v0.39.0...v0.40.0) (2026-11-07)
+
+
+### Bug Fixes
+
+* accept addon manifests that list resources we don't know ([6fabdc6](https://github.com/lostb1t/remux/commit/6fabdc64c6cf01e2d655242e5a1f8874fb64a098))
+* don't let browsers reuse stale copies of patched web pages ([fc879f0](https://github.com/lostb1t/remux/commit/fc879f043d7553583f0b7d6d65764c8b3c27557c))
+* don't map text subtitles into progressive transcodes that fail on them ([6aaba0d](https://github.com/lostb1t/remux/commit/6aaba0d13dcc65cb69a54ee99d24298e5ad0a78e))
+* keep catalog items when a later catalog page fails to load ([#666](https://github.com/lostb1t/remux/issues/666)) ([8455bea](https://github.com/lostb1t/remux/commit/8455beaa3e0848448bea00fa608c36ba2e1c1e71))
+* keep streams in sync on long plays when the server re-encodes video ([#678](https://github.com/lostb1t/remux/issues/678)) ([b3f1f83](https://github.com/lostb1t/remux/commit/b3f1f8388e117ed8b8c28491e95dab00f2716275))
+* keep the chosen audio track when the server scales or tone-maps video (fixes [#526](https://github.com/lostb1t/remux/issues/526)) ([8b83990](https://github.com/lostb1t/remux/commit/8b83990542144d0ae75c04cdcc0b7d33cfd6c207))
+* keep the item page when picking a version in jellyfin-web 12.x (fixes [#673](https://github.com/lostb1t/remux/issues/673)) ([eb1f8ce](https://github.com/lostb1t/remux/commit/eb1f8ce9cb5701dcde30f78a916608e66eeab887))
+* keep the same version playing when you change audio track ([#679](https://github.com/lostb1t/remux/issues/679)) ([d01fbfa](https://github.com/lostb1t/remux/commit/d01fbfafd99c4989ea4dd1ffeb52cf1f206db557))
+* load dashboard styles before first paint ([#654](https://github.com/lostb1t/remux/issues/654)) ([42bd273](https://github.com/lostb1t/remux/commit/42bd273636e4b1be1a82eba96af2d77877731594))
+* make the bitrate test return random data of exactly the requested size ([ff64112](https://github.com/lostb1t/remux/commit/ff641127de42c03dcd00d311aad4fb9a4690e22e))
+* only offer the media kind filter on a user's filters, not on collections ([5f71376](https://github.com/lostb1t/remux/commit/5f71376847168ee50875042a3b8494a231938dba))
+* play 4K HEVC on LG webOS and Samsung Tizen TVs ([#677](https://github.com/lostb1t/remux/issues/677)) ([d3fcfaa](https://github.com/lostb1t/remux/commit/d3fcfaab3d4777aa0a77f06faef4b71a932a1bce))
+* report why a WebDAV file could not be served instead of always 404 ([cf3e56c](https://github.com/lostb1t/remux/commit/cf3e56cba3edf3cf29ff54543d5f9c153475de6d))
+* return MediaSources when an item is fetched by version id (fixes [#661](https://github.com/lostb1t/remux/issues/661)) ([872f03f](https://github.com/lostb1t/remux/commit/872f03f92ffce287badb498debb2473af3a1ef28))
+* show external subtitles without a language and link them to their video ([#670](https://github.com/lostb1t/remux/issues/670)) ([3351c9f](https://github.com/lostb1t/remux/commit/3351c9fe2f0dcd5c6dc3aec72635bdc0b0e0f051))
+* transcode audio the client can't play and keep surround channels (fixes [#636](https://github.com/lostb1t/remux/issues/636)) ([#644](https://github.com/lostb1t/remux/issues/644)) ([08c6e3c](https://github.com/lostb1t/remux/commit/08c6e3cf3da9fd15cb2cf3384a7ec9fdb3819a40))
+* treat an empty meta from a Stremio addon as an unknown title ([#671](https://github.com/lostb1t/remux/issues/671)) ([6a1d873](https://github.com/lostb1t/remux/commit/6a1d873477ceb5c84817d8d417c013302bd810e2))
+* use your own local subtitles and prefer them over provider ones ([#657](https://github.com/lostb1t/remux/issues/657)) ([b5fa933](https://github.com/lostb1t/remux/commit/b5fa933a4663031620fa2787cd1eb6525c2cdc82))
+
+
+### Features
+
+* let admins force the default library order for everyone ([#663](https://github.com/lostb1t/remux/issues/663)) ([d61a08e](https://github.com/lostb1t/remux/commit/d61a08e327c83bc0f5ab33379614e3880b5747a9))
+* let clients see whether the library order is forced ([fbc6a62](https://github.com/lostb1t/remux/commit/fbc6a62eb8f538605a2c92f14b2ea12708bbdace))
+* rank the streams in a group and optionally the groups themselves ([#672](https://github.com/lostb1t/remux/issues/672)) ([d9270da](https://github.com/lostb1t/remux/commit/d9270daa88966bedace888d8b42e2ff49071f2f9))
+* remember the language you last chose for audio and subtitles ([#680](https://github.com/lostb1t/remux/issues/680)) ([5efb249](https://github.com/lostb1t/remux/commit/5efb24944ebfd11223e369173743a073acd62857))
+* **sdks:** fetch recap and outro segments from IntroDB ([#660](https://github.com/lostb1t/remux/issues/660)) ([bdec31c](https://github.com/lostb1t/remux/commit/bdec31cf7a07653c1017dee9840082c9ea6152f2))
+* show upcoming movies, shows and episodes in their own library ([#667](https://github.com/lostb1t/remux/issues/667)) ([eeb99fe](https://github.com/lostb1t/remux/commit/eeb99fec31ae9e1c820175c1542ceff7ed5fd229))
+
+
+### Performance Improvements
+
+* make loading libraries with an upcoming collection fast ([#669](https://github.com/lostb1t/remux/issues/669)) ([d2e1452](https://github.com/lostb1t/remux/commit/d2e1452d2e2c87fdf29377b2f467fcbc7b2ef3e9))
+
+# [0.39.0](https://github.com/lostb1t/remux/compare/v0.38.2...v0.39.0) (2026-11-01)
+
+
+### Bug Fixes
+
+* keep secrets out of server logs ([18a0314](https://github.com/lostb1t/remux/commit/18a031442f2401eff6436735ba2280d2cae5869c))
+* keep trying peer ports after rqbit 9 update ([d0b984b](https://github.com/lostb1t/remux/commit/d0b984b18a69c0912d905b7eec66b5c5f66fd130))
+* let iOS seek and play music from Remux ([#655](https://github.com/lostb1t/remux/issues/655)) ([0e05e57](https://github.com/lostb1t/remux/commit/0e05e57ba61de8cc38ffb5c458010d01b974379c))
+* play live TV in the browser instead of handing it the raw TS stream ([#650](https://github.com/lostb1t/remux/issues/650)) ([689aa19](https://github.com/lostb1t/remux/commit/689aa199dcf0b0be7d3e298b0cb8321dafc36025))
+* send browser user agent for IPTV requests ([1306db4](https://github.com/lostb1t/remux/commit/1306db4619e7f39661cefcb28842f8cd4b73e29d))
+
+
+### Features
+
+* add an Eclipse music addon and fix playing its files ([#656](https://github.com/lostb1t/remux/issues/656)) ([73bfd7d](https://github.com/lostb1t/remux/commit/73bfd7dd8dad6b71218f23eebae1c72a88ae7c37))
+* add dashboard server logs viewer ([#652](https://github.com/lostb1t/remux/issues/652)) ([c69b68c](https://github.com/lostb1t/remux/commit/c69b68c298e544589bff0c03dd069b3df6e64bf3))
+* add Remux Web as a second web client with a default-client setting ([7425cf8](https://github.com/lostb1t/remux/commit/7425cf8dbfd8fe92e283a09cdd5cea7a5e42aa74))
+* add watchlist and ignore marks with /Items filters ([e046433](https://github.com/lostb1t/remux/commit/e04643305389dbda7d32c646d305f367cf8ecf4b))
+* save device profiles from session capabilities ([5920911](https://github.com/lostb1t/remux/commit/592091161a650dc8e48cefda0b7d78aba69dcbde))
+
+
+### Performance Improvements
+
+* respect item fields in list responses ([#651](https://github.com/lostb1t/remux/issues/651)) ([51c9a82](https://github.com/lostb1t/remux/commit/51c9a8244191be71edc53419157efc9436019fb2))
+* start the played rollup from the user's play state ([#642](https://github.com/lostb1t/remux/issues/642)) ([3d5bcc1](https://github.com/lostb1t/remux/commit/3d5bcc1c4b117842751dcebf6c823f1052c698e3)), closes [#26](https://github.com/lostb1t/remux/issues/26)
+
+## [0.38.2](https://github.com/lostb1t/remux/compare/v0.38.1...v0.38.2) (2026-10-24)
+
+
+### Bug Fixes
+
+* build Linux binaries on ubuntu-24.04 with baseline x86-64 C flags ([f7ed73b](https://github.com/lostb1t/remux/commit/f7ed73b0140467974997876a2a5c425850fc107d))
+
+## [0.38.1](https://github.com/lostb1t/remux/compare/v0.38.0...v0.38.1) (2026-10-24)
+
+
+### Bug Fixes
+
+* only show studios that match the search term ([#648](https://github.com/lostb1t/remux/issues/648)) ([595e539](https://github.com/lostb1t/remux/commit/595e539a42631b92c66fd6fbe7b819375ae76bc3))
+* rank an 8-bit stream tagged HDR as SDR ([72436b6](https://github.com/lostb1t/remux/commit/72436b6b4c819bab4449f1c489dad65406bd5b36))
+
+# [0.38.0](https://github.com/lostb1t/remux/compare/v0.37.0...v0.38.0) (2026-10-24)
+
+
+### Bug Fixes
+
+* **addons:** merge search results from all search addons ([#629](https://github.com/lostb1t/remux/issues/629)) ([d0042ad](https://github.com/lostb1t/remux/commit/d0042ad9c7a9dc700bd5666a3b1aaccfbdb4b414))
+* apply the user policy to item lookups and playback ([#617](https://github.com/lostb1t/remux/issues/617)) ([12ed17c](https://github.com/lostb1t/remux/commit/12ed17cc1f66419c6c7a059164a4ff82365e4841))
+* find local music stored in Artist and Album folders ([#620](https://github.com/lostb1t/remux/issues/620)) ([78652f4](https://github.com/lostb1t/remux/commit/78652f40c4725db3947cb2ccab08d67357c8509d))
+* honor IsFavorite on /Studios and /Genres ([#612](https://github.com/lostb1t/remux/issues/612)) ([b2fc549](https://github.com/lostb1t/remux/commit/b2fc5496703f8efb75fde23df01367b5185e9bfe))
+* honor Season on show episode queries ([#615](https://github.com/lostb1t/remux/issues/615)) ([c671bda](https://github.com/lostb1t/remux/commit/c671bdad181d60b74697b2e7d784cdcce63c824f))
+* keep an explicit ParentIndexNumber on show episode queries ([4f3a574](https://github.com/lostb1t/remux/commit/4f3a5743e086fe1d5a85b657a9350b0a2826f6f9))
+* keep similar-title pages full under a user's policy ([588f242](https://github.com/lostb1t/remux/commit/588f2423f8e4c29b1fd7f7428241014b921c62d8))
+* let old episodes of continuing series leave the refresh window ([#625](https://github.com/lostb1t/remux/issues/625)) ([46ea296](https://github.com/lostb1t/remux/commit/46ea29686b7e3ebe25f05ca2ace71349e54ec73d))
+* limit /items to 250 results when no limit is given ([c9a1a98](https://github.com/lostb1t/remux/commit/c9a1a983d6903e0ca02ed20313651ca910002ab7))
+* list the user's views on a bare /items request ([ba03f36](https://github.com/lostb1t/remux/commit/ba03f362c9a78c2d1d68242ff29857785247b26a))
+* make the library task descriptions say what each task does ([07dcc1d](https://github.com/lostb1t/remux/commit/07dcc1d8cac7ca742bbfa863a327e58c6d7a8016))
+* notify webhooks when an item is marked played from Streamyfin (fixes [#637](https://github.com/lostb1t/remux/issues/637)) ([#643](https://github.com/lostb1t/remux/issues/643)) ([8d46789](https://github.com/lostb1t/remux/commit/8d46789358778014f600ebfbc9799b59196d542a))
+* **playback:** inherit series original language for episode default audio ([#621](https://github.com/lostb1t/remux/issues/621)) ([919ebf9](https://github.com/lostb1t/remux/commit/919ebf9f883ad0ac21cd75ea130927d6f458ff08))
+* **probe:** don't submit or reuse probes of a different file than the listed release ([#628](https://github.com/lostb1t/remux/issues/628)) ([31c7228](https://github.com/lostb1t/remux/commit/31c722836d2c38faf0f6cf878be91c64562d7bb4))
+* resolve a missing path id once per opendal scan, not once per file ([#632](https://github.com/lostb1t/remux/issues/632)) ([2747bbe](https://github.com/lostb1t/remux/commit/2747bbea3c73759584c3c99c5ec60d15cdd28d33))
+* retry a timed-out addon meta fetch once before failing the item ([#631](https://github.com/lostb1t/remux/issues/631)) ([ede6069](https://github.com/lostb1t/remux/commit/ede60699216190c3e7808b8c41e5a6f0d38583a9))
+* retry remuxdb metrics sync with backoff when the backend is down ([#624](https://github.com/lostb1t/remux/issues/624)) ([0d3fde4](https://github.com/lostb1t/remux/commit/0d3fde47fb3cd64e9d54981de2fac1ecef2d62f6))
+* scan WebDAV paths from their own folder, not the share root ([#627](https://github.com/lostb1t/remux/issues/627)) ([838015f](https://github.com/lostb1t/remux/commit/838015f25c80c5afc73d6b7556a03262b4d98b60))
+* skip addon videos that have no episode number ([#623](https://github.com/lostb1t/remux/issues/623)) ([9e49325](https://github.com/lostb1t/remux/commit/9e493253bd95feb01a34dd4962821ba061105289))
+* stop test servers from importing TMDB catalogs at startup ([a02731e](https://github.com/lostb1t/remux/commit/a02731e5f997f1e0a4d331e0c9d496f4fb796e47))
+* **stream:** treat aiostreams error clips and archives as dead in is_alive ([#622](https://github.com/lostb1t/remux/issues/622)) ([49bf567](https://github.com/lostb1t/remux/commit/49bf5679a384d9d32b8b4bf3ac5d91e9750a86b8))
+* treat an empty addon meta response as no metadata, not an error ([#638](https://github.com/lostb1t/remux/issues/638)) ([0bf911d](https://github.com/lostb1t/remux/commit/0bf911d0d301128f1e00a9d1646a33078728deae))
+
+
+### Features
+
+* **sdks:** add playback, episodes and URL helpers for the web client ([8760ab1](https://github.com/lostb1t/remux/commit/8760ab14d0e731bd99acbeafcebdbde359777952))
+* **tasks:** add Refresh Catalogs and Refresh File Indexes tasks ([#630](https://github.com/lostb1t/remux/issues/630)) ([4e15204](https://github.com/lostb1t/remux/commit/4e15204011c290067c1d8f90db51e13e288a5153))
+
+
+### Performance Improvements
+
+* back off nightly refresh for dormant series and movies ([#626](https://github.com/lostb1t/remux/issues/626)) ([5d78bec](https://github.com/lostb1t/remux/commit/5d78becd3b25540b1f8e91d287cc002489d6c33d))
+* check relation kinds by primary key when replacing an item's people ([#641](https://github.com/lostb1t/remux/issues/641)) ([160c1d6](https://github.com/lostb1t/remux/commit/160c1d6d56d2c5eb62e010501ca57fb7e9bab073))
+* look up a folder's indexed rows by path range instead of scanning a bucket ([4f5fcb3](https://github.com/lostb1t/remux/commit/4f5fcb378bd652ad58577c27c0f689cf466e1d9a))
+* seek the relation index for person and studio filters ([#640](https://github.com/lostb1t/remux/issues/640)) ([d229677](https://github.com/lostb1t/remux/commit/d229677078c5bc3b73e5b6277b274f6076429fe1))
+* skip unchanged top-level folders when rescanning WebDAV ([#633](https://github.com/lostb1t/remux/issues/633)) ([3e3e5ac](https://github.com/lostb1t/remux/commit/3e3e5acfee157f1474bbac61ed44202cdc810af6))
+* sync RemuxDB metrics in daily and weekly tiers ([#634](https://github.com/lostb1t/remux/issues/634)) ([2386df0](https://github.com/lostb1t/remux/commit/2386df09bc2c022230b95c315e49f4584e572e1d))
+
+# [0.37.0](https://github.com/lostb1t/remux/compare/v0.36.1...v0.37.0) (2026-10-17)
+
+
+### Bug Fixes
+
+* find subtitles for the exact release being played ([#609](https://github.com/lostb1t/remux/issues/609)) ([fbac093](https://github.com/lostb1t/remux/commit/fbac0930e92b0247002974404d1c5eb66bbe8fab))
+* let user addons provide catalogs (fixes [#595](https://github.com/lostb1t/remux/issues/595)) ([#597](https://github.com/lostb1t/remux/issues/597)) ([76fdcff](https://github.com/lostb1t/remux/commit/76fdcff918e0ba9161b54dac3bd7c14ee0ea8580))
+* make the unreachable manifest test independent of other tests ([bd4bb4c](https://github.com/lostb1t/remux/commit/bd4bb4ced8474f555b50f4f39cfb9b93447f1254))
+* **media:** resolve dedupe winner chains before remapping to avoid uniq_media_relation conflicts ([#603](https://github.com/lostb1t/remux/issues/603)) ([e82d1f8](https://github.com/lostb1t/remux/commit/e82d1f8afb23a4ef694eb4b02c0364375cf2c9c8))
+* play the version PlaybackInfo actually probed ([#602](https://github.com/lostb1t/remux/issues/602)) ([7738b2f](https://github.com/lostb1t/remux/commit/7738b2f9a645c751371b9138344bfd7cd619d708))
+* re-resolve the tmdb id when TMDB returns 404 for it ([#596](https://github.com/lostb1t/remux/issues/596)) ([9071eea](https://github.com/lostb1t/remux/commit/9071eea38d6efd195acc280c001142cf957b8cf9))
+* render mov_text subtitles at the video size when served as ASS (fixes [#599](https://github.com/lostb1t/remux/issues/599)) ([6ff664d](https://github.com/lostb1t/remux/commit/6ff664dbe4aa1c9ee074ef6206f74aa87d39a872))
+* restore collection selection in smart collections and split out collection filters ([#601](https://github.com/lostb1t/remux/issues/601)) ([5c97fb4](https://github.com/lostb1t/remux/commit/5c97fb489c43d7592df2c4578a0da0db1142496a))
+* show episodes' own rating instead of the weighted one (fixes [#611](https://github.com/lostb1t/remux/issues/611)) ([cdc2e52](https://github.com/lostb1t/remux/commit/cdc2e521de1290dc2a9134815a20b0ee3fa10cac))
+* show full catalog names in filter chips and widen the filter editor (fixes [#591](https://github.com/lostb1t/remux/issues/591)) ([2a8bd19](https://github.com/lostb1t/remux/commit/2a8bd1942ba5770e99b996014a5f4a0a120816be))
+* show the saved choice in addon dropdowns (fixes [#605](https://github.com/lostb1t/remux/issues/605)) ([44d9ebd](https://github.com/lostb1t/remux/commit/44d9ebd7ec541668a462bd6c03acad86425addc8))
+* stop importing catalogs from user addons (fixes [#595](https://github.com/lostb1t/remux/issues/595)) ([f81ef87](https://github.com/lostb1t/remux/commit/f81ef872b03933ff2720b69119238dd886068e09))
+
+
+### Features
+
+* add subtitle, bitrate and cached filters to stream groups (fixes [#594](https://github.com/lostb1t/remux/issues/594), fixes [#541](https://github.com/lostb1t/remux/issues/541)) ([#600](https://github.com/lostb1t/remux/issues/600)) ([da0540d](https://github.com/lostb1t/remux/commit/da0540d49616fe30b538f4209273e80bd44178ac))
+
+
+### Reverts
+
+* let user addons provide catalogs ([#597](https://github.com/lostb1t/remux/issues/597)) ([55f679d](https://github.com/lostb1t/remux/commit/55f679dca5e64d4661f9e8e95b92c79cdd617309))
+
 ## [0.36.1](https://github.com/lostb1t/remux/compare/v0.36.0...v0.36.1) (2026-10-06)
 
 

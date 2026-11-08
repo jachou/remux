@@ -1,4 +1,5 @@
 use crate::{
+    addons::CatalogCompleteness,
     sdks,
     sdks::{CachedEndpoint, ClientError, Endpoint, WithExtraQuery},
 };
@@ -85,7 +86,7 @@ impl StremioService {
         &self,
         media_type: sdks::stremio::MediaType,
         id: impl Into<String>,
-    ) -> Result<sdks::stremio::Meta> {
+    ) -> Result<Option<sdks::stremio::Meta>> {
         Ok(self
             .client
             .execute(
@@ -104,7 +105,8 @@ impl StremioService {
                 .should_cache(|response: &sdks::stremio::MetaResponse| {
                     (!response
                         .meta
-                        .is_error())
+                        .as_ref()
+                        .is_some_and(|m| m.is_error()))
                     .then_some(Duration::from_secs(3600))
                 }),
             )
@@ -199,7 +201,11 @@ impl StremioService {
         id: String,
         supports_skip: bool,
         page_concurrency: usize,
-    ) -> Result<Pin<Box<dyn Stream<Item = sdks::stremio::Meta> + Send>>> {
+    ) -> Result<(
+        Pin<Box<dyn Stream<Item = sdks::stremio::Meta> + Send>>,
+        CatalogCompleteness,
+    )> {
+        let completeness = CatalogCompleteness::default();
         let client = self
             .client
             .clone();
@@ -233,7 +239,7 @@ impl StremioService {
             "catalog first page"
         );
         if page_size == 0 || !supports_skip {
-            return Ok(Box::pin(stream::iter(first_page.metas)));
+            return Ok((Box::pin(stream::iter(first_page.metas)), completeness));
         }
 
         let first = stream::once(future::ready(Ok(first_page)));
@@ -351,7 +357,9 @@ impl StremioService {
             // downstream, so the 404-vs-error distinction has to happen here — by
             // the time a later `filter_map`/`map` would see the `Err`, take_while
             // has already stopped the stream without it.
-            .take_while(|result| {
+            .take_while({
+                let completeness = completeness.clone();
+                move |result| {
                 future::ready(match result {
                     Ok(response) => !response
                         .metas
@@ -367,9 +375,13 @@ impl StremioService {
                             "stopping catalog pagination due to unexpected error: {}",
                             e
                         );
+                        // Not the end of the catalog: whatever was imported so
+                        // far is a truncated set and must not drive removals.
+                        completeness.mark_incomplete();
                         false
                     }
                 })
+                }
             })
             .filter_map(|result| async move {
                 match result {
@@ -379,7 +391,7 @@ impl StremioService {
             })
             .flatten();
 
-        Ok(Box::pin(pages))
+        Ok((Box::pin(pages), completeness))
     }
 }
 
@@ -418,9 +430,24 @@ mod tests {
         });
     }
 
+    async fn collect_catalog(
+        svc: &StremioService,
+    ) -> (Vec<String>, CatalogCompleteness) {
+        let (stream, completeness) = svc
+            .get_catalog_stream("movie".to_string(), "test".to_string(), true, 3)
+            .await
+            .unwrap();
+        let names: Vec<String> = stream
+            .map(|m| m.id)
+            .collect()
+            .await;
+        (names, completeness)
+    }
+
     /// Regression test for the take_while/filter_map bug: take_while drops the
     /// first item it rejects instead of passing it downstream, so a 404 on page
-    /// 2 must still yield page 1's items and stop cleanly there.
+    /// 2 must still yield page 1's items and stop cleanly there. A 404 is the
+    /// normal end of the catalog, so the result stays complete.
     #[tokio::test]
     async fn get_catalog_stream_stops_cleanly_on_404() {
         let server = httpmock::MockServer::start();
@@ -431,23 +458,30 @@ mod tests {
         });
 
         let svc = StremioService::from_url(&server.base_url()).unwrap();
-        let stream = svc
-            .get_catalog_stream("movie".to_string(), "test".to_string(), true, 3)
-            .await
-            .unwrap();
-        let names: Vec<String> = stream
-            .map(|m| m.id)
-            .collect()
-            .await;
+        let (names, completeness) = collect_catalog(&svc).await;
 
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        assert!(completeness.is_complete());
     }
 
-    /// Same as above but for a non-404 error (5xx) — must still stop cleanly
-    /// rather than hang or panic, even though it's not the expected
-    /// end-of-catalog signal.
+    /// An empty page is also a normal end of catalog.
     #[tokio::test]
-    async fn get_catalog_stream_stops_cleanly_on_non_404_error() {
+    async fn get_catalog_stream_is_complete_after_an_empty_page() {
+        let server = httpmock::MockServer::start();
+        mock_page(&server, "/catalog/movie/test.json", &["a", "b"]);
+        mock_page(&server, "/catalog/movie/test/skip=2.json", &[]);
+
+        let svc = StremioService::from_url(&server.base_url()).unwrap();
+        let (names, completeness) = collect_catalog(&svc).await;
+
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        assert!(completeness.is_complete());
+    }
+
+    /// A 5xx on a later page still stops cleanly with the items so far, but
+    /// is flagged incomplete so the importer won't remove unseen members.
+    #[tokio::test]
+    async fn get_catalog_stream_is_incomplete_on_non_404_error() {
         let server = httpmock::MockServer::start();
         mock_page(&server, "/catalog/movie/test.json", &["a", "b"]);
         server.mock(|when, then| {
@@ -456,15 +490,27 @@ mod tests {
         });
 
         let svc = StremioService::from_url(&server.base_url()).unwrap();
-        let stream = svc
-            .get_catalog_stream("movie".to_string(), "test".to_string(), true, 3)
-            .await
-            .unwrap();
-        let names: Vec<String> = stream
-            .map(|m| m.id)
-            .collect()
-            .await;
+        let (names, completeness) = collect_catalog(&svc).await;
 
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        assert!(!completeness.is_complete());
+    }
+
+    /// A page that isn't a catalog response at all is a failure, not an end.
+    #[tokio::test]
+    async fn get_catalog_stream_is_incomplete_on_a_malformed_page() {
+        let server = httpmock::MockServer::start();
+        mock_page(&server, "/catalog/movie/test.json", &["a", "b"]);
+        server.mock(|when, then| {
+            when.path("/catalog/movie/test/skip=2.json");
+            then.status(200)
+                .body("<html>bad gateway</html>");
+        });
+
+        let svc = StremioService::from_url(&server.base_url()).unwrap();
+        let (names, completeness) = collect_catalog(&svc).await;
+
+        assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
+        assert!(!completeness.is_complete());
     }
 }

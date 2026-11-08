@@ -442,17 +442,13 @@ async fn streams_metadata(state: &AppState, id: Uuid) -> AnyResult<StreamsRespon
             .unwrap_or(0)
     });
 
-    let groups = db::StreamGroup::list(
+    let enabled_groups = db::StreamGroup::list_enabled(
         &state
             .ctx
             .db,
     )
     .await
     .unwrap_or_default();
-    let enabled_groups: Vec<&db::StreamGroup> = groups
-        .iter()
-        .filter(|g| g.enabled)
-        .collect();
 
     if enabled_groups.is_empty() {
         let streams = sources
@@ -712,8 +708,8 @@ pub async fn remux_meta(
         .get_meta(media_type, id)
         .await
     {
-        Ok(meta) => Ok(Json::<remux_sdks::stremio::Meta>(meta).into_response()),
-        Err(_) => {
+        Ok(Some(meta)) => Ok(Json::<remux_sdks::stremio::Meta>(meta).into_response()),
+        Ok(None) | Err(_) => {
             Ok((StatusCode::NOT_FOUND, Json(serde_json::Value::Null)).into_response())
         }
     }

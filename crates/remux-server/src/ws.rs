@@ -172,7 +172,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: AuthSess
                 match result {
                     Ok(WsEvent::UserUpdated(user_id)) => {
                         if let Ok(Some(user)) = db::User::get_by_id(&state.ctx.db, &user_id).await {
-                            if !send_msg(&mut socket, SessionMessageType::UserUpdated, Some(api::db_user_to_dto(&state.ctx.config.data_dir, user))).await {
+                            let Ok(dto) = crate::api::users::user_dto(&state.ctx.db, &state.ctx.config.data_dir, user).await else {
+                                continue;
+                            };
+                            if !send_msg(&mut socket, SessionMessageType::UserUpdated, Some(dto)).await {
                                 return;
                             }
                         }
@@ -323,6 +326,7 @@ impl Subscriber for WebSocketSubscriber {
             EventType::MarkUnplayed,
             EventType::MarkFavorite,
             EventType::UnmarkFavorite,
+            EventType::UserFlagChanged,
             EventType::Rating,
             EventType::PlaybackStopped,
             EventType::LibraryChanged,
@@ -350,6 +354,10 @@ impl Subscriber for WebSocketSubscriber {
                 item_id: i.media_id,
             },
             Event::UnmarkFavorite(i) => WsEvent::UserDataChanged {
+                user_id: i.user_id,
+                item_id: i.media_id,
+            },
+            Event::UserFlagChanged(i) => WsEvent::UserDataChanged {
                 user_id: i.user_id,
                 item_id: i.media_id,
             },

@@ -483,13 +483,13 @@ impl StreamDescriptor {
         for (key, value) in request_headers {
             request = request.header(key.as_str(), value.as_str());
         }
-        request = request.header(http::header::RANGE, "bytes=0-0");
+        request = request.header(http::header::RANGE, "bytes=0-7");
 
         match request
             .send()
             .await
         {
-            Ok(r) => {
+            Ok(mut r) => {
                 let status = r.status();
                 let is_ok = status.as_u16() < 400;
                 let elapsed = start.elapsed();
@@ -509,7 +509,13 @@ impl StreamDescriptor {
                         });
 
                     let is_tiny_video = total_size.is_some_and(|sz| sz < 2 * 1024 * 1024);
-                    if is_error_video_url(&direct_url) || is_error_video_url(url) || is_tiny_video {
+                    let is_aiostreams_clip = r
+                        .url()
+                        .path()
+                        .rsplit_once("/static/")
+                        .is_some_and(|(_, clip)| AIOSTREAMS_ERROR_CLIPS.contains(&clip));
+
+                    if is_error_video_url(&direct_url) || is_error_video_url(url) || is_tiny_video || is_aiostreams_clip {
                         tracing::warn!(
                             %url,
                             direct_url = %direct_url,
@@ -523,6 +529,26 @@ impl StreamDescriptor {
                         if is_upstream_rate_limit_url(&direct_url) || is_upstream_rate_limit_url(url) {
                             trip_preemptive_circuit_breaker(None, "liveness check detected upstream rate limit video URL");
                         }
+                        return false;
+                    }
+
+                    // Read only until the magic-number prefix is available; servers that
+                    // ignore Range must not trigger a full download.
+                    let mut head = Vec::with_capacity(8);
+                    while head.len() < 8 {
+                        match r.chunk().await {
+                            Ok(Some(chunk)) => head.extend_from_slice(&chunk),
+                            _ => break,
+                        }
+                    }
+                    if ARCHIVE_MAGIC.iter().any(|magic| head.starts_with(magic)) {
+                        tracing::warn!(
+                            %url,
+                            direct_url = %direct_url,
+                            "liveness check rejected archive file stream (RAR/7z/ZIP)"
+                        );
+                        STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
+                        crate::fast_start::FAST_START_CACHE.invalidate(url);
                         return false;
                     }
 
@@ -557,25 +583,25 @@ impl StreamDescriptor {
                             }
                         }
                     }
+                    true
                 } else {
                     tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
                     let is_rate_or_gw = status == http::StatusCode::TOO_MANY_REQUESTS
-                        || status == http::StatusCode::GATEWAY_TIMEOUT
-                        || status == http::StatusCode::SERVICE_UNAVAILABLE;
+                        || status == http::StatusCode::GATEWAY_TIMEOUT;
                     if is_rate_or_gw {
                         let retry_after = r.headers()
                             .get(http::header::RETRY_AFTER)
                             .and_then(|v| v.to_str().ok())
                             .and_then(|s| s.parse::<u64>().ok())
                             .map(std::time::Duration::from_secs);
-                        trip_preemptive_circuit_breaker(retry_after, "liveness check hit rate limit or gateway error (429/504/503)");
+                        trip_preemptive_circuit_breaker(retry_after, "liveness check hit rate limit or gateway error (429/504)");
                         STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
                     } else {
                         STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
                     }
                     crate::fast_start::FAST_START_CACHE.invalidate(url);
+                    false
                 }
-                is_ok
             }
             Err(e) => {
                 let elapsed = start.elapsed();
@@ -742,6 +768,12 @@ pub struct StreamInfo {
     pub probe_data: Option<crate::api::MediaSourceInfo>,
 }
 
+/// Sizes shown to three significant digits ("11.9 GB") are off by up to 1/200.
+const LISTED_SIZE_PRECISION_DIVISOR: u64 = 200;
+/// ±0.005 GiB: sizes shown in GiB to two decimals ("0.68 GB") are off by up to
+/// half a step, which exceeds 1/200 below 1 GiB.
+const LISTED_SIZE_ROUNDING_FLOOR: u64 = (1 << 30) / 200;
+
 impl StreamInfo {
     pub fn is_p2p(&self) -> bool {
         matches!(self.descriptor, StreamDescriptor::Torrent { .. })
@@ -786,6 +818,35 @@ impl StreamInfo {
         }
     }
 
+    /// Whether a probed file of `probed_size` bytes can't be the listed one,
+    /// i.e. a resolver failover served another release. remux's own torrent
+    /// engine never fails over to another release.
+    pub fn is_other_file(&self, probed_size: Option<i64>) -> bool {
+        let (Some(listed), Some(probed)) = (
+            self.size
+                .filter(|&s| s > 0),
+            probed_size.filter(|&s| s > 0),
+        ) else {
+            return false;
+        };
+        let tolerance = (listed.max(probed) as u64 / LISTED_SIZE_PRECISION_DIVISOR)
+            .max(LISTED_SIZE_ROUNDING_FLOOR);
+        !self.is_p2p()
+            && listed.abs_diff(probed) > tolerance
+            && (probed > listed || !self.may_list_release())
+    }
+
+    /// NZBs and torrents without a file index may list the whole release,
+    /// which no file in it can exceed.
+    fn may_list_release(&self) -> bool {
+        self.usenet_guid
+            .is_some()
+            || self
+                .nzb_url
+                .is_some()
+            || matches!(self.torrent_identity(), Some((_, None)))
+    }
+
     pub fn resolution_tag(&self) -> Option<String> {
         let src = self
             .filename
@@ -793,7 +854,7 @@ impl StreamInfo {
             .or(self
                 .name
                 .as_deref())?;
-        crate::db::min_screen_size(&hunch::hunch(src)).map(|s| s.to_owned())
+        crate::db::normalized_screen_size(&hunch::hunch(src), src)
     }
 }
 
@@ -860,6 +921,28 @@ static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .build()
             .expect("failed to build availability client")
     });
+
+/// Clips AIOStreams redirects to (`/static/<clip>`) when a debrid resolve
+/// fails; they are playable MP4s, so status alone reads them as alive. Mirrors
+/// `StaticFiles` in AIOStreams `utils/static-errors.ts`, minus `200.mp4`.
+const AIOSTREAMS_ERROR_CLIPS: &[&str] = &[
+    "download_failed.mp4",
+    "downloading.mp4",
+    "unavailable_for_legal_reasons.mp4",
+    "store_limit_exceeded.mp4",
+    "content_proxy_limit_reached.mp4",
+    "500.mp4",
+    "429.mp4",
+    "403.mp4",
+    "401.mp4",
+    "no_matching_file.mp4",
+    "payment_required.mp4",
+];
+
+/// Archive signatures (RAR, 7z, ZIP) occasionally served by debrid links in
+/// place of the video file; ffmpeg cannot play them.
+const ARCHIVE_MAGIC: &[&[u8]] =
+    &[b"Rar!\x1a\x07", b"7z\xbc\xaf\x27\x1c", b"PK\x03\x04"];
 
 pub(crate) static STREAM_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
@@ -964,6 +1047,16 @@ impl HttpSource {
             .context_bad_request("upstream request failed")?;
 
         let upstream_status = upstream.status();
+        // reqwest follows redirects that carry a usable `Location`, so a 3xx
+        // reaching us has none (or the hop limit ran out). Mirroring it would
+        // send the client a redirect with no target, as the header whitelist
+        // below drops `Location`; fail loudly instead.
+        if upstream_status.is_redirection() {
+            return Err(anyhow::anyhow!(
+                "upstream answered {upstream_status} without a followable Location"
+            ))
+            .context_bad_gateway("upstream redirect has no usable target");
+        }
         let upstream_headers = upstream
             .headers()
             .clone();
@@ -994,9 +1087,97 @@ impl HttpSource {
                     .saturating_add(1);
                 (start, end, length)
             });
+        let client_range = headers
+            .get(http::header::RANGE)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+            });
+        // The upstream ignored the Range request and sent the whole body
+        // (typical for plain file servers behind a .strm). Serve the range
+        // ourselves by skipping into the upstream body.
+        let upstream_length = upstream_headers
+            .get(http::header::CONTENT_LENGTH)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+            })
+            .and_then(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+            });
+        let self_served = (client_range.is_some()
+            && requested_range.is_none()
+            && upstream_status == http::StatusCode::OK)
+            .then(|| match (client_range, upstream_length) {
+                (range, Some(total)) => match resolve_range(range, total) {
+                    RangeRequest::Partial(start, end) => {
+                        Some((start, end, Some(total)))
+                    }
+                    RangeRequest::Unsatisfiable => {
+                        Some((u64::MAX, u64::MAX, Some(total)))
+                    }
+                    RangeRequest::Full => None,
+                },
+                // Unknown length: the real bounds cannot be determined, so
+                // keep the plain 200 rather than advertise made-up offsets.
+                _ => None,
+            })
+            .flatten();
+        if let Some((u64::MAX, _, Some(total))) = self_served {
+            return Ok(range_not_satisfiable(total));
+        }
         let stream = upstream
             .bytes_stream()
             .map_err(io::Error::other);
+        if let Some((start, end, total)) = self_served {
+            let end = total
+                .map(|total| end.min(total.saturating_sub(1)))
+                .unwrap_or(end);
+            let length = end - start + 1;
+            let mut reader = Box::pin(StreamReader::new(stream));
+            tokio::io::copy(&mut (&mut reader).take(start), &mut tokio::io::sink())
+                .await
+                .context_bad_request("upstream read failed")?;
+            let mut resp = Response::builder()
+                .status(http::StatusCode::PARTIAL_CONTENT)
+                .body(Body::from_stream(ReaderStream::new(reader.take(length))))
+                .unwrap();
+            let out = resp.headers_mut();
+            if let Some(v) = upstream_headers.get(http::header::CONTENT_TYPE) {
+                out.insert(http::header::CONTENT_TYPE, v.clone());
+            } else {
+                out.insert(
+                    http::header::CONTENT_TYPE,
+                    http::HeaderValue::from_static("application/octet-stream"),
+                );
+            }
+            out.insert(
+                http::header::ACCEPT_RANGES,
+                http::HeaderValue::from_static("bytes"),
+            );
+            if total.is_some() {
+                out.insert(
+                    http::header::CONTENT_LENGTH,
+                    http::HeaderValue::from_str(&length.to_string())
+                        .expect("range length is a valid header"),
+                );
+            }
+            out.insert(
+                http::header::CONTENT_RANGE,
+                http::HeaderValue::from_str(&format!(
+                    "bytes {start}-{end}/{}",
+                    total
+                        .map(|t| t.to_string())
+                        .unwrap_or_else(|| "*".to_string())
+                ))
+                .expect("range is a valid header"),
+            );
+            return Ok(resp);
+        }
         let body = if let Some((_, _, length)) = bounded_range {
             Body::from_stream(ReaderStream::new(StreamReader::new(stream).take(length)))
         } else {
@@ -1042,6 +1223,8 @@ impl HttpSource {
                 http::HeaderValue::from_static("application/octet-stream"),
             );
         }
+        out.entry(http::header::ACCEPT_RANGES)
+            .or_insert(http::HeaderValue::from_static("bytes"));
 
         Ok(resp)
     }
@@ -1087,47 +1270,48 @@ impl StreamSource for LocalSource {
         let file_size = metadata.len();
         let content_type = mime_from_path(&self.path);
 
-        let range_str = headers
+        let range_header = headers
             .get(http::header::RANGE)
             .and_then(|v| {
                 v.to_str()
                     .ok()
-            })
-            .map(str::to_owned);
+            });
 
-        if let Some(range) = range_str {
-            let (start, end) = parse_range(&range, file_size)
-                .context_bad_request("invalid Range header")?;
-            let length = end - start + 1;
+        match resolve_range(range_header, file_size) {
+            RangeRequest::Unsatisfiable => Ok(range_not_satisfiable(file_size)),
+            RangeRequest::Partial(start, end) => {
+                let length = end - start + 1;
 
-            let mut file = file;
-            file.seek(std::io::SeekFrom::Start(start))
-                .await
-                .context_bad_request("seek failed")?;
+                let mut file = file;
+                file.seek(std::io::SeekFrom::Start(start))
+                    .await
+                    .context_bad_request("seek failed")?;
 
-            let body = Body::from_stream(ReaderStream::new(file.take(length)));
+                let body = Body::from_stream(ReaderStream::new(file.take(length)));
 
-            Ok(Response::builder()
-                .status(http::StatusCode::PARTIAL_CONTENT)
-                .header(http::header::CONTENT_TYPE, content_type)
-                .header(http::header::CONTENT_LENGTH, length)
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .header(
-                    http::header::CONTENT_RANGE,
-                    format!("bytes {}-{}/{}", start, end, file_size),
-                )
-                .body(body)
-                .unwrap())
-        } else {
-            let body = Body::from_stream(ReaderStream::new(file));
+                Ok(Response::builder()
+                    .status(http::StatusCode::PARTIAL_CONTENT)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .header(http::header::CONTENT_LENGTH, length)
+                    .header(http::header::ACCEPT_RANGES, "bytes")
+                    .header(
+                        http::header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end, file_size),
+                    )
+                    .body(body)
+                    .unwrap())
+            }
+            RangeRequest::Full => {
+                let body = Body::from_stream(ReaderStream::new(file));
 
-            Ok(Response::builder()
-                .status(http::StatusCode::OK)
-                .header(http::header::CONTENT_TYPE, content_type)
-                .header(http::header::CONTENT_LENGTH, file_size)
-                .header(http::header::ACCEPT_RANGES, "bytes")
-                .body(body)
-                .unwrap())
+                Ok(Response::builder()
+                    .status(http::StatusCode::OK)
+                    .header(http::header::CONTENT_TYPE, content_type)
+                    .header(http::header::CONTENT_LENGTH, file_size)
+                    .header(http::header::ACCEPT_RANGES, "bytes")
+                    .body(body)
+                    .unwrap())
+            }
         }
     }
 }
@@ -1170,29 +1354,64 @@ impl StreamSource for TorrentSource {
     }
 }
 
-pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
-    let bytes = range
-        .strip_prefix("bytes=")
-        .ok_or_else(|| anyhow::anyhow!("expected bytes= prefix"))?;
-    let (start_str, end_str) = bytes
-        .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("malformed range"))?;
+/// How a request's `Range` header applies to a body of known size.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RangeRequest {
+    /// No usable `Range`: serve the whole body. Malformed and multi-range
+    /// headers land here too, which RFC 9110 allows.
+    Full,
+    /// Inclusive byte range to serve with a 206.
+    Partial(u64, u64),
+    /// Nothing of the body is in range: answer 416.
+    Unsatisfiable,
+}
 
-    if start_str.is_empty() {
-        let suffix: u64 = end_str.parse()?;
-        return Ok((file_size.saturating_sub(suffix), file_size - 1));
-    }
-
-    let start: u64 = start_str.parse()?;
-    let end: u64 = if end_str.is_empty() {
-        file_size - 1
-    } else {
-        end_str
-            .parse::<u64>()?
-            .min(file_size - 1)
+pub fn resolve_range(range: Option<&str>, total: u64) -> RangeRequest {
+    let Some(spec) = range.and_then(|r| r.strip_prefix("bytes=")) else {
+        return RangeRequest::Full;
     };
+    let Some((start, end)) = spec
+        .split_once('-')
+        .filter(|_| !spec.contains(','))
+    else {
+        return RangeRequest::Full;
+    };
+    let (start, end) = (start.trim(), end.trim());
+    if start.is_empty() {
+        let Ok(suffix) = end.parse::<u64>() else {
+            return RangeRequest::Full;
+        };
+        return if suffix == 0 || total == 0 {
+            RangeRequest::Unsatisfiable
+        } else {
+            RangeRequest::Partial(total.saturating_sub(suffix), total - 1)
+        };
+    }
+    let Ok(start) = start.parse::<u64>() else {
+        return RangeRequest::Full;
+    };
+    let end = if end.is_empty() {
+        u64::MAX
+    } else {
+        match end.parse::<u64>() {
+            Ok(end) if end >= start => end,
+            _ => return RangeRequest::Full,
+        }
+    };
+    if start >= total {
+        return RangeRequest::Unsatisfiable;
+    }
+    RangeRequest::Partial(start, end.min(total - 1))
+}
 
-    Ok((start, end))
+pub fn range_not_satisfiable(total: u64) -> Response {
+    Response::builder()
+        .status(http::StatusCode::RANGE_NOT_SATISFIABLE)
+        .header(http::header::ACCEPT_RANGES, "bytes")
+        .header(http::header::CONTENT_RANGE, format!("bytes */{total}"))
+        .header(http::header::CONTENT_LENGTH, 0)
+        .body(Body::empty())
+        .unwrap()
 }
 
 pub fn mime_from_path(path: &std::path::Path) -> &'static str {
@@ -1235,9 +1454,10 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpSource, LivenessEntry, STREAM_LIVENESS_CACHE, STREAM_PROXY_CLIENT, StreamDescriptor,
-        TrackerUrl, is_tracker_url, mime_from_path,
+        HttpSource, LivenessEntry, RangeRequest, STREAM_LIVENESS_CACHE, STREAM_PROXY_CLIENT,
+        StreamDescriptor, StreamInfo, TrackerUrl, is_tracker_url, mime_from_path, resolve_range,
     };
+    use axum::response::Response;
     use std::path::Path;
 
     #[test]
@@ -1322,6 +1542,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn is_alive_rejects_error_clips_and_archives() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/playback/failed");
+            then.status(307)
+                .header("Location", "/static/download_failed.mp4");
+        });
+        for (path, body) in [
+            ("/static/download_failed.mp4", &b"\x00\x00\x00\x20ftyp"[..]),
+            ("/archive.mkv", b"Rar!\x1a\x07\x01\x00"),
+            ("/movie.mkv", b"\x1a\x45\xdf\xa3\x01\x00\x00\x00"),
+        ] {
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(path);
+                then.status(206)
+                    .body(body);
+            });
+        }
+
+        for (path, alive) in [
+            ("/playback/failed", false),
+            ("/archive.mkv", false),
+            ("/movie.mkv", true),
+        ] {
+            assert_eq!(
+                StreamDescriptor::http(server.url(path))
+                    .is_alive()
+                    .await,
+                alive,
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn torrent_proxy_bounds_finite_ranges() {
         let server = httpmock::MockServer::start();
         let payload = vec![b'x'; 2048];
@@ -1363,6 +1620,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn static_stream_never_mirrors_a_redirect_without_location() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/no-target");
+            then.status(307);
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/hop");
+            then.status(307)
+                .header("Location", "/file.flac");
+        });
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/file.flac");
+            then.status(200)
+                .body(vec![b'x'; 16]);
+        });
+
+        let serve = |path: &str| {
+            let source = HttpSource {
+                url: format!("{}{path}", server.base_url()),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            };
+            async move {
+                let mut headers = http::HeaderMap::new();
+                headers.insert(
+                    http::header::RANGE,
+                    http::HeaderValue::from_static("bytes=0-"),
+                );
+                source
+                    .serve_inner(&headers, false)
+                    .await
+            }
+        };
+
+        // A 3xx with no Location must not reach the client as a 3xx.
+        assert!(
+            serve("/no-target")
+                .await
+                .is_err()
+        );
+
+        // A redirect with a Location is followed, not mirrored.
+        let followed = serve("/hop")
+            .await
+            .unwrap();
+        assert!(
+            followed
+                .status()
+                .is_success()
+        );
+    }
+
+    #[tokio::test]
     async fn torrent_proxy_does_not_rewrite_full_responses_as_partial() {
         let server = httpmock::MockServer::start();
         let payload = vec![b'x'; 2048];
@@ -1395,6 +1709,145 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 2048);
+    }
+
+    #[test]
+    fn resolve_range_handles_every_range_form() {
+        let r = |range, total| resolve_range(Some(range), total);
+        assert_eq!(r("bytes=100-199", 1000), RangeRequest::Partial(100, 199));
+        assert_eq!(r("bytes=900-", 1000), RangeRequest::Partial(900, 999));
+        assert_eq!(r("bytes=-50", 1000), RangeRequest::Partial(950, 999));
+        assert_eq!(r("bytes=-5000", 1000), RangeRequest::Partial(0, 999));
+        assert_eq!(r("bytes=0-5000", 1000), RangeRequest::Partial(0, 999));
+        assert_eq!(r("bytes=1000-", 1000), RangeRequest::Unsatisfiable);
+        assert_eq!(r("bytes=-0", 1000), RangeRequest::Unsatisfiable);
+        assert_eq!(r("bytes=0-1", 0), RangeRequest::Unsatisfiable);
+        assert_eq!(r("bytes=5-1", 1000), RangeRequest::Full);
+        assert_eq!(r("bytes=0-1,5-6", 1000), RangeRequest::Full);
+        assert_eq!(r("items=0-1", 1000), RangeRequest::Full);
+        assert_eq!(resolve_range(None, 1000), RangeRequest::Full);
+    }
+
+    async fn serve_from_upstream_without_range_support(
+        range: Option<&'static str>,
+    ) -> Response {
+        let server = httpmock::MockServer::start();
+        let payload: Vec<u8> = (0..=255u8)
+            .cycle()
+            .take(1000)
+            .collect();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/file.mp3");
+            then.status(200)
+                .header("Content-Type", "audio/mpeg")
+                .body(payload);
+        });
+        let source = HttpSource {
+            url: format!("{}/file.mp3", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        if let Some(range) = range {
+            headers.insert(http::header::RANGE, http::HeaderValue::from_static(range));
+        }
+        source
+            .serve_inner(&headers, false)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn http_source_serves_ranges_itself_when_upstream_ignores_them() {
+        let response =
+            serve_from_upstream_without_range_support(Some("bytes=100-199")).await;
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "100");
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 100-199/1000"
+        );
+        assert_eq!(response.headers()[http::header::ACCEPT_RANGES], "bytes");
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 100);
+        assert_eq!(body[0], 100);
+        assert_eq!(body[99], 199);
+
+        let response =
+            serve_from_upstream_without_range_support(Some("bytes=-10")).await;
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 990-999/1000"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_source_keeps_the_full_response_when_upstream_has_no_length() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .unwrap();
+            let mut buf = [0u8; 2048];
+            let _ = socket
+                .read(&mut buf)
+                .await;
+            // No Content-Length: the body ends when the connection closes.
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n0123456789")
+                .await
+                .unwrap();
+        });
+        let source = HttpSource {
+            url: format!("http://{addr}/file.mp3"),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=0-"),
+        );
+        let response = source
+            .serve_inner(&headers, false)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert!(
+            !response
+                .headers()
+                .contains_key(http::header::CONTENT_RANGE)
+        );
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], b"0123456789");
+    }
+
+    #[tokio::test]
+    async fn http_source_answers_416_and_advertises_ranges() {
+        let response =
+            serve_from_upstream_without_range_support(Some("bytes=5000-")).await;
+        assert_eq!(response.status(), http::StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes */1000"
+        );
+
+        let response = serve_from_upstream_without_range_support(None).await;
+        assert_eq!(response.status(), http::StatusCode::OK);
+        assert_eq!(response.headers()[http::header::ACCEPT_RANGES], "bytes");
     }
 
     #[tokio::test]
@@ -1442,8 +1895,8 @@ mod tests {
         let mock = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
                 .path("/live.mkv")
-                .header("Range", "bytes=0-0");
-            then.status(206);
+                .header("Range", "bytes=0-7");
+            then.status(206).body(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0]);
         });
 
         let test_url = format!("{}/live.mkv", server.base_url());
@@ -1512,5 +1965,60 @@ mod tests {
         // After failure, must be recorded as dead in cache
         assert_eq!(STREAM_LIVENESS_CACHE.get(&test_url).map(|e| e.alive), Some(false));
         assert!(desc.is_known_dead());
+    }
+
+    #[test]
+    fn is_other_file_only_when_listing_rounding_cannot_explain_the_size() {
+        let indexed = StreamInfo {
+            torrent_info_hash: Some("abc123".into()),
+            torrent_file_idx: Some(0),
+            ..Default::default()
+        };
+        let unindexed = StreamInfo {
+            torrent_info_hash: Some("abc123".into()),
+            ..Default::default()
+        };
+        let nzb = StreamInfo {
+            nzb_url: Some("https://indexer.example/api?t=get&id=1".into()),
+            ..Default::default()
+        };
+        let p2p = StreamInfo {
+            descriptor: StreamDescriptor::Torrent {
+                info_hash: "abc123".into(),
+                file_hint: None,
+                file_idx: None,
+                trackers: vec![],
+            },
+            ..Default::default()
+        };
+        let (listed, smaller, larger) = (12_811_223_977, 8_657_935_338, 19_000_000_000);
+        let cases = [
+            (&indexed, listed, smaller, true),
+            (&indexed, listed, larger, true),
+            // 0.33% off: within three-significant-digit rounding.
+            (&indexed, listed, listed - 42_000_000, false),
+            // 0.53% off, but within the 0.005 GiB rounding floor.
+            (&indexed, 730_144_440, 734_003_200, false),
+            (&indexed, 730_144_440, 740_000_000, true),
+            // May list the whole release: only a larger file contradicts it.
+            (&unindexed, listed, smaller, false),
+            (&unindexed, listed, larger, true),
+            (&nzb, listed, smaller, false),
+            (&nzb, listed, larger, true),
+            (&p2p, listed, larger, false),
+        ];
+        for (si, listed, probed, other) in cases {
+            let si = StreamInfo {
+                size: Some(listed),
+                ..si.clone()
+            };
+            assert_eq!(
+                si.is_other_file(Some(probed)),
+                other,
+                "{listed} vs {probed}"
+            );
+            assert!(!si.is_other_file(None));
+        }
+        assert!(!indexed.is_other_file(Some(smaller)));
     }
 }

@@ -256,6 +256,19 @@ impl AddonPreset for OpendalWebdavPreset {
                     default: None,
                     kind: AddonOptionType::StringList,
                 },
+                AddonOption {
+                    id: "incremental_scan".to_string(),
+                    name: "Incremental rescans".to_string(),
+                    description: Some(
+                        "Skip top-level folders whose modified time has not changed since they were indexed. \
+                         Only for servers that update a folder's mtime when anything below it changes; \
+                         everything is still walked in full once a week."
+                            .to_string(),
+                    ),
+                    required: false,
+                    default: Some(serde_json::Value::Bool(false)),
+                    kind: AddonOptionType::Boolean,
+                },
             ],
         }
     }
@@ -338,6 +351,31 @@ pub struct OpendalFile {
     pub size: Option<i64>,
     #[sqlx(default)]
     pub probe_data: Option<sqlx::types::Json<crate::api::MediaSourceInfo>>,
+}
+
+impl OpendalAddon {
+    /// How to serve the file at `path`. A local backend indexes absolute
+    /// paths while its operator is rooted at the library folder, so going
+    /// through the operator would resolve the path under the root a second
+    /// time; local files are served straight from disk instead.
+    fn descriptor_for(&self, path: &str) -> crate::stream::StreamDescriptor {
+        // A `.strm` file is indexed under the URL it contains, not under its own
+        // path, so there is no file on the backend to open: play the URL.
+        if path.starts_with("http://") || path.starts_with("https://") {
+            crate::stream::StreamDescriptor::Http {
+                url: path.to_string(),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            }
+        } else if self.backend == "local" {
+            crate::stream::StreamDescriptor::Local(std::path::PathBuf::from(path))
+        } else {
+            crate::stream::StreamDescriptor::Opendal {
+                addon_id: self.addon_id,
+                path: path.to_string(),
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -431,25 +469,105 @@ impl CatalogAddon for OpendalAddon {
                 .collect()
             }
             "track" => {
-                sqlx::query_as::<_, (Option<String>,)>(
-                    "SELECT title FROM opendal_files \
-                     WHERE addon_id = ? AND media_kind = 'track'",
+                #[derive(sqlx::FromRow)]
+                struct FileRow {
+                    path: String,
+                    title: Option<String>,
+                    track_number: Option<i64>,
+                    artist: Option<String>,
+                    album: Option<String>,
+                    disc_number: Option<i64>,
+                }
+                let files: Vec<FileRow> = sqlx::query_as(
+                    "SELECT path, title, track_number, artist, album, disc_number FROM opendal_files \
+                     WHERE addon_id = ? AND media_kind = 'track' ORDER BY artist, album, disc_number, track_number",
                 )
                 .bind(self.addon_id)
                 .fetch_all(&ctx.db)
-                .await?
-                .into_iter()
-                .filter_map(|(title,)| title)
-                .map(|title| db::Media {
-                    id: common::get_stable_uuid(format!(
-                        "{}:track:{}",
-                        self.addon_id, title
-                    )),
-                    title: title.clone(),
-                    kind: db::MediaKind::Track,
-                    ..Default::default()
-                })
-                .collect()
+                .await?;
+
+                // Jellyfin music hierarchy: Artist -> Album -> Track. Ids are
+                // derived from the file path / names so same-titled tracks in
+                // different albums never collide and survive reimports.
+                let mut seen_artists: std::collections::HashSet<String> =
+                    Default::default();
+                let mut seen_albums: std::collections::HashSet<String> =
+                    Default::default();
+                let mut out: Vec<db::Media> = Vec::with_capacity(files.len() * 2);
+
+                for f in &files {
+                    let artist_key = f
+                        .artist
+                        .as_deref()
+                        .map(|a| music_artist_key(self.addon_id, a));
+                    let album_key = f
+                        .album
+                        .as_deref()
+                        .map(|album| {
+                            music_album_key(self.addon_id, f.artist.as_deref(), album)
+                        });
+                    let artist_id = artist_key
+                        .as_ref()
+                        .map(|k| common::get_stable_uuid(k.clone()));
+                    let album_id = album_key
+                        .as_ref()
+                        .map(|k| common::get_stable_uuid(k.clone()));
+                    if let (Some(artist), Some(key)) = (&f.artist, &artist_key) {
+                        if seen_artists.insert(key.clone()) {
+                            out.push(db::Media {
+                                id: common::get_stable_uuid(key.clone()),
+                                title: artist.clone(),
+                                kind: db::MediaKind::Artist,
+                                external_ids: db::ExternalIds {
+                                    custom_stremio_id: Some(key.clone()),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    if let (Some(album), Some(key)) = (&f.album, &album_key) {
+                        if seen_albums.insert(key.clone()) {
+                            out.push(db::Media {
+                                id: common::get_stable_uuid(key.clone()),
+                                title: album.clone(),
+                                kind: db::MediaKind::Album,
+                                parent_id: artist_id,
+                                grandparent_id: artist_id,
+                                external_ids: db::ExternalIds {
+                                    custom_stremio_id: Some(key.clone()),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            });
+                        }
+                    }
+                    let track_key = format!("{}:track:{}", self.addon_id, f.path);
+                    let descriptor = self.descriptor_for(&f.path);
+                    out.push(db::Media {
+                        id: common::get_stable_uuid(track_key.clone()),
+                        title: f
+                            .title
+                            .clone()
+                            .unwrap_or_default(),
+                        kind: db::MediaKind::Track,
+                        idx: f.track_number,
+                        parent_idx: f.disc_number,
+                        parent_id: album_id,
+                        grandparent_id: artist_id,
+                        stream_info: Some(crate::stream::StreamInfo {
+                            descriptor,
+                            name: Some(f.path.clone()),
+                            ..Default::default()
+                        }),
+                        external_ids: db::ExternalIds {
+                            custom_stremio_id: Some(track_key),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    });
+                }
+                out
             }
             _ => {
                 sqlx::query_as::<_, (String, Option<String>)>(
@@ -617,10 +735,7 @@ impl SubtitleAddon for OpendalAddon {
                     id: f
                         .path
                         .clone(),
-                    url: Some(crate::stream::StreamDescriptor::Opendal {
-                        addon_id: self.addon_id,
-                        path: f.path,
-                    }),
+                    url: Some(self.descriptor_for(&f.path)),
                     lang,
                     is_forced,
                     is_hi,
@@ -670,6 +785,38 @@ impl StreamAddon for OpendalAddon {
         _id_prefixes: Option<&[String]>,
     ) -> Result<Vec<crate::stream::StreamInfo>> {
         let files: Vec<OpendalFile> = if self.media_kind == "track" {
+            // Local tracks carry their own descriptor (path) on the media row;
+            // fall back to a title+artist+album match for legacy rows.
+            // Only reuse it when the file is one this addon indexed: every music
+            // addon supports every track, so another addon's descriptor must not
+            // be stamped with this addon's identity.
+            if let Some(si) = &media.stream_info {
+                let owned_path = match &si.descriptor {
+                    crate::stream::StreamDescriptor::Local(p) => Some(
+                        p.to_string_lossy()
+                            .into_owned(),
+                    ),
+                    crate::stream::StreamDescriptor::Opendal { addon_id, path }
+                        if *addon_id == self.addon_id =>
+                    {
+                        Some(path.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(path) = owned_path {
+                    let owned: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM opendal_files \
+                         WHERE addon_id = ? AND media_kind = 'track' AND path = ?)",
+                    )
+                    .bind(self.addon_id)
+                    .bind(&path)
+                    .fetch_one(&ctx.db)
+                    .await?;
+                    if owned {
+                        return Ok(vec![si.clone()]);
+                    }
+                }
+            }
             sqlx::query_as(
                 "SELECT path, name, title, imdb_id, season, episode, track_number, year, size, probe_data \
                  FROM opendal_files \
@@ -729,21 +876,16 @@ impl StreamAddon for OpendalAddon {
                 }
             })
             .map(|f| {
-                let descriptor = if self.backend == "local" {
-                    crate::stream::StreamDescriptor::Local(std::path::PathBuf::from(
-                        &f.path,
-                    ))
-                } else {
-                    crate::stream::StreamDescriptor::Opendal {
-                        addon_id: self.addon_id,
-                        path: f
-                            .path
-                            .clone(),
-                    }
-                };
+                let descriptor = self.descriptor_for(&f.path);
                 crate::stream::StreamInfo {
                     descriptor,
                     name: Some(
+                        f.name
+                            .clone(),
+                    ),
+                    // Lets release-aware subtitle ranking compare sidecars
+                    // against this file.
+                    filename: Some(
                         f.name
                             .clone(),
                     ),
@@ -784,32 +926,35 @@ impl StreamAddon for OpendalAddon {
             .operator
             .stat(path)
             .await
-            .context_not_found("file not found in opendal backend")?;
+            .map_err(|e| backend_error(self.addon_id, path, "stat", e))?;
         let file_size = meta.content_length();
         let content_type = crate::stream::mime_from_path(std::path::Path::new(path));
 
-        let range_str = headers
+        let range_header = headers
             .get(http::header::RANGE)
             .and_then(|v| {
                 v.to_str()
                     .ok()
-            })
-            .map(str::to_owned);
+            });
 
-        if let Some(range) = range_str {
-            let (start, end) = crate::stream::parse_range(&range, file_size)
-                .context_bad_request("invalid Range header")?;
+        use crate::stream::RangeRequest;
+        let range = crate::stream::resolve_range(range_header, file_size);
+        if range == RangeRequest::Unsatisfiable {
+            return Ok(crate::stream::range_not_satisfiable(file_size));
+        }
+
+        if let RangeRequest::Partial(start, end) = range {
             let length = end - start + 1;
 
             let reader = self
                 .operator
                 .reader_with(path)
                 .await
-                .context_bad_request("failed to open opendal reader")?;
+                .map_err(|e| backend_error(self.addon_id, path, "open", e))?;
             let bytes_stream = reader
                 .into_bytes_stream(start..start + length)
                 .await
-                .context_bad_request("failed to create opendal byte stream")?
+                .map_err(|e| backend_error(self.addon_id, path, "read", e))?
                 .map_err(io::Error::other);
 
             Ok(axum::response::Response::builder()
@@ -828,11 +973,11 @@ impl StreamAddon for OpendalAddon {
                 .operator
                 .reader(path)
                 .await
-                .context_bad_request("failed to open opendal reader")?;
+                .map_err(|e| backend_error(self.addon_id, path, "open", e))?;
             let bytes_stream = reader
                 .into_bytes_stream(..)
                 .await
-                .context_bad_request("failed to create opendal byte stream")?
+                .map_err(|e| backend_error(self.addon_id, path, "read", e))?
                 .map_err(io::Error::other);
 
             Ok(axum::response::Response::builder()
@@ -973,18 +1118,7 @@ impl TreeAddon for OpendalAddon {
                         // Leave title empty so the TMDB meta addon can fill in the proper
                         // episode name via refresh_meta (which apply_title_format then wraps).
                         let title = String::new();
-                        let descriptor = if self.backend == "local" {
-                            crate::stream::StreamDescriptor::Local(
-                                std::path::PathBuf::from(&f.path),
-                            )
-                        } else {
-                            crate::stream::StreamDescriptor::Opendal {
-                                addon_id: self.addon_id,
-                                path: f
-                                    .path
-                                    .clone(),
-                            }
-                        };
+                        let descriptor = self.descriptor_for(&f.path);
                         Some(db::Media {
                             id: common::get_stable_uuid(format!(
                                 "episode:{}:{}:{}",
@@ -1114,6 +1248,96 @@ fn split_subtitle_stem(stem: &str) -> (String, Option<String>, bool, bool) {
     (parts[..suffix_start].join("."), lang, is_forced, is_hi)
 }
 
+/// Stable key of a local music artist; the id and `custom_stremio_id` derive
+/// from it.
+fn music_artist_key(addon_id: Uuid, artist: &str) -> String {
+    format!("{addon_id}:artist:{artist}")
+}
+
+/// Stable key of a local music album. The artist's length comes first so names
+/// containing `:` can't make two different artist/album pairs share a key
+/// (`A:B` + `C` versus `A` + `B:C`).
+fn music_album_key(addon_id: Uuid, artist: Option<&str>, album: &str) -> String {
+    let artist = artist.unwrap_or("");
+    format!("{addon_id}:album:{}:{artist}:{album}", artist.len())
+}
+
+/// Artist, album and disc number of a music file from the Jellyfin folder
+/// layout: `{Artist}/{Album}/{NN - Title}`, album-only folders (`{Album}/{Track}`)
+/// and loose tracks. A `Disc N` / `CD N` folder inside the album carries the
+/// disc number instead of naming the album. `rel_path` is relative to the
+/// operator root; `scan_dir` is the configured directory it was listed from
+/// (`/` for local roots) and is not part of the layout.
+fn music_layout(
+    rel_path: &str,
+    scan_dir: &str,
+) -> (Option<String>, Option<String>, Option<i64>) {
+    let rel = rel_path.trim_matches('/');
+    let base = scan_dir.trim_matches('/');
+    let rel = if base.is_empty() {
+        rel
+    } else {
+        rel.strip_prefix(base)
+            .map(|r| r.trim_start_matches('/'))
+            .unwrap_or(rel)
+    };
+    let mut dirs: Vec<&str> = rel
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .collect();
+    dirs.pop(); // the file itself
+
+    static DISC_DIR: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"(?i)^(?:disc|disk|cd)[\s._-]*(\d{1,2})$").unwrap()
+    });
+    let mut disc = None;
+    if let Some(n) = dirs
+        .last()
+        .and_then(|d| DISC_DIR.captures(d))
+        .and_then(|c| {
+            c[1].parse::<i64>()
+                .ok()
+        })
+    {
+        disc = Some(n);
+        dirs.pop();
+    }
+    match dirs.as_slice() {
+        [artist, album, ..] => (
+            Some((*artist).to_string()),
+            Some((*album).to_string()),
+            disc,
+        ),
+        [album] => (None, Some((*album).to_string()), disc),
+        _ => (None, None, disc),
+    }
+}
+
+/// A subtitle seen during a scan, waiting for the whole listing so it can be
+/// linked to the video beside it. `dir` comes from the full stored path, so the
+/// same relative folder under two scan roots stays distinct.
+struct PendingSub {
+    dir: String,
+    path: String,
+    name: String,
+}
+
+/// What the scan knows about an identified video, to hand on to its subtitles.
+struct IndexedVideo {
+    imdb_id: String,
+    title: Option<String>,
+    season: Option<i64>,
+    episode: Option<i64>,
+    year: Option<i64>,
+}
+
+/// The folder an entry sits in, as listed.
+fn parent_dir(entry_rel: &str) -> String {
+    entry_rel
+        .rsplit_once('/')
+        .map_or_else(String::new, |(dir, _)| dir.to_string())
+}
+
 async fn scan_addon(
     ctx: &AppContext,
     tmdb: &Option<sdks::RestClient<sdks::BearerAuth>>,
@@ -1202,17 +1426,33 @@ async fn scan_addon(
         None
     };
     let mut probe_jobs: Vec<ProbeJob> = Vec::new();
+    let mut path_id_memo = PathIdMemo::default();
+    let mut videos: std::collections::HashMap<(String, String), IndexedVideo> =
+        Default::default();
+    let mut pending_subs: Vec<PendingSub> = Vec::new();
+
+    // Debrid-style WebDAV shares only ever add folders, so a folder that has not
+    // changed since it was indexed is not walked again. This is opt-in
+    // (`incremental_scan: true` in the addon config): many servers only bump a
+    // directory's mtime for direct children, so a change deep in a tree may not be
+    // seen until the weekly full walk. Local scans never skip.
+    let incremental = if is_local || cfg["incremental_scan"].as_bool() != Some(true) {
+        None
+    } else {
+        IncrementalIndex::load(ctx, addon.id).await?
+    };
 
     for (operator, list_from, path_prefix) in scan_roots {
-        let mut lister = operator
-            .lister_with(&list_from)
-            .recursive(true)
-            .await?;
+        let (mut single, mut lister) = open_scan_source(
+            &operator,
+            &list_from,
+            is_local,
+            incremental.as_ref(),
+            &mut seen_ids,
+        )
+        .await?;
 
-        while let Some(entry) = lister
-            .try_next()
-            .await?
-        {
+        while let Some(entry) = next_scan_entry(&mut single, &mut lister).await? {
             // The lister classifies entries from a raw readdir() call, which does not
             // follow symlinks and reports them as EntryMode::Unknown. Resolve those
             // via stat() (which does follow symlinks) so symlinked media files staged
@@ -1252,145 +1492,14 @@ async fn scan_addon(
                 .unwrap_or("")
                 .to_lowercase();
 
-            // Subtitle files: parse IMDB from filename (same convention as video files).
+            // Subtitle files are linked to their video once the whole listing
+            // has been seen, whatever order the two were listed in.
             if SUBTITLE_EXTENSIONS.contains(&ext.as_str()) {
-                let stem = stem_without_ext(&name);
-                let (base_stem, _, _, _) = split_subtitle_stem(&stem);
-                let jellyfin_ids = db::ExternalIds::from_path(&path);
-                let parsed = hunch::hunch(&base_stem);
-
-                let (imdb_id, season, episode, year, title_str) =
-                    match media_kind.as_str() {
-                        "episode" => {
-                            let season = parsed
-                                .season()
-                                .map(|s| s as i64);
-                            let episode = parsed
-                                .episode()
-                                .map(|e| e as i64);
-                            let year = parsed
-                                .year()
-                                .map(|y| y as i64);
-                            let clean_title = parsed
-                                .title()
-                                .unwrap_or(base_stem.as_str())
-                                .to_string();
-                            let existing_imdb =
-                                fetch_existing_imdb(ctx, addon.id, &path).await?;
-                            let imdb_id = if let Some(id) = existing_imdb {
-                                Some(id)
-                            } else if !jellyfin_ids.is_empty() {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_ids(
-                                        &jellyfin_ids,
-                                        true,
-                                        client,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    jellyfin_ids
-                                        .imdb
-                                        .clone()
-                                        .map(Into::into)
-                                }
-                            } else {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_search(
-                                        client,
-                                        &clean_title,
-                                        None,
-                                        true,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    None
-                                }
-                            };
-                            (imdb_id, season, episode, year, clean_title)
-                        }
-                        _ => {
-                            let year = parsed
-                                .year()
-                                .map(|y| y as i64);
-                            let clean_title = parsed
-                                .title()
-                                .unwrap_or(base_stem.as_str())
-                                .to_string();
-                            let existing_imdb =
-                                fetch_existing_imdb(ctx, addon.id, &path).await?;
-                            let imdb_id = if let Some(id) = existing_imdb {
-                                Some(id)
-                            } else if !jellyfin_ids.is_empty() {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_ids(
-                                        &jellyfin_ids,
-                                        false,
-                                        client,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    jellyfin_ids
-                                        .imdb
-                                        .clone()
-                                        .map(Into::into)
-                                }
-                            } else {
-                                if let Some(client) = tmdb {
-                                    MediaResolveService::resolve_imdb_from_search(
-                                        client,
-                                        &clean_title,
-                                        year,
-                                        false,
-                                    )
-                                    .await
-                                    .map(Into::into)
-                                } else {
-                                    None
-                                }
-                            };
-                            (imdb_id, None, None, year, clean_title)
-                        }
-                    };
-
-                if imdb_id.is_none() {
-                    debug!(path, "opendal: subtitle has no IMDB id, skipping");
-                    continue;
-                }
-
-                let sub_id = common::get_stable_uuid(format!("{}:{}", addon.id, path));
-                seen_ids.push(sub_id);
-                let now = Utc::now()
-                    .naive_utc()
-                    .to_string();
-                sqlx::query(
-                    "INSERT INTO opendal_files \
-                     (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at) \
-                     VALUES (?, ?, 'subtitle', ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?) \
-                     ON CONFLICT(id) DO UPDATE SET \
-                       path = excluded.path, name = excluded.name, \
-                       title = excluded.title, \
-                       imdb_id = COALESCE(opendal_files.imdb_id, excluded.imdb_id), \
-                       season = excluded.season, episode = excluded.episode, \
-                       year = excluded.year, scanned_at = excluded.scanned_at",
-                )
-                .bind(sub_id)
-                .bind(addon.id)
-                .bind(&path)
-                .bind(&name)
-                .bind(&title_str)
-                .bind(imdb_id.as_deref())
-                .bind(season)
-                .bind(episode)
-                .bind(year)
-                .bind(&now)
-                .execute(&ctx.db)
-                .await?;
-
-                debug!(path, "opendal: indexed subtitle");
-                upserted += 1;
+                pending_subs.push(PendingSub {
+                    dir: parent_dir(&path),
+                    path,
+                    name,
+                });
                 continue;
             }
 
@@ -1587,13 +1696,13 @@ async fn scan_addon(
                         Some(id)
                     } else if !jellyfin_ids.is_empty() {
                         if let Some(client) = tmdb {
-                            MediaResolveService::resolve_imdb_from_ids(
+                            resolve_path_ids(
+                                &mut path_id_memo,
                                 &jellyfin_ids,
                                 true,
                                 client,
                             )
                             .await
-                            .map(Into::into)
                         } else {
                             jellyfin_ids
                                 .imdb
@@ -1637,13 +1746,13 @@ async fn scan_addon(
                         Some(id)
                     } else if !jellyfin_ids.is_empty() {
                         if let Some(client) = tmdb {
-                            MediaResolveService::resolve_imdb_from_ids(
+                            resolve_path_ids(
+                                &mut path_id_memo,
                                 &jellyfin_ids,
                                 false,
                                 client,
                             )
                             .await
-                            .map(Into::into)
                         } else {
                             jellyfin_ids
                                 .imdb
@@ -1672,6 +1781,27 @@ async fn scan_addon(
 
                     (Some(clean_title), None, None, None, year, imdb_id)
                 }
+            };
+
+            if let Some(imdb) = imdb_id.as_deref() {
+                videos.insert(
+                    (parent_dir(&path), stem.to_lowercase()),
+                    IndexedVideo {
+                        imdb_id: imdb.to_string(),
+                        title: title.clone(),
+                        season,
+                        episode,
+                        year,
+                    },
+                );
+            }
+
+            // Jellyfin music layout, see `music_layout`. Without embedded tags the
+            // folder names are the source of truth for artist/album.
+            let (artist, album, disc_number) = if media_kind == "track" {
+                music_layout(&entry_rel, &list_from)
+            } else {
+                (None, None, None)
             };
 
             // The local lister reports neither length nor mtime, so probing falls
@@ -1706,8 +1836,8 @@ async fn scan_addon(
 
             let insert_result = sqlx::query(
                 "INSERT INTO opendal_files \
-                 (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                 (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at, artist, album, disc_number) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(id) DO UPDATE SET \
                    path = excluded.path, \
                    name = excluded.name, media_kind = excluded.media_kind, \
@@ -1716,6 +1846,8 @@ async fn scan_addon(
                    season = excluded.season, episode = excluded.episode, \
                    track_number = excluded.track_number, \
                    year = excluded.year, size = excluded.size, scanned_at = excluded.scanned_at, \
+                   artist = excluded.artist, album = excluded.album, \
+                   disc_number = excluded.disc_number, \
                    probe_data = CASE WHEN ? IS NOT NULL AND ? IS NOT opendal_files.probe_version THEN NULL ELSE opendal_files.probe_data END",
             )
             .bind(row_id)
@@ -1731,6 +1863,9 @@ async fn scan_addon(
             .bind(year)
             .bind(size)
             .bind(&now)
+            .bind(artist.as_deref())
+            .bind(album.as_deref())
+            .bind(disc_number)
             .bind(probe_version.as_deref())
             .bind(probe_version.as_deref())
             .execute(&ctx.db)
@@ -1796,6 +1931,172 @@ async fn scan_addon(
                 Err(e) => return Err(e.into()),
             }
         }
+    }
+
+    // Link each subtitle to the video beside it (same folder, same name up to
+    // its language/flag suffixes), which has already been identified. Only a
+    // subtitle with no such video falls back to identifying itself.
+    for PendingSub { dir, path, name } in pending_subs {
+        let stem = stem_without_ext(&name);
+        let (base_stem, _, _, _) = split_subtitle_stem(&stem);
+        // The video next to it already has the ids: no second lookup.
+        let sibling = videos
+            .get(&(dir.clone(), stem.to_lowercase()))
+            .or_else(|| videos.get(&(dir.clone(), base_stem.to_lowercase())));
+        let jellyfin_ids = db::ExternalIds::from_path(&path);
+        let parsed = hunch::hunch(&base_stem);
+
+        let (imdb_id, season, episode, year, title_str) = if let Some(video) = sibling {
+            (
+                Some(
+                    video
+                        .imdb_id
+                        .clone(),
+                ),
+                video.season,
+                video.episode,
+                video.year,
+                video
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| base_stem.clone()),
+            )
+        } else {
+            match media_kind.as_str() {
+                "episode" => {
+                    let season = parsed
+                        .season()
+                        .map(|s| s as i64);
+                    let episode = parsed
+                        .episode()
+                        .map(|e| e as i64);
+                    let year = parsed
+                        .year()
+                        .map(|y| y as i64);
+                    let clean_title = parsed
+                        .title()
+                        .unwrap_or(base_stem.as_str())
+                        .to_string();
+                    let existing_imdb =
+                        fetch_existing_imdb(ctx, addon.id, &path).await?;
+                    let imdb_id = if let Some(id) = existing_imdb {
+                        Some(id)
+                    } else if !jellyfin_ids.is_empty() {
+                        if let Some(client) = tmdb {
+                            resolve_path_ids(
+                                &mut path_id_memo,
+                                &jellyfin_ids,
+                                true,
+                                client,
+                            )
+                            .await
+                        } else {
+                            jellyfin_ids
+                                .imdb
+                                .clone()
+                                .map(Into::into)
+                        }
+                    } else {
+                        if let Some(client) = tmdb {
+                            MediaResolveService::resolve_imdb_from_search(
+                                client,
+                                &clean_title,
+                                None,
+                                true,
+                            )
+                            .await
+                            .map(Into::into)
+                        } else {
+                            None
+                        }
+                    };
+                    (imdb_id, season, episode, year, clean_title)
+                }
+                _ => {
+                    let year = parsed
+                        .year()
+                        .map(|y| y as i64);
+                    let clean_title = parsed
+                        .title()
+                        .unwrap_or(base_stem.as_str())
+                        .to_string();
+                    let existing_imdb =
+                        fetch_existing_imdb(ctx, addon.id, &path).await?;
+                    let imdb_id = if let Some(id) = existing_imdb {
+                        Some(id)
+                    } else if !jellyfin_ids.is_empty() {
+                        if let Some(client) = tmdb {
+                            resolve_path_ids(
+                                &mut path_id_memo,
+                                &jellyfin_ids,
+                                false,
+                                client,
+                            )
+                            .await
+                        } else {
+                            jellyfin_ids
+                                .imdb
+                                .clone()
+                                .map(Into::into)
+                        }
+                    } else {
+                        if let Some(client) = tmdb {
+                            MediaResolveService::resolve_imdb_from_search(
+                                client,
+                                &clean_title,
+                                year,
+                                false,
+                            )
+                            .await
+                            .map(Into::into)
+                        } else {
+                            None
+                        }
+                    };
+                    (imdb_id, None, None, year, clean_title)
+                }
+            }
+        };
+
+        if imdb_id.is_none() {
+            info!(
+                path,
+                "opendal: subtitle has no IMDB id and no video beside it, skipping"
+            );
+            continue;
+        }
+
+        let sub_id = common::get_stable_uuid(format!("{}:{}", addon.id, path));
+        seen_ids.push(sub_id);
+        let now = Utc::now()
+            .naive_utc()
+            .to_string();
+        sqlx::query(
+                    "INSERT INTO opendal_files \
+                     (id, addon_id, media_kind, path, name, title, imdb_id, season, episode, track_number, year, size, scanned_at) \
+                     VALUES (?, ?, 'subtitle', ?, ?, ?, ?, ?, ?, NULL, ?, NULL, ?) \
+                     ON CONFLICT(id) DO UPDATE SET \
+                       path = excluded.path, name = excluded.name, \
+                       title = excluded.title, \
+                       imdb_id = excluded.imdb_id, \
+                       season = excluded.season, episode = excluded.episode, \
+                       year = excluded.year, scanned_at = excluded.scanned_at",
+                )
+                .bind(sub_id)
+                .bind(addon.id)
+                .bind(&path)
+                .bind(&name)
+                .bind(&title_str)
+                .bind(imdb_id.as_deref())
+                .bind(season)
+                .bind(episode)
+                .bind(year)
+                .bind(&now)
+                .execute(&ctx.db)
+                .await?;
+
+        debug!(path, "opendal: indexed subtitle");
+        upserted += 1;
     }
 
     let deleted = prune_stale_paths(ctx, addon.id, &seen_ids).await?;
@@ -1962,6 +2263,320 @@ async fn run_probe_jobs(ctx: &AppContext, addon: &Addon, jobs: Vec<ProbeJob>) {
     info!(addon = %addon.name, stored, "opendal: probing complete");
 }
 
+/// The response for a storage backend that failed to serve `path`, with what the
+/// backend actually said logged: a file that is gone is a 404, but a refused
+/// login or an unreachable server is not, and answering 404 for those sent
+/// people looking for a missing file.
+fn backend_error(
+    addon_id: Uuid,
+    path: &str,
+    step: &str,
+    error: opendal::Error,
+) -> axum_anyhow::ApiError {
+    use axum::http::StatusCode;
+    let (status, detail) = match error.kind() {
+        opendal::ErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            "file not found in the storage backend",
+        ),
+        opendal::ErrorKind::PermissionDenied => (
+            StatusCode::BAD_GATEWAY,
+            "the storage backend refused access (check its credentials)",
+        ),
+        opendal::ErrorKind::RateLimited => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the storage backend is rate limiting requests",
+        ),
+        _ => (StatusCode::BAD_GATEWAY, "the storage backend failed"),
+    };
+    warn!(%addon_id, path, step, kind = ?error.kind(), error = %error, "opendal backend request failed");
+    axum_anyhow::ApiError::builder()
+        .status(status)
+        .title("stream")
+        .detail(detail)
+        .build()
+}
+
+/// Directory form of a configured WebDAV path (always with a trailing slash).
+///
+/// opendal's WebDAV backend cannot list recursively on its own, so it falls back to a
+/// client-side walk. For a path *without* a trailing slash that walk starts from the
+/// path's parent and only prefix-filters the results afterwards, which for a top-level
+/// folder means crawling the entire share once per configured path.
+fn webdav_dir_path(path: &str) -> String {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{trimmed}/")
+    }
+}
+
+/// An entry produced by a scan: either from a lister or a path that is a single file.
+struct ScanEntry {
+    path: String,
+    metadata: opendal::Metadata,
+}
+
+impl From<opendal::Entry> for ScanEntry {
+    fn from(entry: opendal::Entry) -> Self {
+        let (path, metadata) = entry.into_parts();
+        Self { path, metadata }
+    }
+}
+
+impl ScanEntry {
+    fn path(&self) -> &str {
+        &self.path
+    }
+
+    fn name(&self) -> &str {
+        self.path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or_default()
+    }
+
+    fn metadata(&self) -> &opendal::Metadata {
+        &self.metadata
+    }
+}
+
+/// How far before the newest indexed row a folder's mtime must fall to count as
+/// unchanged. Covers a change landing between listing a folder and writing its
+/// rows, and clock skew between this server and the share.
+const INCREMENTAL_SLACK: chrono::Duration = chrono::Duration::hours(1);
+
+/// A full walk is forced when the stalest row was last seen longer ago than this.
+const FULL_WALK_INTERVAL: chrono::Duration = chrono::Duration::days(7);
+
+/// One indexed row, as far as the skip decision is concerned.
+struct IndexedRow {
+    id: Uuid,
+    path: String,
+    scanned_at: chrono::NaiveDateTime,
+    /// A non-track row that never got an IMDB id.
+    unresolved: bool,
+}
+
+/// What a previous scan stored, used to decide which top-level folders to skip.
+struct IncrementalIndex {
+    /// Sorted by stored path, so the rows below one folder are a contiguous slice.
+    rows: Vec<IndexedRow>,
+}
+
+impl IncrementalIndex {
+    /// `None` when skipping is not safe or not wanted for this addon:
+    /// - rows from `.strm` files store the target URL as their path, so they cannot
+    ///   be attributed to a folder;
+    /// - the last full walk is too old. Many servers only bump a directory's mtime
+    ///   for its direct children, so a change deep in a tree can go unseen; a
+    ///   periodic full walk heals that. Walking a folder refreshes `scanned_at` of
+    ///   every row in it, so the oldest `scanned_at` of the addon is when the last
+    ///   full walk finished at the latest. That needs no extra state or migration.
+    async fn load(ctx: &AppContext, addon_id: Uuid) -> Result<Option<Self>> {
+        let raw: Vec<(Uuid, String, String, String, Option<String>)> = sqlx::query_as(
+            "SELECT id, path, scanned_at, media_kind, imdb_id FROM opendal_files \
+             WHERE addon_id = ?",
+        )
+        .bind(addon_id)
+        .fetch_all(&ctx.db)
+        .await?;
+        let mut rows: Vec<IndexedRow> = Vec::with_capacity(raw.len());
+        let mut oldest: Option<chrono::NaiveDateTime> = None;
+        for (id, path, scanned_at, media_kind, imdb_id) in raw {
+            if path.starts_with("http://") || path.starts_with("https://") {
+                return Ok(None);
+            }
+            let Ok(at) = chrono::NaiveDateTime::parse_from_str(
+                &scanned_at,
+                "%Y-%m-%d %H:%M:%S%.f",
+            ) else {
+                return Ok(None);
+            };
+            oldest = Some(oldest.map_or(at, |o| o.min(at)));
+            // Files that cannot be resolved are normally not stored at all, so a
+            // row with no id is the only trace of a failed resolution there can be.
+            let unresolved = media_kind != "track"
+                && imdb_id
+                    .as_deref()
+                    .is_none_or(str::is_empty);
+            rows.push(IndexedRow {
+                id,
+                path,
+                scanned_at: at,
+                unresolved,
+            });
+        }
+        if oldest.is_some_and(|o| o < Utc::now().naive_utc() - FULL_WALK_INTERVAL) {
+            return Ok(None);
+        }
+        rows.sort_unstable_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+        });
+        Ok(Some(Self { rows }))
+    }
+
+    /// Ids of the folder's rows when the folder can be skipped: it already has rows,
+    /// none of them failed to resolve, and its mtime is known and not newer than the
+    /// newest of them.
+    fn unchanged_rows(
+        &self,
+        dir_path: &str,
+        modified: Option<chrono::DateTime<Utc>>,
+    ) -> Option<Vec<Uuid>> {
+        let modified = modified?.naive_utc();
+        let start = self
+            .rows
+            .partition_point(|r| {
+                r.path
+                    .as_str()
+                    < dir_path
+            });
+        let mut newest: Option<chrono::NaiveDateTime> = None;
+        let mut ids = Vec::new();
+        for row in self.rows[start..]
+            .iter()
+            .take_while(|r| {
+                r.path
+                    .starts_with(dir_path)
+            })
+        {
+            if row.unresolved {
+                return None;
+            }
+            ids.push(row.id);
+            newest = Some(newest.map_or(row.scanned_at, |n| n.max(row.scanned_at)));
+        }
+        (modified <= newest? - INCREMENTAL_SLACK).then_some(ids)
+    }
+}
+
+type EntryStream = std::pin::Pin<
+    Box<dyn futures::Stream<Item = opendal::Result<opendal::Entry>> + Send>,
+>;
+
+/// Opens one configured scan path. A WebDAV path that points at a single file yields
+/// just that entry; anything else is walked as a directory from its own root. With an
+/// index, the directory is listed one level deep and only folders that are new or
+/// changed are walked; the rows of skipped folders are added to `seen_ids` so they
+/// are not pruned.
+async fn open_scan_source(
+    operator: &opendal::Operator,
+    list_from: &str,
+    is_local: bool,
+    index: Option<&IncrementalIndex>,
+    seen_ids: &mut Vec<Uuid>,
+) -> Result<(Option<ScanEntry>, Option<EntryStream>)> {
+    if is_local {
+        let lister = operator
+            .lister_with(list_from)
+            .recursive(true)
+            .await?;
+        return Ok((None, Some(Box::pin(lister))));
+    }
+    let dir = webdav_dir_path(list_from);
+    if dir != "/"
+        && let Ok(meta) = operator
+            .stat(dir.trim_end_matches('/'))
+            .await
+        && meta.mode() == EntryMode::FILE
+    {
+        let rel = dir
+            .trim_matches('/')
+            .to_string();
+        return Ok((
+            Some(ScanEntry {
+                path: rel,
+                metadata: meta,
+            }),
+            None,
+        ));
+    }
+    let Some(index) = index else {
+        let lister = operator
+            .lister_with(&dir)
+            .recursive(true)
+            .await?;
+        return Ok((None, Some(Box::pin(lister))));
+    };
+
+    let mut top = operator
+        .lister_with(&dir)
+        .await?;
+    let mut direct = Vec::new();
+    let mut walks = Vec::new();
+    let mut skipped = 0usize;
+    while let Some(entry) = top
+        .try_next()
+        .await?
+    {
+        if entry
+            .metadata()
+            .mode()
+            != EntryMode::DIR
+        {
+            direct.push(entry);
+            continue;
+        }
+        match index.unchanged_rows(
+            entry.path(),
+            entry
+                .metadata()
+                .last_modified(),
+        ) {
+            Some(ids) => {
+                skipped += 1;
+                seen_ids.extend(ids);
+            }
+            None => {
+                walks.push(
+                    operator
+                        .lister_with(entry.path())
+                        .recursive(true)
+                        .await?,
+                );
+            }
+        }
+    }
+    debug!(
+        path = list_from,
+        skipped,
+        walked = walks.len(),
+        "opendal: incremental scan"
+    );
+    use futures::StreamExt as _;
+    Ok((
+        None,
+        Some(Box::pin(
+            futures::stream::iter(
+                direct
+                    .into_iter()
+                    .map(Ok),
+            )
+            .chain(futures::stream::iter(walks).flatten()),
+        )),
+    ))
+}
+
+async fn next_scan_entry(
+    single: &mut Option<ScanEntry>,
+    lister: &mut Option<EntryStream>,
+) -> Result<Option<ScanEntry>> {
+    if let Some(entry) = single.take() {
+        return Ok(Some(entry));
+    }
+    match lister {
+        Some(l) => Ok(l
+            .try_next()
+            .await?
+            .map(ScanEntry::from)),
+        None => Ok(None),
+    }
+}
+
 fn build_webdav_operator(cfg: &serde_json::Value) -> Result<opendal::Operator> {
     let endpoint = cfg["endpoint"]
         .as_str()
@@ -1981,6 +2596,42 @@ fn build_webdav_operator(cfg: &serde_json::Value) -> Result<opendal::Operator> {
         builder = builder.password(p);
     }
     Ok(opendal::Operator::new(builder)?.finish())
+}
+
+/// What this scan already learned about a path's tmdb/tvdb id, per kind. A
+/// show's folder id sits on every file under it, so without this a miss (say
+/// a series id sent to the movie endpoint) is asked again for every file.
+#[derive(Default)]
+struct PathIdMemo(
+    std::collections::HashMap<(bool, Option<i64>, Option<i64>), Option<String>>,
+);
+
+async fn resolve_path_ids(
+    memo: &mut PathIdMemo,
+    ids: &db::ExternalIds,
+    is_tv: bool,
+    client: &sdks::RestClient<sdks::BearerAuth>,
+) -> Option<String> {
+    if let Some(imdb) = &ids.imdb {
+        return Some(
+            imdb.clone()
+                .into(),
+        );
+    }
+    let key = (is_tv, ids.tmdb, ids.tvdb);
+    if let Some(known) = memo
+        .0
+        .get(&key)
+    {
+        return known.clone();
+    }
+    let resolved: Option<String> =
+        MediaResolveService::resolve_imdb_from_ids(ids, is_tv, client)
+            .await
+            .map(Into::into);
+    memo.0
+        .insert(key, resolved.clone());
+    resolved
 }
 
 async fn fetch_existing_imdb(
@@ -2050,6 +2701,40 @@ async fn prune_stale_paths(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn strm_urls_are_played_as_urls_on_every_backend() {
+        use crate::stream::StreamDescriptor;
+        let addon = |backend: &str| OpendalAddon {
+            addon_id: Uuid::nil(),
+            operator: Arc::new(
+                opendal::Operator::new(opendal::services::Memory::default())
+                    .unwrap()
+                    .finish(),
+            ),
+            root: String::new(),
+            backend: backend.to_string(),
+            media_kind: "movie".to_string(),
+        };
+        let url = "https://user:pass@host/strm/e/token";
+        for backend in ["webdav", "local"] {
+            assert!(
+                matches!(
+                    addon(backend).descriptor_for(url),
+                    StreamDescriptor::Http { url: ref u, .. } if u == url
+                ),
+                "{backend}"
+            );
+        }
+        assert!(matches!(
+            addon("webdav").descriptor_for("/movies/1917.mkv"),
+            StreamDescriptor::Opendal { .. }
+        ));
+        assert!(matches!(
+            addon("local").descriptor_for("/movies/1917.mkv"),
+            StreamDescriptor::Local(_)
+        ));
+    }
+
     use std::sync::{Arc, atomic::AtomicU64};
 
     use chrono::Utc;
@@ -2069,6 +2754,294 @@ mod tests {
         sdks,
         stream::StreamDescriptor,
     };
+
+    #[test]
+    fn webdav_dir_path_always_ends_with_slash() {
+        assert_eq!(webdav_dir_path("/"), "/");
+        assert_eq!(webdav_dir_path(""), "/");
+        assert_eq!(
+            webdav_dir_path("/Romeria (2025) [Bluray 1080p][Esp]"),
+            "/Romeria (2025) [Bluray 1080p][Esp]/"
+        );
+        assert_eq!(webdav_dir_path("/a/b/"), "/a/b/");
+    }
+
+    fn propfind_body(entries: &[(&str, bool)]) -> String {
+        let mut out =
+            String::from(r#"<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">"#);
+        for (href, dir) in entries {
+            let rt = if *dir {
+                "<D:resourcetype><D:collection/></D:resourcetype>"
+            } else {
+                "<D:resourcetype/><D:getcontentlength>5</D:getcontentlength>"
+            };
+            out.push_str(&format!(
+                "<D:response><D:href>{href}</D:href><D:propstat><D:prop>{rt}<D:getlastmodified>Mon, 01 Jan 2024 00:00:00 GMT</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+            ));
+        }
+        out.push_str("</D:multistatus>");
+        out
+    }
+
+    /// Minimal PROPFIND server: records every requested path.
+    async fn mock_webdav(
+        routes: Vec<(&'static str, String)>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let hits = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let routes = routes.clone();
+                let log = log.clone();
+                tokio::spawn(async move {
+                    // Read the headers up to the blank line, then any body the
+                    // Content-Length announces, so the request is fully consumed.
+                    let mut data: Vec<u8> = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    let header_end = loop {
+                        if let Some(p) = data
+                            .windows(4)
+                            .position(|w| w == b"\r\n\r\n")
+                        {
+                            break p + 4;
+                        }
+                        match sock
+                            .read(&mut chunk)
+                            .await
+                        {
+                            Ok(0) | Err(_) => break data.len(),
+                            Ok(n) => data.extend_from_slice(&chunk[..n]),
+                        }
+                    };
+                    let head = String::from_utf8_lossy(&data[..header_end]).to_string();
+                    let content_length = head
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length")
+                                .then(|| {
+                                    v.trim()
+                                        .parse::<usize>()
+                                        .ok()
+                                })
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    while data.len() < header_end + content_length {
+                        match sock
+                            .read(&mut chunk)
+                            .await
+                        {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => data.extend_from_slice(&chunk[..n]),
+                        }
+                    }
+                    let req = head;
+                    let path = req
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    log.lock()
+                        .unwrap()
+                        .push(path.clone());
+                    let (status, body) = match routes
+                        .iter()
+                        .find(|(p, _)| *p == path)
+                    {
+                        Some((_, b)) => ("207 Multi-Status", b.clone()),
+                        None => ("404 Not Found", String::new()),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock
+                        .write_all(resp.as_bytes())
+                        .await;
+                });
+            }
+        });
+        (base, hits)
+    }
+
+    /// A server that answers every request with `status` and no body.
+    async fn webdav_answering(status: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock
+                        .read(&mut buf)
+                        .await;
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    let _ = sock
+                        .write_all(resp.as_bytes())
+                        .await;
+                });
+            }
+        });
+        base
+    }
+
+    async fn serve_status(status: &'static str) -> axum::http::StatusCode {
+        let base = webdav_answering(status).await;
+        let addon = OpendalAddon {
+            addon_id: Uuid::new_v4(),
+            operator: Arc::new(
+                opendal::Operator::new(
+                    opendal::services::Webdav::default().endpoint(&base),
+                )
+                .unwrap()
+                .finish(),
+            ),
+            root: base,
+            backend: "webdav".to_string(),
+            media_kind: "movie".to_string(),
+        };
+        let descriptor = crate::stream::StreamDescriptor::Opendal {
+            addon_id: addon.addon_id,
+            path: "movies/a.mkv".to_string(),
+        };
+        addon
+            .serve_stream(&descriptor, &axum::http::HeaderMap::new())
+            .await
+            .err()
+            .expect("the backend refused")
+            .status()
+    }
+
+    /// Only a file that is really gone is a 404. A refused login or a failing
+    /// server must not look like a missing file.
+    #[tokio::test]
+    async fn serving_a_file_reports_what_the_backend_said() {
+        use axum::http::StatusCode;
+        assert_eq!(serve_status("404 Not Found").await, StatusCode::NOT_FOUND);
+        assert_eq!(
+            serve_status("401 Unauthorized").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(serve_status("403 Forbidden").await, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            serve_status("500 Internal Server Error").await,
+            StatusCode::BAD_GATEWAY
+        );
+        assert_eq!(
+            serve_status("429 Too Many Requests").await,
+            StatusCode::BAD_GATEWAY
+        );
+    }
+
+    // A top-level WebDAV path configured without a trailing slash used to make opendal
+    // walk the whole share from the parent ("/") and prefix-filter afterwards.
+    #[tokio::test]
+    async fn webdav_scan_path_does_not_walk_the_whole_share() {
+        let (base, hits) = mock_webdav(vec![
+            (
+                "/",
+                propfind_body(&[
+                    ("/", true),
+                    ("/Movie%20A/", true),
+                    ("/Movie%20B/", true),
+                ]),
+            ),
+            (
+                "/Movie%20A/",
+                propfind_body(&[("/Movie%20A/", true), ("/Movie%20A/a.mkv", false)]),
+            ),
+            ("/c.mkv", propfind_body(&[("/c.mkv", false)])),
+        ])
+        .await;
+        let op = opendal::Operator::new(
+            opendal::services::Webdav::default().endpoint(&base),
+        )
+        .unwrap()
+        .finish();
+
+        let (mut single, mut lister) =
+            open_scan_source(&op, "/Movie A", false, None, &mut Vec::new())
+                .await
+                .unwrap();
+        let mut seen = Vec::new();
+        while let Some(e) = next_scan_entry(&mut single, &mut lister)
+            .await
+            .unwrap()
+        {
+            if e.metadata()
+                .mode()
+                == EntryMode::FILE
+            {
+                seen.push(
+                    e.path()
+                        .to_string(),
+                );
+            }
+        }
+        assert_eq!(seen, vec!["Movie A/a.mkv"]);
+        assert!(
+            hits.lock()
+                .unwrap()
+                .iter()
+                .all(|p| p.starts_with("/Movie%20A")),
+            "crawled outside the configured path: {:?}",
+            hits.lock()
+                .unwrap()
+        );
+
+        // A path that is itself a file is indexed as that one file.
+        let (mut single, mut lister) =
+            open_scan_source(&op, "/c.mkv", false, None, &mut Vec::new())
+                .await
+                .unwrap();
+        let first = next_scan_entry(&mut single, &mut lister)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.path(), "c.mkv");
+        assert_eq!(first.name(), "c.mkv");
+        assert!(
+            next_scan_entry(&mut single, &mut lister)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !hits
+                .lock()
+                .unwrap()
+                .contains(&"/".to_string())
+        );
+    }
 
     fn tmdb_test_client(base_url: &str) -> Option<sdks::RestClient<sdks::BearerAuth>> {
         Some(
@@ -2304,6 +3277,16 @@ mod tests {
                 assert!(
                     matches!(s.descriptor, StreamDescriptor::Local(_)),
                     "{}: expected Local descriptor",
+                    f.rel_path
+                );
+                // Subtitle ranking compares sidecars against this name.
+                assert_eq!(
+                    s.filename
+                        .as_deref(),
+                    std::path::Path::new(f.rel_path)
+                        .file_name()
+                        .and_then(|n| n.to_str()),
+                    "{}: stream should carry the file name",
                     f.rel_path
                 );
             }
@@ -3243,7 +4226,9 @@ mod tests {
         .unwrap();
         assert_eq!(sub_count, 3, "expected 3 subtitle rows");
 
-        // subtitle_fetch returns SubtitleInfo with Opendal descriptors.
+        // subtitle_fetch returns SubtitleInfo with Local descriptors for a local
+        // backend: the operator is rooted at the library folder, so an Opendal
+        // descriptor would resolve the absolute path under it a second time.
         let movie_media = db::Media {
             id: crate::common::get_stable_uuid("movie:tt0133093".to_string()),
             kind: db::MediaKind::Movie,
@@ -3260,10 +4245,10 @@ mod tests {
         assert_eq!(infos.len(), 3, "subtitle_fetch should return 3 subtitles");
 
         for info in &infos {
-            assert!(
-                matches!(info.url, Some(StreamDescriptor::Opendal { .. })),
-                "expected Opendal descriptor"
-            );
+            let Some(StreamDescriptor::Local(path)) = &info.url else {
+                panic!("expected Local descriptor, got {:?}", info.url);
+            };
+            assert!(path.is_file(), "{path:?} should be a servable file");
         }
 
         let en = infos
@@ -3300,6 +4285,110 @@ mod tests {
         assert!(de.is_hi);
     }
 
+    // E2E: a subtitle takes the ids of the video beside it
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn opendal_subtitle_is_linked_to_its_video() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir
+            .path()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Neither name carries an id, and a .strm keeps its target URL as path:
+        // the only thing tying the subtitle to the film is the folder and name.
+        let strm_url = "https://example.invalid/stream/obscure.mkv";
+        for (folder, video, body) in [
+            ("Obscure Film", "Obscure Film.mkv", "x"),
+            ("Strm Film", "Strm Film.strm", strm_url),
+            ("Saga", "Saw.mkv", "x"),
+            ("Saga", "Saw.II.mkv", "y"),
+        ] {
+            let film = dir
+                .path()
+                .join(folder);
+            std::fs::create_dir_all(&film).unwrap();
+            std::fs::write(film.join(video), body).unwrap();
+            let stem = video
+                .rsplit_once('.')
+                .unwrap()
+                .0;
+            std::fs::write(film.join(format!("{stem}.srt")), b"subtitle").unwrap();
+        }
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon, db_addon) = make_local_addon(ctx, dir.path(), "movie").await;
+
+        // The films were identified by an earlier scan.
+        for (video_path, name, imdb) in [
+            (
+                format!("{root}/Obscure Film/Obscure Film.mkv"),
+                "Obscure Film.mkv",
+                "tt0000001",
+            ),
+            (strm_url.to_string(), "Strm Film.strm", "tt0000002"),
+            (format!("{root}/Saga/Saw.mkv"), "Saw.mkv", "tt0000003"),
+            (format!("{root}/Saga/Saw.II.mkv"), "Saw.II.mkv", "tt0000004"),
+        ] {
+            sqlx::query(
+                "INSERT INTO opendal_files (id, addon_id, media_kind, path, name, imdb_id, scanned_at) \
+                 VALUES (?, ?, 'movie', ?, ?, ?, '2026-01-01 00:00:00')",
+            )
+            .bind(Uuid::new_v4())
+            .bind(db_addon.id)
+            .bind(&video_path)
+            .bind(name)
+            .bind(imdb)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        }
+
+        // A subtitle indexed earlier under the wrong id is relinked.
+        let stale = format!("{root}/Obscure Film/Obscure Film.srt");
+        sqlx::query(
+            "INSERT INTO opendal_files (id, addon_id, media_kind, path, name, imdb_id, scanned_at) \
+             VALUES (?, ?, 'subtitle', ?, 'Obscure Film.srt', 'tt9999999', '2026-01-01 00:00:00')",
+        )
+        .bind(crate::common::get_stable_uuid(format!(
+            "{}:{}",
+            db_addon.id, stale
+        )))
+        .bind(db_addon.id)
+        .bind(&stale)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT name, imdb_id FROM opendal_files \
+             WHERE addon_id = ? AND media_kind = 'subtitle' ORDER BY path",
+        )
+        .bind(db_addon.id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Obscure Film.srt".to_string(), "tt0000001".to_string()),
+                ("Saw.II.srt".to_string(), "tt0000004".to_string()),
+                ("Saw.srt".to_string(), "tt0000003".to_string()),
+                ("Strm Film.srt".to_string(), "tt0000002".to_string()),
+            ],
+            "each subtitle takes the id of the video beside it, `Saw.II` not `Saw`'s"
+        );
+    }
+
+    // -----------------------------------------------------------------------
     // -----------------------------------------------------------------------
     // E2E: subtitle without an IMDB id is not indexed
     // -----------------------------------------------------------------------
@@ -3608,6 +4697,42 @@ mod tests {
                 f.rel_path, f.expected_imdb, f.expected_season, f.expected_episode
             );
         }
+    }
+
+    // A show's tmdb id sits on every file in its folder. Under a movie addon it
+    // goes to the movie endpoint and 404s; that miss must be asked once per
+    // scan, not once per file.
+    #[tokio::test]
+    async fn opendal_movie_scan_asks_a_missing_tmdb_id_once() {
+        let dir = tempfile::tempdir().unwrap();
+        for e in 1..=3 {
+            let full = dir
+                .path()
+                .join(format!(
+                    "Some Show (2005) [tmdbid-2710]/Season 01/Some.Show.S01E0{e}.mkv"
+                ));
+            std::fs::create_dir_all(
+                full.parent()
+                    .unwrap(),
+            )
+            .unwrap();
+            std::fs::write(&full, b"fake ep").unwrap();
+        }
+
+        let tmdb = httpmock::MockServer::start();
+        let movie = tmdb.mock(|when, then| {
+            when.path("/movie/2710");
+            then.status(404);
+        });
+
+        let (ctx, _guard) = test_server_with_tmdb(&tmdb).await;
+        let (addon, db_addon) = make_local_addon(&ctx, dir.path(), "movie").await;
+        addon
+            .refresh_index(&ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+
+        assert_eq!(movie.hits(), 1);
     }
 
     // -----------------------------------------------------------------------
@@ -3956,13 +5081,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(streams.len(), 1);
-        let path = match &streams[0].descriptor {
-            StreamDescriptor::Local(p) => p
-                .to_string_lossy()
-                .to_string(),
-            other => panic!("expected Local descriptor, got {other:?}"),
+        // ...and it is played as that URL, not opened as a file on the backend.
+        let played = match &streams[0].descriptor {
+            StreamDescriptor::Http { url, .. } => url.clone(),
+            other => panic!("expected Http descriptor, got {other:?}"),
         };
-        assert_eq!(path, url, "stream path must be the URL from the .strm file");
+        assert_eq!(played, url, "stream must play the URL from the .strm file");
     }
 
     // -----------------------------------------------------------------------
@@ -4477,5 +5601,880 @@ mod tests {
             .await
             .unwrap();
         assert!(!stored_probe(ctx, db_addon.id).await);
+    }
+
+    // -----------------------------------------------------------------------
+    // Local music (Jellyfin layout): Artist/Album/Track folders, album-only
+    // folders and loose tracks. See
+    // https://jellyfin.org/docs/general/server/media/music/
+    // -----------------------------------------------------------------------
+
+    async fn index_track_fixtures(
+        ctx: &crate::AppContext,
+        dir: &std::path::Path,
+        fixtures: &[&str],
+    ) -> (OpendalAddon, Addon) {
+        write_files(
+            dir,
+            &fixtures
+                .iter()
+                .map(|p| (*p, b"fake" as &[u8]))
+                .collect::<Vec<_>>(),
+        );
+        let (addon, db_addon) = make_local_addon(ctx, dir, "track").await;
+        addon
+            .refresh_index(ctx, &db_addon, noop_progress())
+            .await
+            .unwrap();
+        (addon, db_addon)
+    }
+
+    /// Scan parses artist/album from the Jellyfin folder layout and track
+    /// number + title from the filename.
+    #[tokio::test]
+    async fn opendal_track_scan_parses_jellyfin_music_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = [
+            // {Artist}/{Album}/{NN - Title}
+            "Steely Dan/Two Against Nature/03 - Two Against Nature.flac",
+            // album-only folder; without embedded tags the folder name is the album
+            "Incubus - Morning View XXIII (2024) [FLAC]/03. Wish You Were Here.flac",
+            // {Artist}/{Album}/{NN Title}
+            "Various Artists/Now That's What I Call Music/01 Uptown Funk.mp3",
+            // loose track at the root
+            "Loose Track.mp3",
+        ];
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (_, db_addon) = index_track_fixtures(ctx, dir.path(), &fixtures).await;
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct Row {
+            path: String,
+            title: Option<String>,
+            track_number: Option<i64>,
+            artist: Option<String>,
+            album: Option<String>,
+        }
+        let rows: Vec<Row> = sqlx::query_as(
+            "SELECT path, title, track_number, artist, album FROM opendal_files              WHERE addon_id = ? AND media_kind = 'track' ORDER BY path",
+        )
+        .bind(db_addon.id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            rows.len(),
+            4,
+            "every fixture file must be indexed; got: {rows:?}"
+        );
+        for r in &rows {
+            let rel = r
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap();
+            match rel {
+                "03 - Two Against Nature.flac" => {
+                    assert_eq!(
+                        r.artist
+                            .as_deref(),
+                        Some("Steely Dan")
+                    );
+                    assert_eq!(
+                        r.album
+                            .as_deref(),
+                        Some("Two Against Nature")
+                    );
+                    assert_eq!(
+                        r.title
+                            .as_deref(),
+                        Some("Two Against Nature")
+                    );
+                    assert_eq!(r.track_number, Some(3));
+                }
+                "03. Wish You Were Here.flac" => {
+                    // album-only folder: the folder name is the album; artist is
+                    // unknown without embedded tags
+                    assert_eq!(
+                        r.album
+                            .as_deref(),
+                        Some("Incubus - Morning View XXIII (2024) [FLAC]")
+                    );
+                    assert_eq!(r.artist, None);
+                    assert_eq!(
+                        r.title
+                            .as_deref(),
+                        Some("Wish You Were Here")
+                    );
+                    assert_eq!(r.track_number, Some(3));
+                }
+                "01 Uptown Funk.mp3" => {
+                    assert_eq!(
+                        r.artist
+                            .as_deref(),
+                        Some("Various Artists")
+                    );
+                    assert_eq!(
+                        r.album
+                            .as_deref(),
+                        Some("Now That's What I Call Music")
+                    );
+                    assert_eq!(
+                        r.title
+                            .as_deref(),
+                        Some("Uptown Funk")
+                    );
+                    assert_eq!(r.track_number, Some(1));
+                }
+                "Loose Track.mp3" => {
+                    assert_eq!(r.artist, None);
+                    assert_eq!(r.album, None);
+                    assert_eq!(
+                        r.title
+                            .as_deref(),
+                        Some("Loose Track")
+                    );
+                    assert_eq!(r.track_number, None);
+                }
+                other => panic!("unexpected fixture path: {other}"),
+            }
+        }
+    }
+
+    /// Catalog builds the Artist -> Album -> Track hierarchy with per-file ids:
+    /// tracks with the same title in different albums/artists must not collide.
+    #[tokio::test]
+    async fn opendal_track_catalog_builds_music_hierarchy() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = [
+            "Artist A/Album One/Intro.flac",
+            "Artist A/Album Two/Intro.flac",
+            "Artist B/Album One/Intro.flac",
+        ];
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon, _) = index_track_fixtures(ctx, dir.path(), &fixtures).await;
+
+        let catalog: Vec<db::Media> = addon
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+
+        let tracks: Vec<&db::Media> = catalog
+            .iter()
+            .filter(|m| m.kind == db::MediaKind::Track)
+            .collect();
+        let albums: Vec<&db::Media> = catalog
+            .iter()
+            .filter(|m| m.kind == db::MediaKind::Album)
+            .collect();
+        let artists: Vec<&db::Media> = catalog
+            .iter()
+            .filter(|m| m.kind == db::MediaKind::Artist)
+            .collect();
+
+        assert_eq!(
+            tracks.len(),
+            3,
+            "each file must produce its own track; got: {:?}",
+            tracks
+                .iter()
+                .map(|m| &m.title)
+                .collect::<Vec<_>>()
+        );
+        let track_ids: std::collections::HashSet<_> = tracks
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(
+            track_ids.len(),
+            3,
+            "same-titled tracks in different albums/artists must have distinct ids"
+        );
+
+        assert_eq!(albums.len(), 3, "one album row per distinct artist+album");
+        assert_eq!(artists.len(), 2, "one artist row per distinct artist");
+
+        for t in &tracks {
+            assert!(
+                t.parent_id
+                    .is_some(),
+                "track must link to its album"
+            );
+            assert!(
+                t.grandparent_id
+                    .is_some(),
+                "track must link to its artist"
+            );
+        }
+    }
+
+    /// Streams resolve to the exact file for the track, not a same-titled file
+    /// from another album.
+    #[tokio::test]
+    async fn opendal_track_streams_resolve_exact_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = [
+            "Artist A/Album One/Intro.flac",
+            "Artist A/Album Two/Intro.flac",
+            "Artist B/Album One/Intro.flac",
+        ];
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon, _) = index_track_fixtures(ctx, dir.path(), &fixtures).await;
+
+        let catalog: Vec<db::Media> = addon
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+
+        let artist_a_id: uuid::Uuid = catalog
+            .iter()
+            .find(|m| m.kind == db::MediaKind::Artist && m.title == "Artist A")
+            .expect("Artist A row in catalog")
+            .id;
+        let target = catalog
+            .iter()
+            .find(|m| {
+                m.kind == db::MediaKind::Track
+                    && m.title == "Intro"
+                    && m.grandparent_id == Some(artist_a_id)
+            })
+            .expect("track under Artist A");
+
+        let streams = addon
+            .get_streams(target, ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(streams.len(), 1, "exactly one stream for the track");
+        match &streams[0].descriptor {
+            crate::stream::StreamDescriptor::Local(p) => {
+                assert!(
+                    p.to_string_lossy()
+                        .ends_with("Artist A/Album One/Intro.flac"),
+                    "must resolve the exact file; got: {p:?}"
+                );
+            }
+            other => panic!("expected Local descriptor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn music_layout_follows_jellyfin_folders() {
+        let l = |p: &str, d: &str| music_layout(p, d);
+        let some = |s: &str| Some(s.to_string());
+        assert_eq!(
+            l("Steely Dan/Two Against Nature/03 - Two.flac", "/"),
+            (some("Steely Dan"), some("Two Against Nature"), None)
+        );
+        // album-only folder and a loose track
+        assert_eq!(l("Album/01 Song.flac", "/"), (None, some("Album"), None));
+        assert_eq!(l("Song.flac", "/"), (None, None, None));
+        // WebDAV paths are relative to the operator root, not the scan directory
+        assert_eq!(
+            l("Music/Steely Dan/Two Against Nature/03.flac", "/Music/"),
+            (some("Steely Dan"), some("Two Against Nature"), None)
+        );
+        // `Disc N` / `CD N` folders carry the disc number; look-alike album names do not
+        assert_eq!(
+            l("Artist/Album/Disc 2/01.flac", "/"),
+            (some("Artist"), some("Album"), Some(2))
+        );
+        assert_eq!(
+            l("Artist/Album/CD1/01.flac", "/"),
+            (some("Artist"), some("Album"), Some(1))
+        );
+        assert_eq!(
+            l("Artist/CD Singles/01 Song.flac", "/"),
+            (some("Artist"), some("CD Singles"), None)
+        );
+        assert_eq!(
+            l("Disc World/01 Song.flac", "/"),
+            (None, some("Disc World"), None)
+        );
+    }
+
+    /// A `Disc N` folder is not an album: both discs share the album, and each
+    /// track carries its disc number so clients can tell `01` on disc 1 from
+    /// `01` on disc 2.
+    #[tokio::test]
+    async fn opendal_track_catalog_keeps_disc_numbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixtures = [
+            "Artist/Album/Disc 1/01 Song.flac",
+            "Artist/Album/Disc 2/01 Song.flac",
+        ];
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon, _) = index_track_fixtures(ctx, dir.path(), &fixtures).await;
+
+        let catalog: Vec<db::Media> = addon
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+        let albums = catalog
+            .iter()
+            .filter(|m| m.kind == db::MediaKind::Album)
+            .count();
+        assert_eq!(albums, 1, "both discs belong to one album");
+        let mut discs: Vec<(Option<i64>, Option<i64>)> = catalog
+            .iter()
+            .filter(|m| m.kind == db::MediaKind::Track)
+            .map(|m| (m.parent_idx, m.idx))
+            .collect();
+        discs.sort();
+        assert_eq!(discs, vec![(Some(1), Some(1)), (Some(2), Some(1))]);
+    }
+
+    /// Every music addon supports every track, so a track's stored stream must
+    /// only be served by the addon that indexed that file.
+    #[tokio::test]
+    async fn opendal_track_stream_belongs_to_the_indexing_addon() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon_a, _) =
+            index_track_fixtures(ctx, dir_a.path(), &["Artist/Album/Song.flac"]).await;
+        let (addon_b, _) = index_track_fixtures(
+            ctx,
+            dir_b.path(),
+            &["Other/Elsewhere/Different.flac"],
+        )
+        .await;
+
+        let catalog: Vec<db::Media> = addon_a
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap()
+            .collect()
+            .await;
+        let track = catalog
+            .iter()
+            .find(|m| m.kind == db::MediaKind::Track)
+            .unwrap();
+
+        assert_eq!(
+            addon_a
+                .get_streams(track, ctx, None)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            addon_b
+                .get_streams(track, ctx, None)
+                .await
+                .unwrap()
+                .is_empty(),
+            "another addon must not serve this addon's file"
+        );
+    }
+
+    #[test]
+    fn music_album_keys_are_unambiguous() {
+        let addon = Uuid::nil();
+        assert_ne!(
+            music_album_key(addon, Some("A:B"), "C"),
+            music_album_key(addon, Some("A"), "B:C")
+        );
+        assert_ne!(
+            music_album_key(addon, None, "A:B"),
+            music_album_key(addon, Some("A"), "B")
+        );
+        assert_eq!(
+            music_album_key(addon, Some("A"), "B"),
+            music_album_key(addon, Some("A"), "B")
+        );
+    }
+
+    /// Playback resolves from the row the import persisted, not from the
+    /// in-memory catalog item: the stored track keeps its stream, so two
+    /// identically titled tracks in different albums play their own files.
+    #[tokio::test]
+    async fn opendal_persisted_tracks_resolve_their_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let (addon, db_addon) = index_track_fixtures(
+            ctx,
+            dir.path(),
+            &["Artist/Album One/Intro.flac", "Artist/Album Two/Intro.flac"],
+        )
+        .await;
+
+        let collection_id = Uuid::new_v4();
+        let catalog = crate::addons::ResolvedCatalog {
+            provider_catalog_id: "files".into(),
+            catalog_id: format!("addon:{}:files", db_addon.id),
+            collection_id,
+            name: "files".into(),
+            media_kind: Some(db::MediaKind::Track),
+            collection_media_kind: None,
+            enabled: true,
+            max_items: None,
+            tags: vec![],
+        };
+        db::Media {
+            id: collection_id,
+            kind: db::MediaKind::Collection,
+            title: "files".into(),
+            ..Default::default()
+        }
+        .save(&ctx.db)
+        .await
+        .unwrap();
+        let stream = addon
+            .catalog_stream(ctx, "files")
+            .await
+            .unwrap()
+            .unwrap();
+        crate::tasks::catalog_import_shared::import_catalog_items(
+            ctx,
+            &catalog,
+            &catalog.catalog_id,
+            100,
+            crate::addons::CatalogStream::from(stream),
+            &noop_progress(),
+        )
+        .await
+        .unwrap();
+
+        let track_ids: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM media WHERE CAST(kind AS TEXT) = 'track'",
+        )
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap();
+        assert_eq!(track_ids.len(), 2, "both same-titled tracks are persisted");
+
+        let mut resolved = Vec::new();
+        for id in track_ids {
+            let track = db::Media::get_by_id(&ctx.db, &id)
+                .await
+                .unwrap()
+                .unwrap();
+            let streams = addon
+                .get_streams(&track, ctx, None)
+                .await
+                .unwrap();
+            assert_eq!(streams.len(), 1, "one stream per persisted track");
+            match &streams[0].descriptor {
+                crate::stream::StreamDescriptor::Local(p) => {
+                    resolved.push(
+                        p.to_string_lossy()
+                            .into_owned(),
+                    );
+                }
+                other => panic!("expected Local descriptor, got {other:?}"),
+            }
+        }
+        resolved.sort();
+        assert!(
+            resolved[0].ends_with("Artist/Album One/Intro.flac"),
+            "{resolved:?}"
+        );
+        assert!(
+            resolved[1].ends_with("Artist/Album Two/Intro.flac"),
+            "{resolved:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Incremental WebDAV scans: a folder that has not changed since it was
+    // indexed is not listed again.
+    // -----------------------------------------------------------------------
+
+    const OLD: &str = "Mon, 01 Jan 2024 00:00:00 GMT";
+    const FUTURE: &str = "Fri, 01 Jan 2100 00:00:00 GMT";
+    const MOVIE: &str = "%5Bimdbid-tt0133093%5D%20The%20Matrix%20(1999).mkv";
+    const MOVIE2: &str = "%5Bimdbid-tt0106977%5D%20Heat%20(1995).mkv";
+
+    type DavRoutes = Arc<std::sync::Mutex<std::collections::HashMap<String, String>>>;
+    type DavHits = Arc<std::sync::Mutex<Vec<String>>>;
+
+    fn dav_entry(href: &str, dir: bool, modified: &str) -> String {
+        let rt = if dir {
+            "<D:resourcetype><D:collection/></D:resourcetype>"
+        } else {
+            "<D:resourcetype/><D:getcontentlength>5</D:getcontentlength>"
+        };
+        format!(
+            "<D:response><D:href>{href}</D:href><D:propstat><D:prop>{rt}<D:getlastmodified>{modified}</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"
+        )
+    }
+
+    fn dav_body(entries: &[String]) -> String {
+        format!(
+            r#"<?xml version="1.0"?><D:multistatus xmlns:D="DAV:">{}</D:multistatus>"#,
+            entries.concat()
+        )
+    }
+
+    /// PROPFIND mock whose routes can be edited between scans. Records every
+    /// requested path.
+    async fn mutable_webdav() -> (String, DavRoutes, DavHits) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let base = format!(
+            "http://{}",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let routes: DavRoutes = Default::default();
+        let hits: DavHits = Default::default();
+        let (r, h) = (routes.clone(), hits.clone());
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let (routes, hits) = (r.clone(), h.clone());
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock
+                        .read(&mut buf)
+                        .await
+                        .unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let path = req
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("")
+                        .to_string();
+                    hits.lock()
+                        .unwrap()
+                        .push(path.clone());
+                    let body = routes
+                        .lock()
+                        .unwrap()
+                        .get(&path)
+                        .cloned();
+                    let (status, body) = match body {
+                        Some(b) => ("207 Multi-Status", b),
+                        None => ("404 Not Found", String::new()),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock
+                        .write_all(resp.as_bytes())
+                        .await;
+                });
+            }
+        });
+        (base, routes, hits)
+    }
+
+    /// Registers a folder's own listing and returns its entry for the root listing.
+    fn set_dav_dir(
+        routes: &DavRoutes,
+        name: &str,
+        modified: &str,
+        files: &[&str],
+    ) -> String {
+        let mut entries = vec![dav_entry(&format!("/{name}/"), true, modified)];
+        entries.extend(
+            files
+                .iter()
+                .map(|f| dav_entry(&format!("/{name}/{f}"), false, modified)),
+        );
+        routes
+            .lock()
+            .unwrap()
+            .insert(format!("/{name}/"), dav_body(&entries));
+        dav_entry(&format!("/{name}/"), true, modified)
+    }
+
+    fn set_dav_root(routes: &DavRoutes, dirs: &[String]) {
+        let mut entries = vec![dav_entry("/", true, OLD)];
+        entries.extend_from_slice(dirs);
+        routes
+            .lock()
+            .unwrap()
+            .insert("/".to_string(), dav_body(&entries));
+    }
+
+    async fn make_webdav_addon(ctx: &AppContext, endpoint: &str) -> Addon {
+        let now = Utc::now().naive_utc();
+        let addon = Addon {
+            id: Uuid::new_v4(),
+            name: "test-webdav".to_string(),
+            preset: AddonPresetRef {
+                kind: "opendal-webdav".to_string(),
+                config: serde_json::json!({
+                    "media_kind": "movie",
+                    "endpoint": endpoint,
+                    "paths": ["/"],
+                    "incremental_scan": true,
+                })
+                .into(),
+            },
+            resources: vec![ResourceType::Stream, ResourceType::Catalog],
+            types: vec![],
+            enabled: true,
+            priority: 0,
+            system: false,
+            is_default: true,
+            http_redirect_stream: false,
+            subtitle_extraction: false,
+            probe_on_scan: false,
+            service_filter: vec![],
+            created_at: now,
+            updated_at: now,
+        };
+        addon
+            .insert(&ctx.db)
+            .await
+            .unwrap();
+        addon
+    }
+
+    async fn indexed_paths(ctx: &AppContext, addon: &Addon) -> Vec<String> {
+        sqlx::query_scalar(
+            "SELECT path FROM opendal_files WHERE addon_id = ? ORDER BY path",
+        )
+        .bind(addon.id)
+        .fetch_all(&ctx.db)
+        .await
+        .unwrap()
+    }
+
+    /// Two folders indexed by a first scan; the request log is cleared after it.
+    async fn scanned_share() -> (
+        crate::integration_test::TestGuard,
+        Addon,
+        DavRoutes,
+        DavHits,
+    ) {
+        let (base, routes, hits) = mutable_webdav().await;
+        let a = set_dav_dir(&routes, "A", OLD, &[MOVIE]);
+        let b = set_dav_dir(&routes, "B", OLD, &[MOVIE2]);
+        set_dav_root(&routes, &[a, b]);
+        let (_, guard) = new_test_server()
+            .await
+            .unwrap();
+        let addon = make_webdav_addon(&guard.0, &base).await;
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed_paths(&guard.0, &addon)
+                .await
+                .len(),
+            2
+        );
+        hits.lock()
+            .unwrap()
+            .clear();
+        (guard, addon, routes, hits)
+    }
+
+    #[tokio::test]
+    async fn webdav_rescan_skips_unchanged_folders() {
+        let (guard, addon, _routes, hits) = scanned_share().await;
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        assert_eq!(
+            *hits
+                .lock()
+                .unwrap(),
+            vec!["/".to_string()],
+            "unchanged folders must not be listed"
+        );
+        assert_eq!(
+            indexed_paths(&guard.0, &addon)
+                .await
+                .len(),
+            2,
+            "rows of skipped folders must survive the prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn webdav_rescan_indexes_new_folder() {
+        let (guard, addon, routes, hits) = scanned_share().await;
+        let a = set_dav_dir(&routes, "A", OLD, &[MOVIE]);
+        let b = set_dav_dir(&routes, "B", OLD, &[MOVIE2]);
+        let c = set_dav_dir(&routes, "C", OLD, &[MOVIE]);
+        set_dav_root(&routes, &[a, b, c]);
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        let hits = hits
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(hits.contains(&"/C/".to_string()), "{hits:?}");
+        assert!(!hits.contains(&"/A/".to_string()), "{hits:?}");
+        assert!(!hits.contains(&"/B/".to_string()), "{hits:?}");
+        assert_eq!(
+            indexed_paths(&guard.0, &addon)
+                .await
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn webdav_rescan_prunes_removed_folder() {
+        let (guard, addon, routes, _hits) = scanned_share().await;
+        let a = set_dav_dir(&routes, "A", OLD, &[MOVIE]);
+        set_dav_root(&routes, &[a]);
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        assert_eq!(
+            indexed_paths(&guard.0, &addon).await,
+            vec!["A/[imdbid-tt0133093] The Matrix (1999).mkv".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn webdav_rescan_walks_folder_with_newer_mtime() {
+        let (guard, addon, routes, hits) = scanned_share().await;
+        let a = set_dav_dir(&routes, "A", FUTURE, &[MOVIE, MOVIE2]);
+        let b = set_dav_dir(&routes, "B", OLD, &[MOVIE2]);
+        set_dav_root(&routes, &[a, b]);
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        let hits = hits
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(hits.contains(&"/A/".to_string()), "{hits:?}");
+        assert!(!hits.contains(&"/B/".to_string()), "{hits:?}");
+        assert_eq!(
+            indexed_paths(&guard.0, &addon)
+                .await
+                .len(),
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn webdav_rescan_walks_everything_by_default() {
+        let (guard, mut addon, _routes, hits) = scanned_share().await;
+        addon
+            .preset
+            .config = serde_json::json!({
+            "media_kind": "movie",
+            "endpoint": addon.preset.config.expose()["endpoint"],
+            "paths": ["/"],
+        })
+        .into();
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        let hits = hits
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(hits.contains(&"/A/".to_string()), "{hits:?}");
+        assert!(hits.contains(&"/B/".to_string()), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn webdav_rescan_walks_everything_after_a_week() {
+        let (guard, addon, _routes, hits) = scanned_share().await;
+        sqlx::query("UPDATE opendal_files SET scanned_at = ? WHERE path LIKE 'A/%'")
+            .bind((Utc::now().naive_utc() - chrono::Duration::days(8)).to_string())
+            .execute(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        let hits = hits
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(hits.contains(&"/A/".to_string()), "{hits:?}");
+        assert!(hits.contains(&"/B/".to_string()), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn webdav_rescan_walks_folder_with_unresolved_row() {
+        let (guard, addon, _routes, hits) = scanned_share().await;
+        sqlx::query("UPDATE opendal_files SET imdb_id = NULL WHERE path LIKE 'A/%'")
+            .execute(
+                &guard
+                    .0
+                    .db,
+            )
+            .await
+            .unwrap();
+        scan_addon(&guard.0, &None, &addon)
+            .await
+            .unwrap();
+        let hits = hits
+            .lock()
+            .unwrap()
+            .clone();
+        assert!(hits.contains(&"/A/".to_string()), "{hits:?}");
+        assert!(!hits.contains(&"/B/".to_string()), "{hits:?}");
+    }
+
+    #[test]
+    fn incremental_index_finds_only_rows_below_the_folder() {
+        let at = Utc::now().naive_utc() - chrono::Duration::days(1);
+        let row = |path: &str| IndexedRow {
+            id: Uuid::new_v4(),
+            path: path.to_string(),
+            scanned_at: at,
+            unresolved: false,
+        };
+        let (a, ab, b) = (
+            row("Movies/A/x.mkv"),
+            row("Movies/AB/x.mkv"),
+            row("Movies/B/x.mkv"),
+        );
+        let a_id = a.id;
+        let mut rows = vec![b, a, ab];
+        rows.sort_unstable_by(|x, y| {
+            x.path
+                .cmp(&y.path)
+        });
+        let index = IncrementalIndex { rows };
+        let old = Some(Utc::now() - chrono::Duration::days(30));
+        assert_eq!(index.unchanged_rows("Movies/A/", old), Some(vec![a_id]));
+        assert_eq!(index.unchanged_rows("Movies/C/", old), None);
+        assert_eq!(index.unchanged_rows("Movies/A/", None), None);
     }
 }

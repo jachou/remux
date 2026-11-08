@@ -5,11 +5,12 @@ use crate::{
 };
 use dioxus::prelude::*;
 use remux_sdks::remux::{
-    CountryInfo, CultureDto, EmbeddedSubtitleHandling, EncodingOptions, GetCountries,
-    GetCultures, GetEncodingConfiguration, GetIntroConfiguration,
-    GetSystemConfiguration, HardwareAccelerationType, IntroOptions, IntroOrder,
-    IntroTriggers, ServerConfiguration, SortMediaSourcesMode, StartTask,
-    UpdateEncodingConfiguration, UpdateIntroConfiguration, UpdateSystemConfiguration,
+    CountryInfo, CultureDto, DefaultWebClient, EmbeddedSubtitleHandling,
+    EncodingOptions, GetCountries, GetCultures, GetEncodingConfiguration,
+    GetIntroConfiguration, GetSystemConfiguration, HardwareAccelerationType,
+    IntroOptions, IntroOrder, IntroTriggers, ServerConfiguration, SortMediaSourcesMode,
+    StartTask, UpdateEncodingConfiguration, UpdateIntroConfiguration,
+    UpdateSystemConfiguration,
 };
 
 #[component]
@@ -18,6 +19,7 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
     let mut server_name = use_signal(String::new);
     let mut metadata_country = use_signal(|| "US".to_string());
     let mut metadata_language = use_signal(|| "en".to_string());
+    let mut default_web_client = use_signal(DefaultWebClient::default);
     let mut countries: Signal<Vec<CountryInfo>> = use_signal(Vec::new);
     let mut cultures: Signal<Vec<CultureDto>> = use_signal(Vec::new);
     let mut catalog_max_items = use_signal(|| 100_i64);
@@ -28,6 +30,7 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
     let mut subtitle_languages = use_signal(String::new);
     let mut quick_connect_enabled = use_signal(|| true);
     let mut enable_next_up_in_continue_watching = use_signal(|| false);
+    let mut force_default_view_order = use_signal(|| false);
     let mut loading = use_signal(|| true);
     let mut saving = use_signal(|| false);
     let mut error = use_signal(|| Option::<String>::None);
@@ -57,6 +60,10 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                             .clone()
                             .unwrap_or_else(|| "en".to_string()),
                     );
+                    default_web_client.set(
+                        cfg.default_web_client
+                            .unwrap_or_default(),
+                    );
                     catalog_max_items.set(
                         cfg.catalog_max_items
                             .unwrap_or(100),
@@ -80,6 +87,10 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                     );
                     enable_next_up_in_continue_watching.set(
                         cfg.enable_next_up_in_continue_watching
+                            .unwrap_or(false),
+                    );
+                    force_default_view_order.set(
+                        cfg.force_default_view_order
                             .unwrap_or(false),
                     );
                     base_cfg.set(Some(cfg));
@@ -114,6 +125,7 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
         let language = metadata_language
             .peek()
             .clone();
+        let web_client = *default_web_client.peek();
         let max = *catalog_max_items.peek();
         let concurrency = *meta_concurrency.peek();
         let addon_timeout = *addon_fetch_timeout_secs.peek();
@@ -124,6 +136,7 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
             .clone();
         let qc_enabled = *quick_connect_enabled.peek();
         let next_up_unified = *enable_next_up_in_continue_watching.peek();
+        let force_view_order = *force_default_view_order.peek();
 
         let mut cfg = base_cfg
             .peek()
@@ -132,8 +145,10 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
         cfg.server_name = Some(name);
         cfg.metadata_country_code = Some(country);
         cfg.preferred_metadata_language = Some(language);
+        cfg.default_web_client = Some(web_client);
         cfg.quick_connect_available = Some(qc_enabled);
         cfg.enable_next_up_in_continue_watching = Some(next_up_unified);
+        cfg.force_default_view_order = Some(force_view_order);
         cfg.catalog_max_items = Some(max);
         cfg.meta_concurrency = concurrency;
         cfg.addon_fetch_timeout_secs = Some(addon_timeout);
@@ -217,6 +232,24 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                                     }
                                 }
                             }
+                        }
+
+                        div { class: "field",
+                            label { class: "field-label", r#for: "s-web-client", "Default Web Client" }
+                            select {
+                                id: "s-web-client",
+                                class: "select-input",
+                                value: "{default_web_client.read().as_str()}",
+                                onchange: move |e| default_web_client.set(DefaultWebClient::from_str_lossy(&e.value())),
+                                for client in DefaultWebClient::ALL {
+                                    option {
+                                        value: "{client.as_str()}",
+                                        selected: *default_web_client.read() == client,
+                                        "{client.label()}"
+                                    }
+                                }
+                            }
+                            p { class: "field-hint", "Opened when you visit the server address. Both clients stay available at /web/ and /remux/." }
                         }
 
                         div { class: "field",
@@ -341,6 +374,15 @@ pub fn ServerSettingsCard(app_state: AppState) -> Element {
                                 description: "Add the next released episode of a started series when that series has no episode currently in progress. Disabled by default.",
                                 checked: *enable_next_up_in_continue_watching.read(),
                                 on_change: move |v| enable_next_up_in_continue_watching.set(v),
+                            }
+                        }
+
+                        div { class: "field",
+                            ToggleRow {
+                                label: "Force default library order",
+                                description: "Ignore users' own home screen ordering and show everyone the library order set in the dashboard. Users' saved orders are kept and apply again when this is off.",
+                                checked: *force_default_view_order.read(),
+                                on_change: move |v| force_default_view_order.set(v),
                             }
                         }
 

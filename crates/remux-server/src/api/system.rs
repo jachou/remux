@@ -143,6 +143,9 @@ pub async fn system_info_public(
                 .started_at
                 .to_rfc3339(),
         ),
+        remux_force_default_view_order: config
+            .force_default_view_order
+            .unwrap_or(false),
         ..Default::default()
     }))
 }
@@ -931,6 +934,9 @@ pub async fn system_info(
             .jellyfin_version
             .clone(),
         remux_version: env!("CARGO_PKG_VERSION").to_string(),
+        remux_force_default_view_order: config
+            .force_default_view_order
+            .unwrap_or(false),
         can_self_restart: Some(true),
         has_pending_restart: false,
         is_shutting_down: false,
@@ -1004,7 +1010,28 @@ mod test {
             "Version": crate::default_jellyfin_version(),
             "RemuxVersion": env!("CARGO_PKG_VERSION"),
             "StartupWizardCompleted": true,
+            "RemuxForceDefaultViewOrder": false,
         }));
+
+        let mut cfg = crate::db::Settings::get_config_or_default(
+            &_ctx
+                .0
+                .db,
+        )
+        .await;
+        cfg.force_default_view_order = Some(true);
+        crate::db::Settings::set_config(
+            &_ctx
+                .0
+                .db,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        server
+            .get("/system/info/public")
+            .await
+            .assert_json_contains(&json!({ "RemuxForceDefaultViewOrder": true }));
     }
 
     #[tokio::test]

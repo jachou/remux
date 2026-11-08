@@ -1254,6 +1254,45 @@ fn can_fallback_to_stale_probe_cache(cached: &api::MediaSourceInfo) -> bool {
 /// `apply_filename_guess`.
 pub const SKIP_FFPROBE: bool = true;
 
+/// How long a probe of another file than listed is reused before probing
+/// again, in case the resolver now serves the listed file.
+const MISMATCHED_PROBE_TTL: std::time::Duration =
+    std::time::Duration::from_secs(10 * 60);
+
+fn mismatched_probe_key(stream: &db::Media) -> String {
+    let listed = stream
+        .stream_info
+        .as_ref()
+        .and_then(|si| si.size)
+        .unwrap_or_default();
+    format!("probe_mismatch:{}:{listed}", stream.id)
+}
+
+/// A probe of another file than listed is reused only while its marker
+/// lasts, so a later probe of the listed file replaces it and reaches RemuxDB.
+fn reuses_cached_probe(
+    stream: &db::Media,
+    cached: &api::MediaSourceInfo,
+    store: &remux_utils::Store,
+) -> bool {
+    is_reusable_probe_cache(cached)
+        && (!stream
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| si.is_other_file(cached.size))
+            || store
+                .get::<()>(mismatched_probe_key(stream))
+                .is_some())
+}
+
+/// Whether `probe_stream` ran ffprobe for this request; only then is the
+/// result new to RemuxDB. Stored metadata and filename guesses are `Cached`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeOutcome {
+    Cached,
+    Probed,
+}
+
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
 pub(crate) async fn probe_stream(
     stream: &db::Media,
@@ -1266,7 +1305,8 @@ pub(crate) async fn probe_stream(
     restrict_resolution: bool,
     port: u16,
     db: &sqlx::SqlitePool,
-) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
+    store: &remux_utils::Store,
+) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media, ProbeOutcome)> {
     if skip_probe {
         let mut info = api::MediaSourceInfo::from(stream.clone());
         // No real probe (RemuxDB miss, and this candidate isn't the one that
@@ -1281,15 +1321,20 @@ pub(crate) async fn probe_stream(
                 warn!(id = %stream.id, error = %e, "failed to persist filename-guessed probe data");
             }
         }
-        return Ok((info, stream.clone()));
+        return Ok((info, stream.clone(), ProbeOutcome::Cached));
     }
+    // A reusable probe of another file still beats failing playback.
     let can_fallback_to_stale = stream
         .probe_data
         .as_ref()
-        .is_some_and(can_fallback_to_stale_probe_cache);
+        .is_some_and(|cached| {
+            can_fallback_to_stale_probe_cache(cached)
+                || (is_reusable_probe_cache(cached)
+                    && !reuses_cached_probe(stream, cached, store))
+        });
     let mut primary_alive = true;
     if let Some(cached) = &stream.probe_data {
-        if is_reusable_probe_cache(cached) {
+        if reuses_cached_probe(stream, cached, store) {
             let alive = match stream
                 .stream_info
                 .as_ref()
@@ -1305,12 +1350,12 @@ pub(crate) async fn probe_stream(
                 debug!(id = %stream.id, "probe cache hit, url alive");
                 let mut info = api::MediaSourceInfo::from(stream.clone());
                 apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
-                return Ok((info, stream.clone()));
+                return Ok((info, stream.clone(), ProbeOutcome::Cached));
             }
             primary_alive = false;
             debug!(id = %stream.id, "probe cache hit but url dead, falling through to fallback");
         } else {
-            debug!(id = %stream.id, "probe cache stale or filename-guess only, re-probing");
+            debug!(id = %stream.id, "probe cache stale, filename-guess only or of another file, re-probing");
         }
     }
     if stream
@@ -1370,8 +1415,22 @@ pub(crate) async fn probe_stream(
         .await
     };
 
+    if let Ok((probed, effective)) = &result
+        && effective
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| si.is_other_file(probed.size))
+    {
+        info!(
+            id = %effective.id,
+            listed_size = ?effective.stream_info.as_ref().and_then(|si| si.size),
+            probed_size = ?probed.size,
+            "probed file is not the listed release"
+        );
+        store.save(mismatched_probe_key(effective), (), MISMATCHED_PROBE_TTL);
+    }
     match result {
-        Ok(result) => Ok(result),
+        Ok((info, effective)) => Ok((info, effective, ProbeOutcome::Probed)),
         Err(error) if can_fallback_to_stale => {
             warn!(
                 id = %stream.id,
@@ -1380,7 +1439,7 @@ pub(crate) async fn probe_stream(
             );
             let mut info = api::MediaSourceInfo::from(stream.clone());
             apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
-            Ok((info, stream.clone()))
+            Ok((info, stream.clone(), ProbeOutcome::Cached))
         }
         Err(error) => Err(error),
     }
@@ -1639,7 +1698,7 @@ where
             info!(
                 failed_id = %primary.id,
                 next_id = %stream.id,
-                next_url = %url,
+                next_url = %redact_url(&url),
                 "probe failed, trying next matching stream"
             );
         }
@@ -1705,7 +1764,7 @@ where
                     if probed_ticks < threshold_ticks {
                         warn!(
                             id = %stream.id,
-                            url = %url,
+                            url = %redact_url(&url),
                             probed_ticks,
                             threshold_ticks,
                             known_runtime_secs = ?stream.runtime,
@@ -1735,7 +1794,7 @@ where
                 }
                 if is_retry {
                     info!(
-                        fallback_url = %url,
+                        fallback_url = %redact_url(&url),
                         attempt = attempts,
                         "probe succeeded on fallback stream"
                     );
@@ -1743,13 +1802,13 @@ where
                 return Ok((probed, stream));
             }
             Ok(Ok(Err(e))) => {
-                warn!(url = %url, error = %e, "probe failed");
+                warn!(url = %redact_url(&url), error = %e, "probe failed");
             }
             Ok(Err(e)) => {
-                warn!(url = %url, error = %e, "probe task panicked");
+                warn!(url = %redact_url(&url), error = %e, "probe task panicked");
             }
             Err(_) => {
-                warn!(url = %url, timeout = timeout_secs, "probe timed out");
+                warn!(url = %redact_url(&url), timeout = timeout_secs, "probe timed out");
                 crate::stream::record_upstream_timeout("probe timed out");
             }
         }
@@ -2601,6 +2660,23 @@ mod probe_tests {
                 sibling.id
             );
         }
+    }
+
+    #[test]
+    fn probe_of_another_file_is_reused_only_while_marked() {
+        let store = remux_utils::Store::new(16);
+        let mut stream = http_media("http://a.example.com");
+        stream
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(12_811_223_977);
+        let (mut cached, _) = video_probe().unwrap();
+        cached.size = Some(8_657_935_338);
+        // Not a cache hit: a re-probe may find the listed file, new to RemuxDB.
+        assert!(!reuses_cached_probe(&stream, &cached, &store));
+        store.save(mismatched_probe_key(&stream), (), MISMATCHED_PROBE_TTL);
+        assert!(reuses_cached_probe(&stream, &cached, &store));
     }
 }
 
