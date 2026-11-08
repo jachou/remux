@@ -502,10 +502,14 @@ impl StreamDescriptor {
                         .and_then(|cr| cr.split('/').last())
                         .and_then(|s| s.parse::<u64>().ok())
                         .or_else(|| {
-                            r.headers()
-                                .get(http::header::CONTENT_LENGTH)
-                                .and_then(|v| v.to_str().ok())
-                                .and_then(|s| s.parse::<u64>().ok())
+                            if status == http::StatusCode::OK {
+                                r.headers()
+                                    .get(http::header::CONTENT_LENGTH)
+                                    .and_then(|v| v.to_str().ok())
+                                    .and_then(|s| s.parse::<u64>().ok())
+                            } else {
+                                None
+                            }
                         });
 
                     let is_tiny_video = total_size.is_some_and(|sz| sz < 2 * 1024 * 1024);
@@ -1896,7 +1900,9 @@ mod tests {
             when.method(httpmock::Method::GET)
                 .path("/live.mkv")
                 .header("Range", "bytes=0-7");
-            then.status(206).body(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0]);
+            then.status(206)
+                .header("Content-Range", "bytes 0-7/100000000")
+                .body(&[0x1a, 0x45, 0xdf, 0xa3, 0, 0, 0, 0]);
         });
 
         let test_url = format!("{}/live.mkv", server.base_url());
