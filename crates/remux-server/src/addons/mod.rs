@@ -3324,9 +3324,10 @@ impl AddonService {
         const CATALOG_TTL_SECS: i64 = 12 * 3600;      // 12 hours
 
         let now = chrono::Utc::now().naive_utc();
-        let release_date = media
-            .digital_released_at
-            .or(media.released_at);
+        let release_date = [media.released_at, media.digital_released_at]
+            .into_iter()
+            .flatten()
+            .max();
 
         match release_date {
             Some(rel) => {

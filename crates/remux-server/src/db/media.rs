@@ -2294,21 +2294,31 @@ impl Media {
             return false;
         }
         let now = chrono::Utc::now().naive_utc();
-        if let Some(r) = self.digital_released_at.or(self.released_at) {
-            return r > now;
+        let dates: Vec<chrono::NaiveDateTime> = [self.released_at, self.digital_released_at]
+            .into_iter()
+            .flatten()
+            .collect();
+        if !dates.is_empty() {
+            return dates.iter().any(|&d| d > now);
         }
         if let Some(ref parent) = self.parent {
-            return parent
-                .digital_released_at
-                .or(parent.released_at)
-                .map_or(true, |r| r > now);
+            let parent_dates: Vec<chrono::NaiveDateTime> = [parent.released_at, parent.digital_released_at]
+                .into_iter()
+                .flatten()
+                .collect();
+            if !parent_dates.is_empty() {
+                return parent_dates.iter().any(|&d| d > now);
+            }
         }
         if let Some(pid) = self.parent_id {
             if let Ok(Some(parent)) = Media::get_by_id(db, &pid).await {
-                return parent
-                    .digital_released_at
-                    .or(parent.released_at)
-                    .map_or(true, |r| r > now);
+                let parent_dates: Vec<chrono::NaiveDateTime> = [parent.released_at, parent.digital_released_at]
+                    .into_iter()
+                    .flatten()
+                    .collect();
+                if !parent_dates.is_empty() {
+                    return parent_dates.iter().any(|&d| d > now);
+                }
             }
         }
         true
@@ -13102,5 +13112,57 @@ mod genre_ids_filter_tests {
             Some(1),
             "the hidden member must not be counted"
         );
+    }
+
+    #[tokio::test]
+    async fn episode_is_unreleased_when_any_date_is_in_the_future() {
+        let db = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        crate::db::migrate(&db)
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now().naive_utc();
+        let past = now - chrono::Duration::days(5);
+        let future = now + chrono::Duration::days(5);
+
+        // Case 1: TV broadcast is in the future, but stale digital_released_at is in the past.
+        // Must be unreleased.
+        let ep_rescheduled = Media {
+            kind: MediaKind::Episode,
+            released_at: Some(future),
+            digital_released_at: Some(past),
+            ..Default::default()
+        };
+        assert!(ep_rescheduled.is_unreleased(&db).await);
+
+        // Case 2: TV broadcast is in the past, but digital release is in the future.
+        // Must be unreleased.
+        let ep_future_digital = Media {
+            kind: MediaKind::Episode,
+            released_at: Some(past),
+            digital_released_at: Some(future),
+            ..Default::default()
+        };
+        assert!(ep_future_digital.is_unreleased(&db).await);
+
+        // Case 3: Both dates are in the past.
+        // Must be released.
+        let ep_released = Media {
+            kind: MediaKind::Episode,
+            released_at: Some(past),
+            digital_released_at: Some(past),
+            ..Default::default()
+        };
+        assert!(!ep_released.is_unreleased(&db).await);
+
+        // Case 4: Movies are never unreleased by is_unreleased (it only guards episodes).
+        let movie = Media {
+            kind: MediaKind::Movie,
+            released_at: Some(future),
+            ..Default::default()
+        };
+        assert!(!movie.is_unreleased(&db).await);
     }
 }

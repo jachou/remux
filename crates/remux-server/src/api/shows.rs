@@ -271,23 +271,23 @@ fn select_preemptive_probe_targets<'a>(items: &'a [api::BaseItemDto]) -> Vec<&'a
 }
 
 fn is_unreleased_episode(ep: &db::Media, threshold: chrono::NaiveDateTime) -> bool {
-    let dates: Vec<chrono::NaiveDateTime> = [ep.digital_released_at, ep.released_at]
+    let dates: Vec<chrono::NaiveDateTime> = [ep.released_at, ep.digital_released_at]
         .into_iter()
         .flatten()
         .collect();
     if dates.is_empty() {
         if let Some(ref p) = ep.parent {
-            let parent_dates: Vec<chrono::NaiveDateTime> = [p.digital_released_at, p.released_at]
+            let parent_dates: Vec<chrono::NaiveDateTime> = [p.released_at, p.digital_released_at]
                 .into_iter()
                 .flatten()
                 .collect();
             if !parent_dates.is_empty() {
-                return parent_dates.iter().all(|&d| d > threshold);
+                return parent_dates.iter().any(|&d| d > threshold);
             }
         }
         return true;
     }
-    dates.iter().all(|&d| d > threshold)
+    dates.iter().any(|&d| d > threshold)
 }
 
 #[get("/shows/nextup")]
@@ -2867,5 +2867,20 @@ pub(crate) mod test {
         let body: serde_json::Value = resp.json();
         assert_eq!(body["TotalRecordCount"], 260);
         assert_eq!(body["Items"].as_array().unwrap().len(), 260);
+    }
+
+    #[test]
+    fn is_unreleased_episode_detects_future_airdate_with_stale_digital_date() {
+        let now = chrono::Utc::now().naive_utc();
+        let past = now - chrono::Duration::days(5);
+        let future = now + chrono::Duration::days(5);
+
+        let ep = db::Media {
+            kind: db::MediaKind::Episode,
+            released_at: Some(future),
+            digital_released_at: Some(past),
+            ..Default::default()
+        };
+        assert!(is_unreleased_episode(&ep, now));
     }
 }
