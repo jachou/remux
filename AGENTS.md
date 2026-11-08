@@ -34,6 +34,14 @@ Always run `cargo fmt` on every crate you touched before committing. CI enforces
 
 When the user says "commit and close issue", include `(fixes #N)` in the commit subject line to auto-close the issue via GitHub. Example: `feat: allow JS injection on branding page (fixes #190)`.
 
+## Disk space & build hygiene (CRITICAL)
+
+The host OS disk (`/dev/sda2`) has limited capacity (~126 GB) and is shared with media server services. Full debug and test builds easily balloon `target/` to 30–40 GB, risking immediate disk exhaustion.
+
+- **Clean up after building/testing**: Always run `cargo clean` or prune `target/` after completing test runs or release builds once binaries are deployed.
+- **Docker builds**: If running cargo inside Docker containers (`rust:1.88-bookworm`), clean up intermediate build artifacts before exiting so root-owned multi-gigabyte files do not linger on the host drive.
+- **Type checking**: When verifying code changes, prefer `cargo check` instead of full builds to minimize disk consumption.
+
 ## Coding conventions
 
 - Prefer `strum`-derived enums over raw strings for any value that has a fixed set of variants (media kinds, image types, codec names, etc.). Use `#[derive(EnumString, Display, ...)]` so the enum round-trips cleanly through serde and DB layers without stringly-typed branches.
