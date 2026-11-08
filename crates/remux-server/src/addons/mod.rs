@@ -3417,6 +3417,8 @@ fn match_probe_version<'a>(
 }
 
 impl AddonService {
+    pub const NEGATIVE_CACHE_TTL_SECS: i64 = 5 * 60; // 5 minutes
+
     /// Determine the streams cache TTL for a media item.
     ///
     /// - Recent releases (released/aired within the last 7 days or upcoming): 30 minutes (1,800s).
@@ -3426,7 +3428,7 @@ impl AddonService {
     ///   ensuring instant sub-100ms PlaybackInfo responses.
     pub fn stream_cache_ttl_secs(media: &db::Media) -> i64 {
         const RECENT_RELEASE_TTL_SECS: i64 = 30 * 60; // 30 minutes
-        const CATALOG_TTL_SECS: i64 = 12 * 3600;      // 12 hours
+        const CATALOG_TTL_SECS: i64 = 12 * 3600; // 12 hours
 
         let now = chrono::Utc::now().naive_utc();
         let release_date = [media.released_at, media.digital_released_at]
@@ -3447,6 +3449,22 @@ impl AddonService {
         }
     }
 
+    /// Effective TTL taking into account negative caching.
+    ///
+    /// If no streams exist (`has_streams == false`), cache for 5 minutes (`NEGATIVE_CACHE_TTL_SECS`)
+    /// so repeated client requests don't storm upstream scrapers, while still allowing fresh
+    /// torrents/streams to be discovered soon after release.
+    pub fn effective_stream_cache_ttl_secs(
+        media: &db::Media,
+        has_streams: bool,
+    ) -> i64 {
+        if !has_streams {
+            Self::NEGATIVE_CACHE_TTL_SECS
+        } else {
+            Self::stream_cache_ttl_secs(media)
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn refresh_streams(
         &self,
@@ -3454,12 +3472,20 @@ impl AddonService {
         ctx: &AppContext,
         user_id: Option<Uuid>,
     ) -> Result<()> {
-        if media.is_unreleased(&ctx.db).await {
+        if media
+            .is_unreleased(&ctx.db)
+            .await
+        {
             tracing::debug!(item_id = %media.id, title = %media.title, "skipping stream refresh for unreleased episode");
             return Ok(());
         }
 
-        let ttl_secs = Self::stream_cache_ttl_secs(media);
+        let mut existing = media
+            .streams(&ctx.db)
+            .await
+            .unwrap_or_default();
+        let ttl_secs =
+            Self::effective_stream_cache_ttl_secs(media, !existing.is_empty());
         static STREAM_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 
         // Fast path: TTL not expired — skip the lock entirely.
@@ -3474,19 +3500,23 @@ impl AddonService {
 
         // Fast path 2: If existing streams are already in DB and candidate #1 is confirmed alive
         // (or warm in Fast-Start RAM cache), skip the slow synchronous upstream scrape.
-        let mut existing = media.streams(&ctx.db).await.unwrap_or_default();
         if let Some(primary) = existing.first() {
             let candidate_alive = if let Some(si) = &primary.stream_info {
                 match &si.descriptor {
                     crate::stream::StreamDescriptor::Http { url, .. } => {
                         let is_err = crate::stream::is_error_video_url(url);
                         !is_err
-                            && (crate::fast_start::FAST_START_CACHE.get(url).is_some_and(|e| {
-                                e.total_size >= 2 * 1024 * 1024
-                                    && !crate::stream::is_error_video_url(&e.direct_cdn_url)
-                            }) || crate::stream::STREAM_LIVENESS_CACHE
+                            && (crate::fast_start::FAST_START_CACHE
                                 .get(url)
-                                .is_some_and(|e| e.alive))
+                                .is_some_and(|e| {
+                                    e.total_size >= 2 * 1024 * 1024
+                                        && !crate::stream::is_error_video_url(
+                                            &e.direct_cdn_url,
+                                        )
+                                })
+                                || crate::stream::STREAM_LIVENESS_CACHE
+                                    .get(url)
+                                    .is_some_and(|e| e.alive))
                     }
                     _ => true,
                 }
@@ -3496,11 +3526,13 @@ impl AddonService {
 
             if candidate_alive {
                 let now = chrono::Utc::now().naive_utc();
-                let _ = sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
-                    .bind(now)
-                    .bind(media.id)
-                    .execute(&ctx.db)
-                    .await;
+                let _ = sqlx::query(
+                    "UPDATE media SET streams_refreshed_at = ? WHERE id = ?",
+                )
+                .bind(now)
+                .bind(media.id)
+                .execute(&ctx.db)
+                .await;
                 let _ = sqlx::query("UPDATE media SET updated_at = ? WHERE parent_id = ? AND kind = 'stream'")
                     .bind(now)
                     .bind(media.id)
@@ -3541,7 +3573,9 @@ impl AddonService {
         if is_fresh(refreshed_at) {
             media.streams_refreshed_at = refreshed_at;
             media.sources = None;
-            let _ = media.streams(&ctx.db).await;
+            let _ = media
+                .streams(&ctx.db)
+                .await;
             return Ok(());
         }
 
@@ -3644,8 +3678,22 @@ impl AddonService {
         };
         info!(streams = deduped.len(), ?sources, elapsed = ?instant.elapsed(), "streams synced");
         if deduped.is_empty() {
+            let now = chrono::Utc::now().naive_utc();
+            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(media.id)
+                .execute(&ctx.db)
+                .await?;
+            media.streams_refreshed_at = Some(now);
             media.sources = None;
-            let _ = media.streams(&ctx.db).await;
+            let _ = media
+                .streams(&ctx.db)
+                .await;
+            debug!(
+                title = %media.title,
+                ttl_secs = Self::NEGATIVE_CACHE_TTL_SECS,
+                "empty streams result, cached negatively"
+            );
             return Ok(());
         }
 
@@ -3700,7 +3748,9 @@ impl AddonService {
         .await?;
 
         media.sources = None;
-        let _ = media.streams(&ctx.db).await;
+        let _ = media
+            .streams(&ctx.db)
+            .await;
         Ok(())
     }
 
@@ -3714,7 +3764,10 @@ impl AddonService {
         static SEGMENT_LOCKS: KeyedLock<Uuid> = KeyedLock::new();
 
         let cache_key = format!("addon-segments:{}", media.id);
-        if let Some(cached) = ctx.store.get::<MediaSegments>(&cache_key) {
+        if let Some(cached) = ctx
+            .store
+            .get::<MediaSegments>(&cache_key)
+        {
             if background {
                 debug!(item = %media.id, "segments cache hit");
             } else {
@@ -3723,8 +3776,13 @@ impl AddonService {
             return (*cached).clone();
         }
 
-        let _guard = SEGMENT_LOCKS.lock(media.id).await;
-        if let Some(cached) = ctx.store.get::<MediaSegments>(&cache_key) {
+        let _guard = SEGMENT_LOCKS
+            .lock(media.id)
+            .await;
+        if let Some(cached) = ctx
+            .store
+            .get::<MediaSegments>(&cache_key)
+        {
             if background {
                 debug!(item = %media.id, "segments cache hit");
             } else {
@@ -3793,7 +3851,8 @@ impl AddonService {
         .filter(|s| s.is_some())
         .count();
 
-        ctx.store.save(cache_key, merged.clone(), SEGMENTS_TTL);
+        ctx.store
+            .save(cache_key, merged.clone(), SEGMENTS_TTL);
 
         if background {
             debug!(segments = found, addons = addon_count, elapsed = ?instant.elapsed(), "segments fetched");
@@ -5519,14 +5578,20 @@ mod tests {
             released_at: Some(now + chrono::Duration::days(1)),
             ..Default::default()
         };
-        assert_eq!(AddonService::stream_cache_ttl_secs(&upcoming_media), 30 * 60);
+        assert_eq!(
+            AddonService::stream_cache_ttl_secs(&upcoming_media),
+            30 * 60
+        );
 
         // 3. Catalog release from 30 days ago (> 7 days): should use 12 hours (43200s)
         let catalog_media = db::Media {
             released_at: Some(now - chrono::Duration::days(30)),
             ..Default::default()
         };
-        assert_eq!(AddonService::stream_cache_ttl_secs(&catalog_media), 12 * 3600);
+        assert_eq!(
+            AddonService::stream_cache_ttl_secs(&catalog_media),
+            12 * 3600
+        );
 
         // 4. Missing release date: defaults to 12 hours (43200s)
         let no_date_media = db::Media {
@@ -5534,7 +5599,34 @@ mod tests {
             digital_released_at: None,
             ..Default::default()
         };
-        assert_eq!(AddonService::stream_cache_ttl_secs(&no_date_media), 12 * 3600);
+        assert_eq!(
+            AddonService::stream_cache_ttl_secs(&no_date_media),
+            12 * 3600
+        );
+
+        // Negative caching: 5 minutes (300s) when no streams exist, regardless of release date
+        assert_eq!(
+            AddonService::effective_stream_cache_ttl_secs(&recent_media, false),
+            5 * 60
+        );
+        assert_eq!(
+            AddonService::effective_stream_cache_ttl_secs(&catalog_media, false),
+            5 * 60
+        );
+        assert_eq!(
+            AddonService::effective_stream_cache_ttl_secs(&no_date_media, false),
+            5 * 60
+        );
+
+        // Positive caching: uses tiered policy when streams are present
+        assert_eq!(
+            AddonService::effective_stream_cache_ttl_secs(&recent_media, true),
+            30 * 60
+        );
+        assert_eq!(
+            AddonService::effective_stream_cache_ttl_secs(&catalog_media, true),
+            12 * 3600
+        );
     }
 
     struct MockRefreshStreamAddon;
@@ -5602,22 +5694,188 @@ mod tests {
 
         let mut movie = crate::integration_test::seed_movie(ctx).await;
 
-        assert!(movie.sources.is_none());
+        assert!(
+            movie
+                .sources
+                .is_none()
+        );
 
-        service.refresh_streams(&mut movie, ctx, None).await.unwrap();
+        service
+            .refresh_streams(&mut movie, ctx, None)
+            .await
+            .unwrap();
 
         // Regression check: media.sources must be populated and not left as empty Some(vec![])
         assert!(
-            movie.sources.is_some(),
+            movie
+                .sources
+                .is_some(),
             "refresh_streams must populate media.sources"
         );
-        let expected_stream_id = movie.sources.as_ref().unwrap()[0].id;
-        assert_eq!(movie.sources.as_ref().unwrap().len(), 1, "expected 1 synced stream");
+        let expected_stream_id = movie
+            .sources
+            .as_ref()
+            .unwrap()[0]
+            .id;
+        assert_eq!(
+            movie
+                .sources
+                .as_ref()
+                .unwrap()
+                .len(),
+            1,
+            "expected 1 synced stream"
+        );
 
         // Subsequent media.streams() call must return the freshly populated streams
-        let from_db = movie.streams(&ctx.db).await.unwrap();
+        let from_db = movie
+            .streams(&ctx.db)
+            .await
+            .unwrap();
         assert_eq!(from_db.len(), 1);
         assert_eq!(from_db[0].id, expected_stream_id);
+    }
+
+    struct MockEmptyStreamAddon {
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl StreamAddon for MockEmptyStreamAddon {
+        fn supports(&self, _media: &db::Media) -> bool {
+            true
+        }
+        async fn get_streams(
+            &self,
+            _media: &db::Media,
+            _ctx: &AppContext,
+            _id_prefixes: Option<&[String]>,
+        ) -> Result<Vec<crate::stream::StreamInfo>> {
+            self.calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_streams_negative_cache_honors_5_min_ttl() {
+        use crate::integration_test::authenticated_server;
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let now = chrono::Utc::now().naive_utc();
+        let runtime = AddonRuntime {
+            row: addon::Addon {
+                id: Uuid::new_v4(),
+                name: "mock-empty-stream-addon".into(),
+                preset: AddonPresetRef {
+                    kind: "scripted".into(),
+                    config: serde_json::Value::Null.into(),
+                },
+                resources: vec![ResourceType::Stream],
+                types: vec![],
+                enabled: true,
+                priority: 0,
+                created_at: now,
+                updated_at: now,
+                system: true,
+                is_default: false,
+                http_redirect_stream: false,
+                subtitle_extraction: false,
+                probe_on_scan: false,
+                service_filter: vec![],
+            },
+            caps: AddonCapabilities {
+                stream: Some(std::sync::Arc::new(MockEmptyStreamAddon {
+                    calls: calls.clone(),
+                })),
+                ..Default::default()
+            },
+        };
+
+        let service = AddonService {
+            inner: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(vec![runtime])),
+        };
+
+        let mut movie = crate::integration_test::seed_movie(ctx).await;
+        assert!(
+            movie
+                .streams_refreshed_at
+                .is_none()
+        );
+
+        // 1. First refresh with 0 streams: queries addon once, populates streams_refreshed_at
+        service
+            .refresh_streams(&mut movie, ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            movie
+                .streams_refreshed_at
+                .is_some(),
+            "streams_refreshed_at must be populated on empty streams"
+        );
+        assert!(
+            movie
+                .streams(&ctx.db)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let refreshed_in_db = sqlx::query_scalar::<_, Option<chrono::NaiveDateTime>>(
+            "SELECT streams_refreshed_at FROM media WHERE id = ?",
+        )
+        .bind(movie.id)
+        .fetch_one(&ctx.db)
+        .await
+        .unwrap();
+        assert!(
+            refreshed_in_db.is_some(),
+            "DB streams_refreshed_at must be set for negative cache"
+        );
+
+        // 2. Second refresh within 5-min TTL: hits negative cache immediately without querying addon
+        service
+            .refresh_streams(&mut movie, ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "negative cache must skip upstream scrape"
+        );
+
+        // 3. Expire the negative cache (> 5 minutes ago)
+        let expired = chrono::Utc::now().naive_utc()
+            - chrono::Duration::seconds(AddonService::NEGATIVE_CACHE_TTL_SECS + 1);
+        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            .bind(expired)
+            .bind(movie.id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+        movie.streams_refreshed_at = Some(expired);
+        movie.sources = None;
+
+        // 4. Refresh after negative cache expired: queries addon again
+        service
+            .refresh_streams(&mut movie, ctx, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "expired negative cache must re-query upstream"
+        );
+        assert!(
+            movie
+                .streams_refreshed_at
+                .unwrap()
+                > expired
+        );
     }
     /// Answers with its hits (or an error if `fail`) after sleeping `delay`
     /// and, if gated, once the test opens the gate.
