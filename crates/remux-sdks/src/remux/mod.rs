@@ -1278,6 +1278,7 @@ pub struct SystemInfo {
     pub server_name: Option<String>,
     pub operating_system: Option<String>,
     pub id: Option<String>,
+    pub startup_wizard_completed: Option<bool>,
     #[default(vec![
         CastReceiverApplication { id: "F007D354".to_string(), name: "Stable".to_string() },
         CastReceiverApplication { id: "6F511C87".to_string(), name: "Unstable".to_string() },

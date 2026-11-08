@@ -65,6 +65,41 @@ fn request_local_address(headers: &HeaderMap, fallback_port: u16) -> String {
     )
 }
 
+fn request_websocket_port(headers: &HeaderMap) -> u16 {
+    if let Some(port) = headers
+        .get("x-forwarded-port")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u16>().ok())
+    {
+        return port;
+    }
+
+    let authority = [headers.get("x-forwarded-host"), headers.get(header::HOST)]
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(',').next())
+        .map(str::trim)
+        .find_map(|value| value.parse::<http::uri::Authority>().ok());
+
+    if let Some(port) = authority.as_ref().and_then(|a| a.port_u16()) {
+        return port;
+    }
+
+    let scheme = headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .map(str::trim)
+        .filter(|value| matches!(*value, "http" | "https"));
+
+    match scheme {
+        Some("https") => 443,
+        Some("http") => 80,
+        _ => 8096,
+    }
+}
+
 #[get("/system/info/public")]
 pub async fn system_info_public(
     State(state): State<AppState>,
@@ -869,6 +904,7 @@ async fn shutdown_server() -> Result<()> {
 #[get("/system/info")]
 pub async fn system_info(
     State(state): State<AppState>,
+    headers: HeaderMap,
     _session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
     let config = crate::db::Settings::get_config(
@@ -877,6 +913,14 @@ pub async fn system_info(
             .db,
     )
     .await?;
+    let local_addr = request_local_address(
+        &headers,
+        state
+            .ctx
+            .config
+            .port,
+    );
+    let ws_port = request_websocket_port(&headers);
     Ok(Json(api::SystemInfo {
         id: Some(server_id()),
         server_name: config.server_name,
@@ -891,7 +935,9 @@ pub async fn system_info(
         has_pending_restart: false,
         is_shutting_down: false,
         supports_library_monitor: true,
-        web_socket_port_number: 3000,
+        web_socket_port_number: ws_port,
+        local_address: Some(local_addr),
+        startup_wizard_completed: config.is_startup_wizard_completed.or(Some(true)),
         ..Default::default()
     }))
 }
