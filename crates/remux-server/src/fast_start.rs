@@ -249,6 +249,31 @@ pub fn get_active_prewarm_notify(url: &str) -> Option<Arc<tokio::sync::Notify>> 
     ACTIVE_PREWARM_NOTIFY.get(url).map(|n| n.value().clone())
 }
 
+/// Returns whether the given URL currently has a pre-warmed entry in `FAST_START_CACHE` with valid head bytes.
+pub fn is_fast_start_cached(url: &str) -> bool {
+    FAST_START_CACHE.get(url).is_some_and(|e| !e.head_bytes.is_empty())
+}
+
+pub(crate) static FAST_START_DB: std::sync::OnceLock<sqlx::SqlitePool> = std::sync::OnceLock::new();
+
+pub fn set_fast_start_db(db: sqlx::SqlitePool) {
+    let _ = FAST_START_DB.set(db);
+}
+
+pub fn get_fast_start_db() -> Option<&'static sqlx::SqlitePool> {
+    FAST_START_DB.get()
+}
+
+static UPGRADING_PROBES: LazyLock<dashmap::DashSet<String>> =
+    LazyLock::new(dashmap::DashSet::new);
+
+struct ProbeUpgradeGuard(String);
+impl Drop for ProbeUpgradeGuard {
+    fn drop(&mut self) {
+        UPGRADING_PROBES.remove(&self.0);
+    }
+}
+
 /// Global semaphore limiting concurrent low-priority background pre-warms to 2 simultaneous chunk downloads,
 /// leaving bandwidth headroom for high-priority interactive playback requests.
 pub static FAST_START_PREWARM_SEMAPHORE: LazyLock<tokio::sync::Semaphore> =
@@ -441,6 +466,11 @@ async fn refresh_cached_resume_and_head(
         head_bytes = entry.head_bytes.len(),
         "[FAST-START] Stream already cached; skipping prewarm"
     );
+
+    if let Some(db) = get_fast_start_db() {
+        spawn_probe_upgrade(db.clone(), item_id, original_url.to_string());
+    }
+
     true
 }
 
@@ -1065,6 +1095,10 @@ pub async fn prewarm_fast_start(
         "[FAST-START] Successfully pre-warmed stream into RAM"
     );
 
+    if let Some(db) = get_fast_start_db() {
+        spawn_probe_upgrade(db.clone(), item_id, original_url.to_string());
+    }
+
     true
 }
 
@@ -1110,6 +1144,19 @@ async fn ensure_local_probe_server() -> Option<u16> {
         .copied()
 }
 
+/// Returns the localhost probe URL (`http://127.0.0.1:{port}/fast-start-probe?url=...`) if the
+/// local probe server is listening.
+pub async fn format_local_probe_url(url: &str) -> Option<String> {
+    let port = ensure_local_probe_server().await?;
+    let encoded: String = url::form_urlencoded::byte_serialize(url.as_bytes()).collect();
+    info!(
+        %url,
+        local_port = port,
+        "[FAST-START] Routing ffprobe through local RAM buffer"
+    );
+    Some(format!("http://127.0.0.1:{port}/fast-start-probe?url={encoded}"))
+}
+
 /// Ensures the given HTTP URL is pre-warmed in `FAST_START_CACHE` and returns a localhost
 /// Fast-Start URL (`http://127.0.0.1:{port}/fast-start-probe?url=...`) so `ffprobe` can read
 /// the 16 MB head and 256 KB tail cues directly from RAM in ~15ms instead of making multiple
@@ -1124,16 +1171,112 @@ pub async fn resolve_fast_start_probe_url(url: &str) -> String {
     if !prewarm_fast_start(None, url, &HashMap::new(), PrewarmPriority::High, None, None).await {
         return url.to_string();
     }
-    let Some(port) = ensure_local_probe_server().await else {
-        return url.to_string();
+    format_local_probe_url(url).await.unwrap_or_else(|| url.to_string())
+}
+
+/// Spawns a background task to upgrade candidate probe data from RAM buffer if unprobed.
+pub fn spawn_probe_upgrade(
+    db: sqlx::SqlitePool,
+    item_id: Option<Uuid>,
+    original_url: String,
+) {
+    let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> = Box::pin(async move {
+        upgrade_probe_data_from_fast_start(&db, item_id, &original_url).await;
+    });
+    tokio::spawn(fut);
+}
+
+/// If a candidate stream in SQLite currently has missing or filename-guessed probe data,
+/// probes it via the localhost Fast-Start RAM buffer (~15ms) and updates SQLite with real track metadata.
+pub async fn upgrade_probe_data_from_fast_start(
+    db: &sqlx::SqlitePool,
+    item_id: Option<Uuid>,
+    original_url: &str,
+) {
+    if !UPGRADING_PROBES.insert(original_url.to_string()) {
+        return;
+    }
+    let _guard = ProbeUpgradeGuard(original_url.to_string());
+
+    // 1. Look up stream in DB
+    let stream_opt = if let Some(id) = item_id {
+        sqlx::query_as::<_, crate::db::Media>(
+            "SELECT * FROM media WHERE (parent_id = ?1 OR id = ?1) AND json_extract(stream_info, '$.descriptor.Http.url') = ?2 LIMIT 1",
+        )
+        .bind(id)
+        .bind(original_url)
+        .fetch_optional(db)
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
     };
-    let encoded: String = url::form_urlencoded::byte_serialize(url.as_bytes()).collect();
-    info!(
-        %url,
-        local_port = port,
-        "[FAST-START] Routing ffprobe through local RAM buffer"
-    );
-    format!("http://127.0.0.1:{port}/fast-start-probe?url={encoded}")
+
+    let stream = match stream_opt {
+        Some(s) => s,
+        None => {
+            match sqlx::query_as::<_, crate::db::Media>(
+                "SELECT * FROM media WHERE json_extract(stream_info, '$.descriptor.Http.url') = ?1 LIMIT 1",
+            )
+            .bind(original_url)
+            .fetch_optional(db)
+            .await
+            {
+                Ok(Some(s)) => s,
+                _ => return,
+            }
+        }
+    };
+
+    // 2. Check if stream already has reusable probe data
+    if let Some(cached) = &stream.probe_data {
+        if crate::playback::probe::is_reusable_probe_cache(cached) {
+            return;
+        }
+    }
+
+    // 3. Resolve localhost probe URL (which serves head from FAST_START_CACHE in RAM)
+    let Some(probe_url) = format_local_probe_url(original_url).await else {
+        return;
+    };
+    let stream_id = stream.id;
+
+    // 4. Run ffprobe against localhost in blocking thread pool with 3s timeout
+    let probe_res = tokio::task::spawn_blocking(move || {
+        crate::playback::probe::probe_media_with(
+            &probe_url,
+            None,
+            Some(Duration::from_millis(3000)),
+        )
+    })
+    .await;
+
+    match probe_res {
+        Ok(Ok((mut probed_info, _))) => {
+            probed_info.id = stream_id;
+            probed_info.e_tag = stream_id;
+            crate::playback::probe::apply_video_bitrate_fallback(
+                &mut probed_info.media_streams,
+                probed_info.bitrate,
+            );
+            if let Err(e) = crate::db::Media::save_probe_data(db, &stream_id, &probed_info).await {
+                warn!(%stream_id, error = %e, "[FAST-START] Failed to save upgraded probe data to DB");
+            } else {
+                info!(
+                    %stream_id,
+                    streams = probed_info.media_streams.len(),
+                    "[FAST-START] Asynchronously upgraded candidate probe data from RAM buffer"
+                );
+            }
+        }
+        Ok(Err(e)) => {
+            debug!(%stream_id, error = %e, "[FAST-START] Background RAM probe failed or incomplete");
+        }
+        Err(e) => {
+            debug!(%stream_id, error = %e, "[FAST-START] Background RAM probe task join error");
+        }
+    }
 }
 
 /// Returns true when the `/stream` request comes from a web browser HTML5 `<video>` element

@@ -565,7 +565,7 @@ fn chapters_to_segments(chapters: &[FfprobeChapter]) -> MediaSegments {
 
 /// When a single video stream has no per-stream bitrate but all audio streams do,
 /// estimate it as container total minus summed audio bitrates (mirrors Jellyfin).
-fn apply_video_bitrate_fallback(
+pub(crate) fn apply_video_bitrate_fallback(
     streams: &mut Vec<api::MediaStream>,
     total_bitrate: Option<i64>,
 ) {
@@ -1224,7 +1224,7 @@ pub(crate) fn is_reusable_probe_cache(cached: &api::MediaSourceInfo) -> bool {
     let Some(_video) = cached.video_stream() else {
         return false;
     };
-    if !SKIP_FFPROBE && cached.is_filename_guess() {
+    if cached.is_filename_guess() {
         return false;
     }
     // H.264 compatibility rules need RefFrames. RemuxDB or other imported
@@ -1546,6 +1546,47 @@ async fn check_liveness_with_fallback(
                 "liveness check failed (SKIP_FFPROBE=true), trying next candidate"
             );
             continue;
+        }
+
+        if let Some(cached) = &stream.probe_data {
+            if is_reusable_probe_cache(cached) {
+                let mut info = api::MediaSourceInfo::from(stream.clone());
+                apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+                info!(
+                    id = %stream.id,
+                    is_retry,
+                    attempt = attempts,
+                    "reusable probe cache hit for candidate confirmed alive"
+                );
+                return Ok((info, stream));
+            }
+        }
+
+        if crate::fast_start::is_fast_start_cached(&url) {
+            let probe_url = crate::fast_start::resolve_fast_start_probe_url(&url).await;
+            let probe_res = tokio::task::spawn_blocking(move || {
+                probe_media_with(
+                    &probe_url,
+                    None,
+                    Some(std::time::Duration::from_millis(2500)),
+                )
+            })
+            .await;
+
+            if let Ok(Ok((mut probed_info, _))) = probe_res {
+                probed_info.id = stream.id;
+                probed_info.e_tag = stream.id;
+                apply_video_bitrate_fallback(&mut probed_info.media_streams, probed_info.bitrate);
+                if let Err(e) = db::Media::save_probe_data(db, &stream.id, &probed_info).await {
+                    warn!(id = %stream.id, error = %e, "failed to persist fast-start RAM-probed data");
+                }
+                info!(
+                    id = %stream.id,
+                    streams = probed_info.media_streams.len(),
+                    "[FAST-START] Successfully probed stream from RAM buffer in <20ms"
+                );
+                return Ok((probed_info, stream));
+            }
         }
 
         let mut info = api::MediaSourceInfo::from(stream.clone());
@@ -2058,7 +2099,7 @@ mod probe_tests {
             }),
             ..Default::default()
         };
-        assert_eq!(is_reusable_probe_cache(&guess), SKIP_FFPROBE);
+        assert!(!is_reusable_probe_cache(&guess));
     }
 
     #[test]

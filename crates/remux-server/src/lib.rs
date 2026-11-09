@@ -294,6 +294,8 @@ pub async fn init_app(
     )
     .await?;
 
+    crate::fast_start::set_fast_start_db(conn.clone());
+
     info!("Running database migrations. Do not interrupt!");
     db::migrate(&conn).await?;
     info!("migrations complete");
