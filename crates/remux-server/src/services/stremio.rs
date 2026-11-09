@@ -26,6 +26,15 @@ fn is_404(e: &ClientError) -> bool {
     )
 }
 
+fn is_rate_limit(e: &ClientError) -> bool {
+    matches!(
+        e,
+        ClientError::RateLimited { .. }
+            | ClientError::Http { status: 429, .. }
+            | ClientError::Json { status: 429, .. }
+    )
+}
+
 #[derive(Clone)]
 pub struct StremioService {
     pub client: sdks::RestClient,
@@ -252,34 +261,69 @@ impl StremioService {
                 let extra_query = extra_query.clone();
                 async move {
                     let skip = page * page_size;
+                    // Inter-page pacing delay to avoid bursting the upstream addon
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+
+                    let mut retries = 0u32;
                     let mut raw_response = None;
-                    let result = client
-                        .execute_observed(
-                            WithExtraQuery {
-                                endpoint: sdks::stremio::CatalogEndpoint {
-                                    kind: kind.clone(),
-                                    id: id.clone(),
-                                    search: None,
-                                    genre: None,
-                                    skip: Some(skip),
+                    let result = loop {
+                        let mut page_raw_response = None;
+                        let res = client
+                            .execute_observed(
+                                WithExtraQuery {
+                                    endpoint: sdks::stremio::CatalogEndpoint {
+                                        kind: kind.clone(),
+                                        id: id.clone(),
+                                        search: None,
+                                        genre: None,
+                                        skip: Some(skip),
+                                    },
+                                    extra: extra_query.clone(),
                                 },
-                                extra: extra_query,
-                            },
-                            |status, body| {
-                                // Bounded: this fires for every page regardless of
-                                // outcome, including large successful pages whose
-                                // body is never read below — and an addon's raw
-                                // response is untrusted, unbounded-size input that
-                                // must not be logged in full (see the `Secret`
-                                // wrapper `ClientError` itself uses for bodies).
-                                let snippet: String = body
-                                    .chars()
-                                    .take(300)
-                                    .collect();
-                                raw_response = Some((status, snippet))
-                            },
-                        )
-                        .await;
+                                |status, body| {
+                                    // Bounded: this fires for every page regardless of
+                                    // outcome, including large successful pages whose
+                                    // body is never read below — and an addon's raw
+                                    // response is untrusted, unbounded-size input that
+                                    // must not be logged in full (see the `Secret`
+                                    // wrapper `ClientError` itself uses for bodies).
+                                    let snippet: String = body
+                                        .chars()
+                                        .take(300)
+                                        .collect();
+                                    page_raw_response = Some((status, snippet))
+                                },
+                            )
+                            .await;
+
+                        raw_response = page_raw_response;
+
+                        if let Err(ref error) = res
+                            && is_rate_limit(error)
+                            && retries < 3
+                        {
+                            retries += 1;
+                            let delay_secs = match error {
+                                ClientError::RateLimited { retry_after_secs } => {
+                                    (*retry_after_secs).max(1).min(10)
+                                }
+                                _ => 1u64 << (retries - 1),
+                            };
+                            tracing::warn!(
+                                kind = %kind,
+                                id = %id,
+                                page,
+                                skip,
+                                retries,
+                                delay_secs,
+                                "catalog page rate limited (429); backing off before retry"
+                            );
+                            tokio::time::sleep(Duration::from_secs(delay_secs)).await;
+                            continue;
+                        }
+
+                        break res;
+                    };
                     match &result {
                         Ok(response) => tracing::debug!(
                             kind = %kind,
@@ -512,5 +556,40 @@ mod tests {
 
         assert_eq!(names, vec!["a".to_string(), "b".to_string()]);
         assert!(!completeness.is_complete());
+    }
+
+    /// A 429 rate limit is retried with backoff and succeeds if a subsequent attempt succeeds.
+    #[tokio::test]
+    async fn get_catalog_stream_retries_on_429_and_succeeds() {
+        let server = httpmock::MockServer::start();
+        mock_page(&server, "/catalog/movie/test.json", &["a", "b"]);
+
+        // First attempt on skip=2 returns 429
+        let mut mock_429 = server.mock(|when, then| {
+            when.path("/catalog/movie/test/skip=2.json");
+            then.status(429)
+                .header("retry-after", "1")
+                .body("rate limited");
+        });
+
+        // We run in a task so we can drop the 429 mock after it is called once
+        let svc = StremioService::from_url(&server.base_url()).unwrap();
+        let handle = tokio::spawn(async move {
+            collect_catalog(&svc).await
+        });
+
+        // Wait until the 429 is hit, then delete the 429 mock and mock a successful page + 404 end
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        mock_429.delete();
+
+        mock_page(&server, "/catalog/movie/test/skip=2.json", &["c", "d"]);
+        server.mock(|when, then| {
+            when.path("/catalog/movie/test/skip=4.json");
+            then.status(404);
+        });
+
+        let (names, completeness) = handle.await.unwrap();
+        assert_eq!(names, vec!["a", "b", "c", "d"]);
+        assert!(completeness.is_complete());
     }
 }

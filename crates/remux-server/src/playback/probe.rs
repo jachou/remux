@@ -1492,8 +1492,8 @@ async fn check_liveness_with_fallback(
             continue;
         }
         attempts += 1;
-        // For Candidate #1 (when not a retry), initiate fast-start pre-warm if not already running so liveness and head buffering coalesce in one upstream request!
-        if !is_retry {
+        // For Candidate #1 or fallback Candidate #2 (attempts <= 2), initiate fast-start pre-warm if not already running so liveness and head buffering coalesce in one upstream request!
+        if attempts <= 2 {
             if let Some(crate::stream::StreamDescriptor::Http { url, request_headers, .. }) = stream.stream_info.as_ref().map(|si| &si.descriptor) {
                 if !crate::stream::STREAM_LIVENESS_CACHE.contains_key(url) && crate::fast_start::get_active_prewarm_notify(url).is_none() {
                     let url_c = url.clone();

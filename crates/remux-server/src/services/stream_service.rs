@@ -990,6 +990,7 @@ impl StreamService {
             sel.candidates
                 .len(),
         );
+        let mut cached_external_subtitles: Option<Vec<crate::addons::SubtitleInfo>> = None;
         for stream in sel
             .candidates
             .into_iter()
@@ -1046,16 +1047,26 @@ impl StreamService {
                 }
             };
             let mut external_subtitles = match subtitle_fetches.remove(&stream.id) {
-                Some(fetch) => fetch
-                    .await
+                Some(fetch) => {
+                    let subs = fetch
+                        .await
+                        .unwrap_or_default();
+                    if cached_external_subtitles.is_none() {
+                        cached_external_subtitles = Some(subs.clone());
+                    }
+                    subs
+                }
+                None => cached_external_subtitles
+                    .as_ref()
+                    .cloned()
                     .unwrap_or_default(),
-                None => Vec::new(),
             };
 
             // Smart check:
             // 1. If external subtitles were NOT fetched, and the probed source turns out
             //    to have NO matching embedded subtitles, fetch on demand!
             if external_subtitles.is_empty()
+                && cached_external_subtitles.is_none()
                 && !has_matching_embedded_subtitles(&source, &sub_langs)
             {
                 if let Some(mut media) = item
@@ -1066,7 +1077,7 @@ impl StreamService {
                         id = %stream.id,
                         "Probed stream has no matching embedded subtitles; fetching external subtitles on demand"
                     );
-                    external_subtitles = Self::subtitles_for_stream(
+                    let subs = Self::subtitles_for_stream(
                         &self.ctx,
                         &mut media,
                         &effective_stream,
@@ -1074,6 +1085,10 @@ impl StreamService {
                         self.user_id,
                     )
                     .await;
+                    cached_external_subtitles = Some(subs.clone());
+                    external_subtitles = subs;
+                } else {
+                    cached_external_subtitles = Some(Vec::new());
                 }
             } else if !external_subtitles.is_empty()
                 && has_matching_embedded_subtitles(&source, &sub_langs)

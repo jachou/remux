@@ -688,19 +688,49 @@ pub async fn prewarm_fast_start(
 
     // Step 1: Request the first N MB (32 MB for standard / 4K)
     let head_range = format!("bytes=0-{}", target_head_size - 1);
-    let mut head_req = PREWARM_CLIENT.get(original_url);
-    for (k, v) in request_headers {
-        head_req = head_req.header(k.as_str(), v.as_str());
-    }
-    head_req = head_req.header(header::RANGE, head_range);
+    let build_head_req = || {
+        let mut req = PREWARM_CLIENT.get(original_url);
+        for (k, v) in request_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req.header(header::RANGE, head_range.clone())
+    };
 
     let prewarm_timeout_secs = std::env::var("REMUX_LIVENESS_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(12);
-    let head_resp = match tokio::time::timeout(Duration::from_secs(prewarm_timeout_secs), head_req.send()).await {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => {
+    let mut head_resp_result = match tokio::time::timeout(Duration::from_secs(prewarm_timeout_secs), build_head_req().send()).await {
+        Ok(res) => res,
+        Err(_) => {
+            METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
+            warn!(%original_url, timeout_secs = prewarm_timeout_secs, "[FAST-START] Pre-warm head request timed out");
+            crate::stream::record_upstream_timeout("fast-start head request timed out");
+            crate::stream::STREAM_LIVENESS_CACHE.insert(
+                original_url.to_string(),
+                crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+            );
+            notify.notify_waiters();
+            return false;
+        }
+    };
+
+    // Retry once on ephemeral 502 Bad Gateway or transient connection error
+    let should_retry = match &head_resp_result {
+        Ok(resp) => resp.status() == StatusCode::BAD_GATEWAY,
+        Err(e) => !e.is_timeout(),
+    };
+    if should_retry {
+        warn!(%original_url, "[FAST-START] Pre-warm head request encountered 502/network glitch; retrying once after 500ms");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        if let Ok(res) = tokio::time::timeout(Duration::from_secs(prewarm_timeout_secs), build_head_req().send()).await {
+            head_resp_result = res;
+        }
+    }
+
+    let head_resp = match head_resp_result {
+        Ok(r) => r,
+        Err(e) => {
             METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
             warn!(%original_url, error = %e, "[FAST-START] Pre-warm head request failed");
             if e.is_timeout() {
@@ -718,17 +748,6 @@ pub async fn prewarm_fast_start(
             notify.notify_waiters();
             return false;
         }
-        Err(_) => {
-            METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
-            warn!(%original_url, timeout_secs = prewarm_timeout_secs, "[FAST-START] Pre-warm head request timed out");
-            crate::stream::record_upstream_timeout("fast-start head request timed out");
-            crate::stream::STREAM_LIVENESS_CACHE.insert(
-                original_url.to_string(),
-                crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
-            );
-            notify.notify_waiters();
-            return false;
-        }
     };
 
     let status = head_resp.status();
@@ -738,6 +757,7 @@ pub async fn prewarm_fast_start(
     if status == StatusCode::TOO_MANY_REQUESTS
         || status == StatusCode::GATEWAY_TIMEOUT
         || status == StatusCode::SERVICE_UNAVAILABLE
+        || status == StatusCode::BAD_GATEWAY
     {
         let retry_after = head_resp
             .headers()

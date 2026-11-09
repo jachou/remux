@@ -479,16 +479,24 @@ impl StreamDescriptor {
         }
 
         let start = std::time::Instant::now();
-        let mut request = AVAILABILITY_CLIENT.get(url);
-        for (key, value) in request_headers {
-            request = request.header(key.as_str(), value.as_str());
-        }
-        request = request.header(http::header::RANGE, "bytes=0-7");
+        let build_request = || {
+            let mut request = AVAILABILITY_CLIENT.get(url);
+            for (key, value) in request_headers {
+                request = request.header(key.as_str(), value.as_str());
+            }
+            request.header(http::header::RANGE, "bytes=0-7")
+        };
 
-        match request
-            .send()
-            .await
-        {
+        let mut send_result = build_request().send().await;
+        if let Ok(ref r) = send_result {
+            if r.status() == http::StatusCode::BAD_GATEWAY {
+                tracing::warn!(%url, "liveness check returned 502 Bad Gateway; retrying once after 500ms");
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                send_result = build_request().send().await;
+            }
+        }
+
+        match send_result {
             Ok(mut r) => {
                 let status = r.status();
                 let is_ok = status.as_u16() < 400;
@@ -591,7 +599,9 @@ impl StreamDescriptor {
                 } else {
                     tracing::warn!(%url, ?status, ?elapsed, "liveness check failed with http status");
                     let is_rate_or_gw = status == http::StatusCode::TOO_MANY_REQUESTS
-                        || status == http::StatusCode::GATEWAY_TIMEOUT;
+                        || status == http::StatusCode::GATEWAY_TIMEOUT
+                        || status == http::StatusCode::BAD_GATEWAY
+                        || status == http::StatusCode::SERVICE_UNAVAILABLE;
                     if is_rate_or_gw {
                         let retry_after = r.headers()
                             .get(http::header::RETRY_AFTER)
