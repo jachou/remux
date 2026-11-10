@@ -104,36 +104,41 @@ static TMDB_FAILED_SERIES: std::sync::LazyLock<moka::sync::Cache<String, ()>> =
             .build()
     });
 
-fn tmdb_series_key(media: &db::Media) -> Option<String> {
-    if let Some(id) = media.external_ids.tmdb {
-        return Some(format!("tmdb:{id}"));
+fn tmdb_series_lookup_id(media: &db::Media) -> Option<String> {
+    if !matches!(
+        media.kind,
+        db::MediaKind::Series | db::MediaKind::Season | db::MediaKind::Episode
+    ) {
+        return None;
     }
-    if let Some(ref gp) = media.grandparent {
-        if let Some(id) = gp.external_ids.tmdb {
-            return Some(format!("tmdb:{id}"));
-        }
-        return Some(format!("gp:{}", gp.id));
-    }
-    if let Some(ref p) = media.parent {
-        if let Some(id) = p.external_ids.tmdb {
-            return Some(format!("tmdb:{id}"));
-        }
-        return Some(format!("p:{}", p.id));
-    }
-    if let Some(pid) = media.parent_id {
-        return Some(format!("pid:{pid}"));
-    }
-    Some(format!("id:{}", media.id))
+    media
+        .grandparent
+        .as_deref()
+        .and_then(|gp| gp.external_ids.stremio_lookup_id())
+        .or_else(|| {
+            if media.kind == db::MediaKind::Series {
+                media.external_ids.stremio_lookup_id()
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            media
+                .grandparent
+                .as_deref()
+                .map(|gp| format!("series:{}", gp.id))
+        })
+        .or_else(|| match media.kind {
+            db::MediaKind::Series => Some(format!("series:{}", media.id)),
+            db::MediaKind::Season => media.parent_id.map(|pid| format!("series:{pid}")),
+            db::MediaKind::Episode => media.grandparent_id.map(|gpid| format!("series:{gpid}")),
+            _ => None,
+        })
 }
 
 #[async_trait]
 impl MetaAddon for TmdbAddon {
     async fn supports(&self, media: &db::Media) -> bool {
-        if let Some(key) = tmdb_series_key(media) {
-            if TMDB_FAILED_SERIES.contains_key(&key) {
-                return false;
-            }
-        }
         matches!(
             media.kind,
             db::MediaKind::Movie
@@ -145,10 +150,14 @@ impl MetaAddon for TmdbAddon {
     }
 
     fn on_meta_fetch_timeout(&self, media: &db::Media) {
-        if let Some(key) = tmdb_series_key(media) {
-            warn!(%key, "TMDB meta fetch timed out; blacklisting series for remainder of run");
+        if let Some(key) = tmdb_series_lookup_id(media) {
+            warn!(%key, "TMDB meta fetch timed out; blacklisting series for remainder of refresh");
             TMDB_FAILED_SERIES.insert(key, ());
         }
+    }
+
+    fn on_series_done(&self, meta_id: &str) {
+        TMDB_FAILED_SERIES.invalidate(meta_id);
     }
 
     async fn meta_fetch(
@@ -157,6 +166,13 @@ impl MetaAddon for TmdbAddon {
         ctx: &AppContext,
         config: &crate::api::ServerConfiguration,
     ) -> Result<Option<db::Media>> {
+        if let Some(key) = tmdb_series_lookup_id(media) {
+            if TMDB_FAILED_SERIES.contains_key(&key) {
+                return Err(anyhow::anyhow!(
+                    "skipping {key}: TMDB meta fetch already timed out earlier in this refresh"
+                ));
+            }
+        }
         match fetch_tmdb_meta(media, ctx, config).await {
             Err(e) if is_404(&e) => {
                 fetch_tmdb_meta_by_other_ids(media, ctx, config).await

@@ -139,24 +139,34 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
             || status == http::StatusCode::SERVICE_UNAVAILABLE
             || status == http::StatusCode::GATEWAY_TIMEOUT;
 
-        if !is_rate_limit && !is_transient_5xx {
+        if is_transient_5xx {
+            if let Some(limit) = &self.shared_rate_limit {
+                let parsed = retry_after(response.headers(), SystemTime::now(), Duration::ZERO);
+                let delay = if parsed.is_zero() {
+                    Duration::from_secs(2)
+                } else {
+                    parsed
+                };
+                tracing::warn!(
+                    url = %response.url(),
+                    %status,
+                    backoff_secs = delay.as_secs(),
+                    "upstream returned transient server error; setting shared cooldown for subsequent requests"
+                );
+                limit.block_for(delay).await;
+            }
             return Ok(response);
         }
 
-        let delay = if is_rate_limit {
-            retry_after(
-                response.headers(),
-                SystemTime::now(),
-                self.default_retry_after,
-            )
-        } else {
-            let parsed = retry_after(response.headers(), SystemTime::now(), Duration::ZERO);
-            if parsed.is_zero() {
-                Duration::from_secs(5)
-            } else {
-                parsed
-            }
-        };
+        if !is_rate_limit {
+            return Ok(response);
+        }
+
+        let delay = retry_after(
+            response.headers(),
+            SystemTime::now(),
+            self.default_retry_after,
+        );
 
         if delay.is_zero() {
             return Ok(response);
@@ -166,7 +176,7 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
             %status,
             backoff_secs = delay.as_secs(),
             shared = self.shared_rate_limit.is_some(),
-            "upstream returned rate limit or server error; backing off shared rate limit"
+            "upstream returned rate limit; backing off"
         );
         if let Some(limit) = &self.shared_rate_limit {
             limit

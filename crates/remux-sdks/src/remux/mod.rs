@@ -3191,8 +3191,6 @@ impl MediaSourceInfo {
         {
             if let Some(s) = self.default_audio_stream() {
                 self.default_audio_stream_index = Some(s.index);
-            } else if let Some(first_audio) = self.media_streams.iter().find(|s| s.type_ == Some(MediaStreamType::Audio)) {
-                self.default_audio_stream_index = Some(first_audio.index);
             }
         }
         // A subtitle choice already made, "off" included, is not second-guessed.

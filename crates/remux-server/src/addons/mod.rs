@@ -2917,18 +2917,18 @@ impl AddonService {
     }
 
     fn notify_series_done(&self, media: &db::Media) {
-        if let Some(meta_id) = media
-            .external_ids
-            .stremio_lookup_id()
+        let fallback_key = format!("series:{}", media.id);
+        let lookup_key = media.external_ids.stremio_lookup_id();
+        for r in self
+            .inner
+            .load()
+            .iter()
         {
-            for r in self
-                .inner
-                .load()
-                .iter()
-            {
-                if let Some(ref meta_addon) = r.meta {
-                    meta_addon.on_series_done(&meta_id);
+            if let Some(ref meta_addon) = r.meta {
+                if let Some(ref meta_id) = lookup_key {
+                    meta_addon.on_series_done(meta_id);
                 }
+                meta_addon.on_series_done(&fallback_key);
             }
         }
     }

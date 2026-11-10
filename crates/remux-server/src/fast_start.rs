@@ -248,21 +248,70 @@ static QUEUED_PREWARMS: LazyLock<dashmap::DashSet<String>> =
 static PREWARM_LOCKS: LazyLock<crate::keyed_lock::KeyedLock<String>> =
     LazyLock::new(crate::keyed_lock::KeyedLock::new);
 
+/// Entry tracking an active fast-start pre-warm notification handle and its active reference count.
+pub struct PrewarmNotifyEntry {
+    pub notify: Arc<tokio::sync::Notify>,
+    pub refs: std::sync::atomic::AtomicUsize,
+}
+
+/// RAII guard that keeps an `ACTIVE_PREWARM_NOTIFY` entry registered until all pre-warm handles for a URL finish.
+pub struct ActivePrewarmNotifyGuard {
+    url: String,
+    entry: Option<Arc<PrewarmNotifyEntry>>,
+}
+
+impl ActivePrewarmNotifyGuard {
+    pub fn notify_waiters(&self) {
+        if let Some(entry) = &self.entry {
+            entry.notify.notify_waiters();
+        }
+    }
+}
+
+impl Drop for ActivePrewarmNotifyGuard {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            if entry.refs.fetch_sub(1, Ordering::SeqCst) == 1 {
+                ACTIVE_PREWARM_NOTIFY
+                    .remove_if(&self.url, |_, current| Arc::ptr_eq(current, &entry));
+                entry.notify.notify_waiters();
+            }
+        }
+    }
+}
+
 /// Tracks URLs actively executing an initial pre-warm head request so concurrent liveness checks can coalesce.
-pub static ACTIVE_PREWARM_NOTIFY: LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Notify>>> =
+pub static ACTIVE_PREWARM_NOTIFY: LazyLock<dashmap::DashMap<String, Arc<PrewarmNotifyEntry>>> =
     LazyLock::new(dashmap::DashMap::new);
 
-/// Synchronously registers or retrieves the `Notify` handle for an initial pre-warm on `url`.
-pub fn register_active_prewarm_notify(url: &str) -> Arc<tokio::sync::Notify> {
-    ACTIVE_PREWARM_NOTIFY
+/// Synchronously registers an active pre-warm notification guard for `url`.
+/// When the last `ActivePrewarmNotifyGuard` for `url` drops, the entry is removed and waiters are woken.
+pub fn register_active_prewarm_notify(url: &str) -> ActivePrewarmNotifyGuard {
+    if is_fast_start_cached(url) {
+        return ActivePrewarmNotifyGuard {
+            url: url.to_string(),
+            entry: None,
+        };
+    }
+    let entry = ACTIVE_PREWARM_NOTIFY
         .entry(url.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
-        .clone()
+        .or_insert_with(|| {
+            Arc::new(PrewarmNotifyEntry {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                refs: std::sync::atomic::AtomicUsize::new(0),
+            })
+        })
+        .clone();
+    entry.refs.fetch_add(1, Ordering::SeqCst);
+    ActivePrewarmNotifyGuard {
+        url: url.to_string(),
+        entry: Some(entry),
+    }
 }
 
 /// Returns the `Notify` handle if a fast-start pre-warm is actively running for `url`.
 pub fn get_active_prewarm_notify(url: &str) -> Option<Arc<tokio::sync::Notify>> {
-    ACTIVE_PREWARM_NOTIFY.get(url).map(|n| n.value().clone())
+    ACTIVE_PREWARM_NOTIFY.get(url).map(|n| n.value().notify.clone())
 }
 
 /// Returns whether the given URL currently has a pre-warmed entry in `FAST_START_CACHE` with valid head bytes.
@@ -697,15 +746,7 @@ pub async fn prewarm_fast_start(
         .await;
     }
 
-    let notify = register_active_prewarm_notify(original_url);
-    struct NotifyGuard<'a>(&'a str, Arc<tokio::sync::Notify>);
-    impl<'a> Drop for NotifyGuard<'a> {
-        fn drop(&mut self) {
-            ACTIVE_PREWARM_NOTIFY.remove(self.0);
-            self.1.notify_waiters();
-        }
-    }
-    let _notify_guard = NotifyGuard(original_url, notify.clone());
+    let notify_guard = register_active_prewarm_notify(original_url);
 
     METRICS.prewarms_started.fetch_add(1, Ordering::Relaxed);
     match priority {
@@ -755,7 +796,7 @@ pub async fn prewarm_fast_start(
                 original_url.to_string(),
                 crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
             );
-            notify.notify_waiters();
+            notify_guard.notify_waiters();
             return false;
         }
     };
@@ -790,7 +831,7 @@ pub async fn prewarm_fast_start(
                     crate::stream::LivenessEntry::new(false),
                 );
             }
-            notify.notify_waiters();
+            notify_guard.notify_waiters();
             return false;
         }
     };
@@ -815,7 +856,7 @@ pub async fn prewarm_fast_start(
             original_url.to_string(),
             crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
         );
-        notify.notify_waiters();
+        notify_guard.notify_waiters();
         return false;
     }
 
@@ -826,7 +867,7 @@ pub async fn prewarm_fast_start(
             original_url.to_string(),
             crate::stream::LivenessEntry::new(false),
         );
-        notify.notify_waiters();
+        notify_guard.notify_waiters();
         return false;
     }
 
@@ -868,7 +909,7 @@ pub async fn prewarm_fast_start(
             crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
         );
         crate::fast_start::FAST_START_CACHE.invalidate(original_url);
-        notify.notify_waiters();
+        notify_guard.notify_waiters();
         return false;
     }
 
@@ -879,7 +920,7 @@ pub async fn prewarm_fast_start(
         original_url.to_string(),
         crate::stream::LivenessEntry::new(true),
     );
-    notify.notify_waiters();
+    notify_guard.notify_waiters();
 
     // Safety guard against OOM: if upstream returned 200 OK (ignored Range), only allow if file is small (<= target_head_size + 1024)
     if is_ok && total_size > (target_head_size + 1024) as u64 {
@@ -2604,6 +2645,9 @@ mod tests {
 
     #[tokio::test]
     async fn high_priority_prewarm_overtakes_queued_low_priority_on_same_url() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+
         // Exhaust all 2 permits of the background semaphore
         let p1 = FAST_START_PREWARM_SEMAPHORE.acquire().await.unwrap();
         let p2 = FAST_START_PREWARM_SEMAPHORE.acquire().await.unwrap();
@@ -2878,5 +2922,32 @@ mod tests {
         );
 
         IN_FLIGHT_PREWARMS.remove(test_url);
+    }
+
+    #[tokio::test]
+    async fn active_prewarm_notify_guard_cleans_up_on_early_return() {
+        let _lock = TEST_LOCK.lock().await;
+        let test_url = "http://127.0.0.1:9999/early-return-notify-test.mkv";
+        FAST_START_CACHE.invalidate(test_url);
+
+        {
+            let _guard = register_active_prewarm_notify(test_url);
+            assert!(
+                get_active_prewarm_notify(test_url).is_some(),
+                "notify should be registered while guard is alive"
+            );
+            // Simulate nested registration inside prewarm_fast_start
+            {
+                let _inner_guard = register_active_prewarm_notify(test_url);
+                assert!(get_active_prewarm_notify(test_url).is_some());
+            }
+            // Outer guard still alive
+            assert!(get_active_prewarm_notify(test_url).is_some());
+        }
+        // Both guards dropped — entry must be removed from ACTIVE_PREWARM_NOTIFY
+        assert!(
+            get_active_prewarm_notify(test_url).is_none(),
+            "notify entry must be removed after all guards drop"
+        );
     }
 }

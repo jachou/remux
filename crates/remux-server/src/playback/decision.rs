@@ -478,6 +478,13 @@ fn build_video_transcode(
     let audio_idx = q
         .audio_stream_index
         .or(source.default_audio_stream_index)
+        .or_else(|| {
+            source
+                .media_streams
+                .iter()
+                .find(|s| s.type_ == Some(api::MediaStreamType::Audio))
+                .map(|s| s.index)
+        })
         .map(|i| format!("&AudioStreamIndex={i}"))
         .unwrap_or_default();
     let sub_idx = effective_sub_idx

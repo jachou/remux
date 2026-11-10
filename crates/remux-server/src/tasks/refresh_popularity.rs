@@ -59,9 +59,7 @@ where
     let mut rejected = 0_usize;
     let mut pending = items;
     let mut delays = delays.iter();
-    let mut round = 0_usize;
     loop {
-        round += 1;
         let results: Vec<_> = stream::iter(pending)
             .map(|item| {
                 let lookup = &lookup;
@@ -89,15 +87,10 @@ where
             return (found, missing, 0);
         }
         let widespread = pending.len() as f64 > page_len as f64 * BACKOFF_FAILURE_SHARE;
-        let delay_candidate = delays.next();
-        let delay = if widespread {
-            delay_candidate.filter(|delay| **delay <= *wait_budget)
-        } else if round < 3 {
-            static SPARSE_DELAY: Duration = Duration::from_millis(500);
-            Some(&SPARSE_DELAY)
-        } else {
-            None
-        };
+        let delay = delays
+            .next()
+            .filter(|_| widespread)
+            .filter(|delay| **delay <= *wait_budget);
         let Some(delay) = delay else {
             if rejected > 0 {
                 warn!(
@@ -229,13 +222,22 @@ impl Task for RefreshPopularityTask {
                         .external_ids
                         .imdb
                         .clone();
+                    let media_id = media.id;
                     async move {
                         match imdb_id {
                             Some(imdb_id) => {
-                                remux_sdks::remuxdb::lookup_media_metrics(
+                                let res = remux_sdks::remuxdb::lookup_media_metrics(
                                     &base_url, &client_id, &imdb_id,
                                 )
-                                .await
+                                .await;
+                                if matches!(res, MetricsLookup::Unavailable) {
+                                    tracing::debug!(
+                                        %media_id,
+                                        %imdb_id,
+                                        "RemuxDB metrics lookup unavailable for item"
+                                    );
+                                }
+                                res
                             }
                             None => MetricsLookup::NotFound,
                         }
