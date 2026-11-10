@@ -655,8 +655,14 @@ impl StreamDescriptor {
 
         // Check if an initial fast-start pre-warm is already running for this URL to coalesce liveness
         if let Some(notify) = crate::fast_start::get_active_prewarm_notify(url) {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            if let Some(entry) = STREAM_LIVENESS_CACHE.get(url) {
+                tracing::info!(%url, alive = entry.alive, "liveness check cache hit");
+                return entry.alive;
+            }
             tracing::info!(%url, "[FAST-START] Coalescing liveness check with active pre-warm");
-            let _ = tokio::time::timeout(std::time::Duration::from_millis(4000), notify.notified()).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(4000), &mut notified).await;
             if let Some(entry) = STREAM_LIVENESS_CACHE.get(url) {
                 tracing::info!(%url, alive = entry.alive, "[FAST-START] Liveness confirmed via coalesced pre-warm");
                 return entry.alive;

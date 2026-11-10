@@ -11,7 +11,7 @@ use std::{
 };
 use tokio::{sync::Mutex as AsyncMutex, task::JoinHandle};
 use tokio_cron_scheduler::{Job, JobScheduler, job::JobId};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{AppContext, db, ws};
 use remux_sdks::remux::TaskTriggerInfoType;
@@ -176,6 +176,7 @@ impl TaskHandler {
 
     pub fn run(&mut self, ctx: AppContext, task_service: Arc<TaskService>) {
         if self.is_running() {
+            warn!(task = %self.task.key(), "task trigger skipped: previous run is still in progress");
             return;
         }
 
@@ -198,13 +199,28 @@ impl TaskHandler {
         );
 
         let handle = tokio::spawn(async move {
+            use futures::FutureExt;
             let start_at = Utc::now().naive_utc();
             let instant = Instant::now();
             info!(task = %task.name(), "starting");
 
-            let result = task
-                .run(ctx.clone(), task_service, progress)
+            let result = std::panic::AssertUnwindSafe(task.run(ctx.clone(), task_service, progress))
+                .catch_unwind()
                 .await;
+            let result = match result {
+                Ok(r) => r,
+                Err(panic_err) => {
+                    let msg = if let Some(s) = panic_err.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_err.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic payload".to_string()
+                    };
+                    error!(task = %task_key, panic = %msg, "task panicked during execution");
+                    Err(anyhow::anyhow!("task panicked: {msg}"))
+                }
+            };
             let elapsed = instant.elapsed();
 
             // Flush WAL after every task so write bursts don't accumulate into

@@ -369,6 +369,33 @@ pub async fn report_playback_progress(
                     )
                 }));
         }
+    } else if !data
+        .item_id
+        .is_nil()
+    {
+        // Sessionless progress update (e.g. Infuse omitting PlaySessionId or after session eviction).
+        // Update user playback state directly so resume position is not lost.
+        if let Some(position_ticks) = data.position_ticks {
+            if let Ok(Some(media)) = db::Media::get_by_id(&state.ctx.db, &data.item_id).await {
+                let _ = db::UserMediaState::update_playback(
+                    &state.ctx.db,
+                    &session.user,
+                    &media,
+                    position_ticks,
+                    data.audio_stream_index.map(|x| x as i64),
+                    data.subtitle_stream_index.map(|x| x as i64),
+                    None,
+                )
+                .await;
+            }
+        }
+    } else {
+        tracing::debug!(
+            device_id = %session.device.id,
+            item_id = %data.item_id,
+            psid = ?data.play_session_id,
+            "ignoring playback progress: no active session found"
+        );
     }
     Ok(StatusCode::NO_CONTENT.into_response())
 }

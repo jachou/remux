@@ -214,17 +214,25 @@ impl FastStartMetrics {
 
 pub static METRICS: FastStartMetrics = FastStartMetrics::new();
 
+/// Maximum aggregate RAM held in the fast-start buffer cache (2 GB limit).
+pub const FAST_START_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Fast-start buffer cache, keyed by upstream stream URL.
 ///
-/// Bounded strictly by `FAST_START_MAX_ITEMS` (50 items) via LRU capacity.
-/// Buffer retention is bound to HTTP liveness rather than a rigid 1-hour timer:
-/// raw format bitstream bytes in RAM are immutable and valid indefinitely,
-/// while the CDN redirect target URL is refreshed on-the-fly by liveness checks
-/// and dead streams are evicted immediately.
+/// Bounded strictly to 2 GB aggregate RAM via LRU weigher policy, with a 30m idle / 1h TTL expiration.
 pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStartEntry>> =
     LazyLock::new(|| {
         moka::sync::Cache::builder()
-            .max_capacity(FAST_START_MAX_ITEMS as u64)
+            .max_capacity(FAST_START_MAX_BYTES)
+            .weigher(|_k, v: &FastStartEntry| {
+                let bytes = v.head_bytes.len()
+                    + v.tail_bytes.as_ref().map_or(0, |b| b.len())
+                    + v.resume_buffer.as_ref().map_or(0, |(_, b)| b.len())
+                    + 1024;
+                bytes.min(u32::MAX as usize) as u32
+            })
+            .time_to_idle(Duration::from_secs(1800))
+            .time_to_live(FAST_START_TTL)
             .build()
     });
 
@@ -243,6 +251,14 @@ static PREWARM_LOCKS: LazyLock<crate::keyed_lock::KeyedLock<String>> =
 /// Tracks URLs actively executing an initial pre-warm head request so concurrent liveness checks can coalesce.
 pub static ACTIVE_PREWARM_NOTIFY: LazyLock<dashmap::DashMap<String, Arc<tokio::sync::Notify>>> =
     LazyLock::new(dashmap::DashMap::new);
+
+/// Synchronously registers or retrieves the `Notify` handle for an initial pre-warm on `url`.
+pub fn register_active_prewarm_notify(url: &str) -> Arc<tokio::sync::Notify> {
+    ACTIVE_PREWARM_NOTIFY
+        .entry(url.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+        .clone()
+}
 
 /// Returns the `Notify` handle if a fast-start pre-warm is actively running for `url`.
 pub fn get_active_prewarm_notify(url: &str) -> Option<Arc<tokio::sync::Notify>> {
@@ -681,8 +697,7 @@ pub async fn prewarm_fast_start(
         .await;
     }
 
-    let notify = Arc::new(tokio::sync::Notify::new());
-    ACTIVE_PREWARM_NOTIFY.insert(original_url.to_string(), notify.clone());
+    let notify = register_active_prewarm_notify(original_url);
     struct NotifyGuard<'a>(&'a str, Arc<tokio::sync::Notify>);
     impl<'a> Drop for NotifyGuard<'a> {
         fn drop(&mut self) {
@@ -1135,7 +1150,9 @@ async fn ensure_local_probe_server() -> Option<u16> {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let port = listener.local_addr()?.port();
             tokio::spawn(async move {
-                let _ = axum::serve(listener, app).await;
+                if let Err(e) = axum::serve(listener, app).await {
+                    tracing::error!(error = %e, "[FAST-START] Local RAM probe HTTP server terminated unexpectedly");
+                }
             });
             Ok::<u16, std::io::Error>(port)
         })
@@ -1271,10 +1288,10 @@ pub async fn upgrade_probe_data_from_fast_start(
             }
         }
         Ok(Err(e)) => {
-            debug!(%stream_id, error = %e, "[FAST-START] Background RAM probe failed or incomplete");
+            warn!(%stream_id, error = %e, "[FAST-START] Background RAM probe failed or incomplete");
         }
         Err(e) => {
-            debug!(%stream_id, error = %e, "[FAST-START] Background RAM probe task join error");
+            warn!(%stream_id, error = %e, "[FAST-START] Background RAM probe task join error");
         }
     }
 }
@@ -1350,7 +1367,9 @@ async fn serve_from_in_flight(
                         METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
                         yield Ok::<Bytes, std::io::Error>(slice);
                     } else {
-                        // Wait for upstream to deliver more bytes
+                        // Register notified BEFORE checking is_done / has_error to prevent missing wakeups
+                        let notified = in_flight_clone.notify.notified();
+                        tokio::pin!(notified);
                         if in_flight_clone.is_done.load(Ordering::Relaxed) {
                             break;
                         }
@@ -1361,10 +1380,17 @@ async fn serve_from_in_flight(
                             ));
                             break;
                         }
-                        let _ = tokio::time::timeout(
+                        if tokio::time::timeout(
                             Duration::from_secs(5),
-                            in_flight_clone.notify.notified(),
-                        ).await;
+                            &mut notified,
+                        ).await.is_err() {
+                            tracing::warn!(
+                                %item_id,
+                                cursor,
+                                target_end,
+                                "[FAST-START] Upstream download wait timeout (5s); underrun detected"
+                            );
+                        }
                     }
                 }
             };
@@ -1459,13 +1485,15 @@ async fn serve_from_in_flight(
 
         // Case 3: Tail / MKV Cues index probe
         Some(rng) if is_tail_range(rng, in_flight.total_size) => {
+            let notified = in_flight.tail_notify.notified();
+            tokio::pin!(notified);
             let tail_opt = in_flight.tail_bytes.read().unwrap().clone();
             let tail_bytes = if let Some(t) = tail_opt {
                 Some(t)
             } else {
                 let _ = tokio::time::timeout(
                     Duration::from_millis(3500),
-                    in_flight.tail_notify.notified(),
+                    &mut notified,
                 ).await;
                 in_flight.tail_bytes.read().unwrap().clone()
             };
@@ -1565,11 +1593,18 @@ pub fn is_remote_client(headers: &HeaderMap) -> bool {
     // 3. Check Host header — if it targets a public domain rather than local LAN IP / hostname
     if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
         let host_name = host.split(':').next().unwrap_or(host);
-        if !host_name.starts_with("192.168.")
+        if let Ok(ip) = host_name.parse::<std::net::IpAddr>() {
+            if !ip.is_loopback() && !is_private_ip(&ip) {
+                return true;
+            }
+        } else if !host_name.starts_with("192.168.")
             && !host_name.starts_with("10.")
             && !host_name.starts_with("127.")
             && host_name != "localhost"
             && !host_name.ends_with(".local")
+            && !host_name.ends_with(".lan")
+            && !host_name.ends_with(".home")
+            && !host_name.ends_with(".home.arpa")
         {
             return true;
         }
@@ -1792,8 +1827,11 @@ pub async fn handle_playback_request(
 
         // Case 2: No Range header specified at all (treat as head probe)
         None => {
-            METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
             let head_len = entry.head_bytes.len();
+            if head_len == 0 {
+                return None;
+            }
+            METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
             let chunk_len = head_len.min(FAST_START_HEAD_SERVE_CHUNK_SIZE);
             let slice = entry.head_bytes.slice(0..chunk_len);
             let end_offset = (chunk_len as u64).saturating_sub(1);
@@ -1954,16 +1992,29 @@ pub async fn handle_playback_request(
         // - For LAN clients: DIRECTLY to Debrid CDN edge (skips resolver 302 hop)
         Some(rng) => {
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
-            let redirect_target = if is_remote { url } else { &entry.direct_cdn_url };
+            let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
+            let redirect_target = if is_remote || token_expired {
+                if token_expired {
+                    FAST_START_CACHE.invalidate(url);
+                }
+                url
+            } else {
+                &entry.direct_cdn_url
+            };
             info!(
                 %item_id,
                 range = %rng,
                 target = %redirect_target,
                 is_remote,
+                token_expired,
                 "[FAST-START] Direct handoff outside buffer: issuing 307 redirect"
             );
             let mut redirect = Redirect::temporary(redirect_target).into_response();
-            let header_tag = if is_remote { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            let header_tag = if is_remote || token_expired {
+                "remote-direct-resolver"
+            } else {
+                "redirect-direct-cdn"
+            };
             redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }

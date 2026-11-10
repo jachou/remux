@@ -867,6 +867,7 @@ impl StreamService {
                             si.size.map(|s| s as u64),
                             None,
                         );
+                        crate::fast_start::register_active_prewarm_notify(url);
                         tokio::spawn(async move {
                             let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
                             crate::fast_start::prewarm_fast_start(
@@ -1448,6 +1449,7 @@ impl StreamService {
         let changed =
             |before: Option<i32>, reported: Option<i32>| match (before, reported) {
                 (Some(before), Some(reported)) if before != reported => Some(reported),
+                (None, Some(reported)) => Some(reported),
                 _ => None,
             };
         let audio = changed(before.audio_stream_index, report.audio_stream_index)
@@ -1801,7 +1803,8 @@ impl StreamService {
                             let db_pool = self.ctx.db.clone();
                             let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
                             let stream_size = si.size.map(|s| s as u64);
-                            tokio::spawn(async move {
+                            crate::fast_start::register_active_prewarm_notify(url);
+                        tokio::spawn(async move {
                                 let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
                                 let head_size = if resume_pos.is_some() {
                                     crate::fast_start::calculate_fast_start_resume_head_size(

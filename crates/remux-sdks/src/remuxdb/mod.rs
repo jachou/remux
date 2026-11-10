@@ -350,7 +350,7 @@ fn classify_metrics(result: Result<MediaMetrics, ClientError>) -> MetricsLookup 
         Ok(metrics) => MetricsLookup::Found(metrics),
         Err(ClientError::Http { status: 404, .. }) => MetricsLookup::NotFound,
         Err(error) if is_transient(&error) => {
-            debug!(%error, "remuxdb: metrics temporarily unavailable");
+            warn!(%error, "remuxdb: metrics temporarily unavailable");
             MetricsLookup::Unavailable
         }
         // 400 means RemuxDB does not understand the id; same as the probe

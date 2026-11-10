@@ -1872,7 +1872,7 @@ async fn stremio_streams(
     let mut streams_opt: Option<Vec<sdks::stremio::Stream>> = None;
     for id in ids_to_try {
         match svc
-            .get_streams(media_type.clone(), id)
+            .get_streams(media_type.clone(), id.clone())
             .await
         {
             Ok(s) => {
@@ -1903,7 +1903,10 @@ async fn stremio_streams(
             Err(e) if is_404(&e) => {
                 last_err = Some(e);
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                tracing::warn!(id = %id, error = %e, "stremio stream candidate failed; trying remaining IDs");
+                last_err = Some(e);
+            }
         }
     }
     let streams = match streams_opt {

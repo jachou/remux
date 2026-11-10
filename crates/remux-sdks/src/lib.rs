@@ -195,17 +195,36 @@ mod client_error_tests {
 }
 
 fn try_extract_error_message(body: &str) -> Option<String> {
-    let v: serde_json::Value = serde_json::from_str(body).ok()?;
-    let title = v
-        .get("title")?
-        .as_str()?;
-    let detail = v
-        .get("detail")
-        .and_then(|d| d.as_str());
-    Some(match detail {
-        Some(d) if !d.is_empty() => format!("{title}: {d}"),
-        _ => title.to_string(),
-    })
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(msg) = v.get("status_message").and_then(|s| s.as_str()) {
+            return Some(msg.to_string());
+        }
+        if let Some(msg) = v.get("message").and_then(|s| s.as_str()) {
+            return Some(msg.to_string());
+        }
+        if let Some(msg) = v.get("error").and_then(|s| s.as_str()) {
+            return Some(msg.to_string());
+        }
+        if let Some(title) = v.get("title").and_then(|t| t.as_str()) {
+            let detail = v
+                .get("detail")
+                .and_then(|d| d.as_str());
+            return Some(match detail {
+                Some(d) if !d.is_empty() => format!("{title}: {d}"),
+                _ => title.to_string(),
+            });
+        }
+    }
+    if let Some(start) = body.to_ascii_lowercase().find("<title>") {
+        let rest = &body[start + 7..];
+        if let Some(end) = rest.to_ascii_lowercase().find("</title>") {
+            let title = rest[..end].trim();
+            if !title.is_empty() && title.len() < 100 {
+                return Some(title.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn default_error_mapper(status: u16, endpoint: &str, body: &str) -> ClientError {

@@ -2084,23 +2084,42 @@ impl AddonService {
         // untouched until the combined result is applied once at the end,
         // where `force_refresh` controls whether existing values are replaced.
         let mut combined: Option<db::Media> = None;
+        let mut had_success = false;
         for (r, result) in applicable
             .iter()
             .zip(results)
         {
             match result {
                 Ok(Some(patch)) => {
+                    had_success = true;
                     let acc = combined.get_or_insert_with(db::Media::default);
                     apply_meta(acc, patch, false);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    had_success = true;
+                }
                 Err(e) => {
-                    error!(addon = %r.row.name, error = %e, "meta addon error")
+                    error!(
+                        addon = %r.row.name,
+                        media_id = %media.id,
+                        media_kind = %media.kind,
+                        title = %media.title,
+                        tmdb_id = ?media.external_ids.tmdb,
+                        imdb_id = ?media.external_ids.imdb.as_deref(),
+                        error = %e,
+                        "meta addon error"
+                    );
                 }
             }
         }
         if let Some(combined) = combined {
             apply_meta(media, combined, force_refresh);
+        }
+
+        // If there were applicable metadata addons but EVERY one of them failed with an error,
+        // do not mark this media as refreshed so future non-forced passes can retry it.
+        if !applicable.is_empty() && !had_success {
+            anyhow::bail!("all applicable metadata addons failed for media {}: {}", media.id, media.title);
         }
 
         // Apply SxxExx / "Season N" title formatting once, after all patches are merged.
@@ -3187,14 +3206,16 @@ impl AddonService {
                         return vec![];
                     }
                 };
-                match r
-                    .stream
-                    .as_ref()
-                    .unwrap()
-                    .get_streams(media, ctx, id_prefixes.as_deref())
-                    .await
-                {
-                    Ok(mut streams) => {
+                let stream_res = tokio::time::timeout(
+                    std::time::Duration::from_secs(12),
+                    r.stream
+                        .as_ref()
+                        .unwrap()
+                        .get_streams(media, ctx, id_prefixes.as_deref()),
+                )
+                .await;
+                match stream_res {
+                    Ok(Ok(mut streams)) => {
                         let elapsed = t.elapsed();
                         if streams.is_empty() {
                             debug!(addon = %name, ?elapsed, "addon: no streams");
@@ -3222,8 +3243,12 @@ impl AddonService {
                         }
                         streams
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         warn!(addon = %name, error = %e, elapsed = ?t.elapsed(), "stream addon failed");
+                        vec![]
+                    }
+                    Err(_) => {
+                        warn!(addon = %name, elapsed = ?t.elapsed(), "stream addon timed out after 12s");
                         vec![]
                     }
                 }

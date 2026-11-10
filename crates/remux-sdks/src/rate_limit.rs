@@ -133,23 +133,40 @@ impl reqwest_middleware::Middleware for RetryAfterMiddleware {
         let response = next
             .run(req, extensions)
             .await?;
-        if response.status() != http::StatusCode::TOO_MANY_REQUESTS {
+        let status = response.status();
+        let is_rate_limit = status == http::StatusCode::TOO_MANY_REQUESTS;
+        let is_transient_5xx = status == http::StatusCode::BAD_GATEWAY
+            || status == http::StatusCode::SERVICE_UNAVAILABLE
+            || status == http::StatusCode::GATEWAY_TIMEOUT;
+
+        if !is_rate_limit && !is_transient_5xx {
             return Ok(response);
         }
 
-        let delay = retry_after(
-            response.headers(),
-            SystemTime::now(),
-            self.default_retry_after,
-        );
+        let delay = if is_rate_limit {
+            retry_after(
+                response.headers(),
+                SystemTime::now(),
+                self.default_retry_after,
+            )
+        } else {
+            let parsed = retry_after(response.headers(), SystemTime::now(), Duration::ZERO);
+            if parsed.is_zero() {
+                Duration::from_secs(5)
+            } else {
+                parsed
+            }
+        };
+
         if delay.is_zero() {
             return Ok(response);
         }
         tracing::warn!(
             url = %response.url(),
-            retry_after_secs = delay.as_secs(),
+            %status,
+            backoff_secs = delay.as_secs(),
             shared = self.shared_rate_limit.is_some(),
-            "upstream returned 429; backing off before this request returns"
+            "upstream returned rate limit or server error; backing off shared rate limit"
         );
         if let Some(limit) = &self.shared_rate_limit {
             limit

@@ -1,14 +1,22 @@
 use dashmap::DashMap;
 use std::{
     hash::Hash,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
 };
 use tokio::sync::{Mutex, OwnedMutexGuard};
+
+pub(crate) struct KeyEntry {
+    mutex: Arc<Mutex<()>>,
+    pub(crate) waiters: AtomicUsize,
+}
 
 /// Per-key async mutex. Only one task at a time may hold the lock for a given key.
 /// The map entry is removed automatically when the guard is dropped.
 pub(crate) struct KeyedLock<K: Eq + Hash + Clone + Send + Sync + 'static> {
-    map: OnceLock<Arc<DashMap<K, Arc<Mutex<()>>>>>,
+    map: OnceLock<Arc<DashMap<K, Arc<KeyEntry>>>>,
 }
 
 impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
@@ -18,7 +26,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
         }
     }
 
-    fn inner(&self) -> Arc<DashMap<K, Arc<Mutex<()>>>> {
+    pub(crate) fn inner(&self) -> Arc<DashMap<K, Arc<KeyEntry>>> {
         self.map
             .get_or_init(|| Arc::new(DashMap::new()))
             .clone()
@@ -27,14 +35,34 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
     /// Acquire the lock for `key`, inserting an entry if none exists.
     pub async fn lock(&self, key: K) -> KeyedLockGuard<K> {
         let map = self.inner();
-        let mutex = map
+        let entry = map
             .entry(key.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .or_insert_with(|| {
+                Arc::new(KeyEntry {
+                    mutex: Arc::new(Mutex::new(())),
+                    waiters: AtomicUsize::new(0),
+                })
+            })
             .clone();
-        let _guard = mutex
-            .lock_owned()
-            .await;
-        KeyedLockGuard { map, key, _guard }
+
+        entry.waiters.fetch_add(1, Ordering::SeqCst);
+        let waiter_guard = WaiterGuard {
+            map: map.clone(),
+            key: key.clone(),
+            entry: entry.clone(),
+            acquired: false,
+        };
+
+        let _guard = entry.mutex.clone().lock_owned().await;
+        let mut waiter_guard = std::mem::ManuallyDrop::new(waiter_guard);
+        waiter_guard.acquired = true;
+
+        KeyedLockGuard {
+            map,
+            key,
+            entry,
+            _guard: Some(_guard),
+        }
     }
 
     pub fn contains_key(&self, key: &K) -> bool {
@@ -47,40 +75,72 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
     /// Returns `None` immediately if no entry is found.
     pub async fn lock_if_exists(&self, key: &K) -> Option<KeyedLockGuard<K>> {
         let map = self.inner();
-        let mutex = map
+        let entry = map
             .get(key)
             .map(|e| Arc::clone(&e))?;
-        let _guard = mutex
-            .lock_owned()
-            .await;
+
+        entry.waiters.fetch_add(1, Ordering::SeqCst);
+        let waiter_guard = WaiterGuard {
+            map: map.clone(),
+            key: key.clone(),
+            entry: entry.clone(),
+            acquired: false,
+        };
+
+        let _guard = entry.mutex.clone().lock_owned().await;
+        let mut waiter_guard = std::mem::ManuallyDrop::new(waiter_guard);
+        waiter_guard.acquired = true;
+
         Some(KeyedLockGuard {
             map,
             key: key.clone(),
-            _guard,
+            entry,
+            _guard: Some(_guard),
         })
     }
 }
 
-pub(crate) struct KeyedLockGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
-    map: Arc<DashMap<K, Arc<Mutex<()>>>>,
+struct WaiterGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
+    map: Arc<DashMap<K, Arc<KeyEntry>>>,
     key: K,
-    _guard: OwnedMutexGuard<()>,
+    entry: Arc<KeyEntry>,
+    acquired: bool,
+}
+
+impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for WaiterGuard<K> {
+    fn drop(&mut self) {
+        if !self.acquired {
+            let prev = self.entry.waiters.fetch_sub(1, Ordering::SeqCst);
+            if prev == 1 {
+                self.map
+                    .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.entry));
+            }
+        }
+    }
+}
+
+pub(crate) struct KeyedLockGuard<K: Eq + Hash + Clone + Send + Sync + 'static> {
+    map: Arc<DashMap<K, Arc<KeyEntry>>>,
+    key: K,
+    entry: Arc<KeyEntry>,
+    _guard: Option<OwnedMutexGuard<()>>,
 }
 
 impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for KeyedLockGuard<K> {
     fn drop(&mut self) {
-        let mutex = OwnedMutexGuard::mutex(&self._guard);
-        self.map
-            .remove_if(&self.key, |_, current| {
-                Arc::ptr_eq(current, mutex) && Arc::strong_count(current) == 2
-            });
+        drop(self._guard.take());
+        let prev = self.entry.waiters.fetch_sub(1, Ordering::SeqCst);
+        if prev == 1 {
+            self.map
+                .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.entry));
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::KeyedLock;
-    use std::sync::Arc;
+    use std::sync::{atomic::Ordering, Arc};
     use tokio::{sync::oneshot, time::Duration};
 
     #[tokio::test]
@@ -104,13 +164,14 @@ mod tests {
                 .unwrap();
         });
 
-        while Arc::strong_count(
-            locks
-                .inner()
-                .get("session")
-                .unwrap()
-                .value(),
-        ) < 3
+        while locks
+            .inner()
+            .get("session")
+            .unwrap()
+            .value()
+            .waiters
+            .load(Ordering::SeqCst)
+            < 2
         {
             tokio::task::yield_now().await;
         }
@@ -134,5 +195,36 @@ mod tests {
             .await
             .unwrap();
         assert!(!locks.contains_key(&"session"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_does_not_leak_key_in_map() {
+        let locks = Arc::new(KeyedLock::new());
+        let first = locks
+            .lock("session_cancel")
+            .await;
+        let waiting_locks = locks.clone();
+        let waiter = tokio::spawn(async move {
+            let _second = waiting_locks
+                .lock("session_cancel")
+                .await;
+        });
+
+        while locks
+            .inner()
+            .get("session_cancel")
+            .unwrap()
+            .value()
+            .waiters
+            .load(Ordering::SeqCst)
+            < 2
+        {
+            tokio::task::yield_now().await;
+        }
+
+        drop(first);
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(!locks.contains_key(&"session_cancel"));
     }
 }

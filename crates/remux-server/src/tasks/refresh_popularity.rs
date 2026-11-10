@@ -59,7 +59,9 @@ where
     let mut rejected = 0_usize;
     let mut pending = items;
     let mut delays = delays.iter();
+    let mut round = 0_usize;
     loop {
+        round += 1;
         let results: Vec<_> = stream::iter(pending)
             .map(|item| {
                 let lookup = &lookup;
@@ -83,10 +85,19 @@ where
                 MetricsLookup::Unavailable => pending.push(item),
             }
         }
+        if pending.is_empty() {
+            return (found, missing, 0);
+        }
         let widespread = pending.len() as f64 > page_len as f64 * BACKOFF_FAILURE_SHARE;
-        let delay = delays
-            .next()
-            .filter(|delay| widespread && **delay <= *wait_budget);
+        let delay_candidate = delays.next();
+        let delay = if widespread {
+            delay_candidate.filter(|delay| **delay <= *wait_budget)
+        } else if round < 3 {
+            static SPARSE_DELAY: Duration = Duration::from_millis(500);
+            Some(&SPARSE_DELAY)
+        } else {
+            None
+        };
         let Some(delay) = delay else {
             if rejected > 0 {
                 warn!(
@@ -98,10 +109,14 @@ where
         };
         warn!(
             unavailable = pending.len(),
-            retry_in_secs = delay.as_secs(),
+            retry_in_secs = delay.as_secs_f64(),
             "RemuxDB metrics unavailable; backing off before retrying"
         );
-        *wait_budget -= *delay;
+        if *wait_budget >= *delay {
+            *wait_budget -= *delay;
+        } else {
+            *wait_budget = Duration::ZERO;
+        }
         tokio::time::sleep(*delay).await;
         round_concurrency = retry_round;
     }

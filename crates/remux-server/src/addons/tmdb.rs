@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use super::{
     AddonCapabilities, AddonKind, AddonMetadata, AddonPreset, AddonPresetRegistration,
-    CatalogAddon, CatalogInfo, MediaKind, MetaAddon, ResourceType, SearchAddon,
-    TreeAddon,
+    CatalogAddon, CatalogCompleteness, CatalogInfo, CatalogStream, MediaKind, MetaAddon,
+    ResourceType, SearchAddon, TreeAddon,
 };
 use crate::{
     AppContext, api, common, db, sdks,
@@ -96,9 +96,44 @@ impl AddonKind for TmdbAddon {
     }
 }
 
+static TMDB_FAILED_SERIES: std::sync::LazyLock<moka::sync::Cache<String, ()>> =
+    std::sync::LazyLock::new(|| {
+        moka::sync::Cache::builder()
+            .time_to_live(Duration::from_secs(600))
+            .max_capacity(5000)
+            .build()
+    });
+
+fn tmdb_series_key(media: &db::Media) -> Option<String> {
+    if let Some(id) = media.external_ids.tmdb {
+        return Some(format!("tmdb:{id}"));
+    }
+    if let Some(ref gp) = media.grandparent {
+        if let Some(id) = gp.external_ids.tmdb {
+            return Some(format!("tmdb:{id}"));
+        }
+        return Some(format!("gp:{}", gp.id));
+    }
+    if let Some(ref p) = media.parent {
+        if let Some(id) = p.external_ids.tmdb {
+            return Some(format!("tmdb:{id}"));
+        }
+        return Some(format!("p:{}", p.id));
+    }
+    if let Some(pid) = media.parent_id {
+        return Some(format!("pid:{pid}"));
+    }
+    Some(format!("id:{}", media.id))
+}
+
 #[async_trait]
 impl MetaAddon for TmdbAddon {
     async fn supports(&self, media: &db::Media) -> bool {
+        if let Some(key) = tmdb_series_key(media) {
+            if TMDB_FAILED_SERIES.contains_key(&key) {
+                return false;
+            }
+        }
         matches!(
             media.kind,
             db::MediaKind::Movie
@@ -107,6 +142,13 @@ impl MetaAddon for TmdbAddon {
                 | db::MediaKind::Episode
                 | db::MediaKind::Person
         )
+    }
+
+    fn on_meta_fetch_timeout(&self, media: &db::Media) {
+        if let Some(key) = tmdb_series_key(media) {
+            warn!(%key, "TMDB meta fetch timed out; blacklisting series for remainder of run");
+            TMDB_FAILED_SERIES.insert(key, ());
+        }
     }
 
     async fn meta_fetch(
@@ -246,12 +288,24 @@ impl CatalogAddon for TmdbAddon {
         ctx: &AppContext,
         local_id: &str,
     ) -> Result<Option<Pin<Box<dyn Stream<Item = db::Media> + Send>>>> {
+        Ok(self
+            .catalog_stream_tracked(ctx, local_id)
+            .await?
+            .map(|cs| cs.into_boxed()))
+    }
+
+    async fn catalog_stream_tracked(
+        &self,
+        ctx: &AppContext,
+        local_id: &str,
+    ) -> Result<Option<CatalogStream>> {
         let config = crate::db::Settings::get_config(&ctx.db).await?;
         let client = tmdb_client(
             config.get_tmdb_key(),
             &ctx.config
                 .tmdb_base_url,
         )?;
+        let completeness = CatalogCompleteness::default();
 
         let stream: Pin<Box<dyn Stream<Item = db::Media> + Send>> = match local_id {
             "popular_movies" => Box::pin(discover_movie_stream(
@@ -260,6 +314,7 @@ impl CatalogAddon for TmdbAddon {
                     sort_by: Some("popularity.desc".into()),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "popular_tv" => Box::pin(discover_tv_stream(
                 client,
@@ -267,6 +322,7 @@ impl CatalogAddon for TmdbAddon {
                     sort_by: Some("popularity.desc".into()),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "top_rated_movies" => Box::pin(discover_movie_stream(
                 client,
@@ -275,6 +331,7 @@ impl CatalogAddon for TmdbAddon {
                     vote_count_gte: Some(300),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "top_rated_tv" => Box::pin(discover_tv_stream(
                 client,
@@ -283,18 +340,20 @@ impl CatalogAddon for TmdbAddon {
                     vote_count_gte: Some(300),
                     ..Default::default()
                 },
+                completeness.clone(),
             )),
             "trending_movies_week" => Box::pin(trending_movie_stream(
                 client,
                 sdks::tmdb::TrendingWindow::Week,
+                completeness.clone(),
             )),
             "trending_tv_week" => {
-                Box::pin(trending_tv_stream(client, sdks::tmdb::TrendingWindow::Week))
+                Box::pin(trending_tv_stream(client, sdks::tmdb::TrendingWindow::Week, completeness.clone()))
             }
             _ => return Ok(None),
         };
 
-        Ok(Some(stream))
+        Ok(Some(CatalogStream::new(stream, completeness)))
     }
 }
 
@@ -353,19 +412,27 @@ fn series_result_to_stub(s: sdks::tmdb::SeriesSearchResult) -> db::Media {
 fn discover_movie_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     query: sdks::tmdb::DiscoverQuery,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, query, Some(1u32)),
-        |(client, query, maybe_page)| async move {
+        (client, query, completeness, Some(1u32)),
+        |(client, query, completeness, maybe_page)| async move {
             let page = maybe_page?;
             let page_query = sdks::tmdb::DiscoverQuery {
                 page: Some(page),
                 ..query.clone()
             };
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::DiscoverMovieEndpoint { query: page_query })
                 .await
-                .ok()?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(page, error = %e, "TMDB discover movies failed; marking catalog incomplete");
+                    completeness.mark_incomplete();
+                    return None;
+                }
+            };
             if resp
                 .results
                 .is_empty()
@@ -378,7 +445,7 @@ fn discover_movie_stream(
                 .map(movie_result_to_stub)
                 .collect();
             let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, query, next)))
+            Some((futures::stream::iter(items), (client, query, completeness, next)))
         },
     )
     .flatten()
@@ -387,19 +454,27 @@ fn discover_movie_stream(
 fn discover_tv_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     query: sdks::tmdb::DiscoverQuery,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, query, Some(1u32)),
-        |(client, query, maybe_page)| async move {
+        (client, query, completeness, Some(1u32)),
+        |(client, query, completeness, maybe_page)| async move {
             let page = maybe_page?;
             let page_query = sdks::tmdb::DiscoverQuery {
                 page: Some(page),
                 ..query.clone()
             };
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::DiscoverTvEndpoint { query: page_query })
                 .await
-                .ok()?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(page, error = %e, "TMDB discover tv failed; marking catalog incomplete");
+                    completeness.mark_incomplete();
+                    return None;
+                }
+            };
             if resp
                 .results
                 .is_empty()
@@ -412,7 +487,7 @@ fn discover_tv_stream(
                 .map(series_result_to_stub)
                 .collect();
             let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, query, next)))
+            Some((futures::stream::iter(items), (client, query, completeness, next)))
         },
     )
     .flatten()
@@ -421,18 +496,26 @@ fn discover_tv_stream(
 fn trending_movie_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     window: sdks::tmdb::TrendingWindow,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, Some(1u32)),
-        move |(client, maybe_page)| async move {
+        (client, completeness, Some(1u32)),
+        move |(client, completeness, maybe_page)| async move {
             let page = maybe_page?;
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::TrendingMovieEndpoint {
                     window,
                     page: Some(page),
                 })
                 .await
-                .ok()?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(page, error = %e, "TMDB trending movies failed; marking catalog incomplete");
+                    completeness.mark_incomplete();
+                    return None;
+                }
+            };
             if resp
                 .results
                 .is_empty()
@@ -445,7 +528,7 @@ fn trending_movie_stream(
                 .map(movie_result_to_stub)
                 .collect();
             let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, next)))
+            Some((futures::stream::iter(items), (client, completeness, next)))
         },
     )
     .flatten()
@@ -454,18 +537,26 @@ fn trending_movie_stream(
 fn trending_tv_stream(
     client: sdks::RestClient<sdks::BearerAuth>,
     window: sdks::tmdb::TrendingWindow,
+    completeness: CatalogCompleteness,
 ) -> impl Stream<Item = db::Media> + Send {
     futures::stream::unfold(
-        (client, Some(1u32)),
-        move |(client, maybe_page)| async move {
+        (client, completeness, Some(1u32)),
+        move |(client, completeness, maybe_page)| async move {
             let page = maybe_page?;
-            let resp = client
+            let resp = match client
                 .execute(sdks::tmdb::TrendingTvEndpoint {
                     window,
                     page: Some(page),
                 })
                 .await
-                .ok()?;
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(page, error = %e, "TMDB trending tv failed; marking catalog incomplete");
+                    completeness.mark_incomplete();
+                    return None;
+                }
+            };
             if resp
                 .results
                 .is_empty()
@@ -478,7 +569,7 @@ fn trending_tv_stream(
                 .map(series_result_to_stub)
                 .collect();
             let next = (page < resp.total_pages).then_some(page + 1);
-            Some((futures::stream::iter(items), (client, next)))
+            Some((futures::stream::iter(items), (client, completeness, next)))
         },
     )
     .flatten()
