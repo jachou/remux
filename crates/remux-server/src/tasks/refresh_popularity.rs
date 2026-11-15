@@ -155,14 +155,14 @@ impl Task for RefreshPopularityTask {
         // retry the probe with backoff. If still unavailable, schedule a delayed retry (5 minutes)
         // so an outage at scheduled run time doesn't wait 24 hours for tomorrow.
         let check_url = format!("{}/api/media/tt0903747", base_url.trim_end_matches('/'));
+        let check_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap_or_default();
         let mut is_available = false;
         for attempt in 1..=3 {
-            let res = tokio::time::timeout(
-                std::time::Duration::from_secs(4),
-                reqwest::Client::new().head(&check_url).send(),
-            )
-            .await;
-            if let Ok(Ok(resp)) = res
+            let res = check_client.head(&check_url).send().await;
+            if let Ok(resp) = res
                 && !resp
                     .status()
                     .is_server_error()

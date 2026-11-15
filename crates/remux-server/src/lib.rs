@@ -975,7 +975,12 @@ pub fn setup_logging(
     otlp_endpoint: Option<&str>,
 ) {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("warn,remux=info"));
+        .unwrap_or_else(|_| EnvFilter::new("warn,remux=info"))
+        .add_directive(
+            "reqwest_retry=error"
+                .parse()
+                .expect("valid directive"),
+        );
 
     let fmt_layer = fmt::layer()
         .with_timer(fmt::time::ChronoLocal::new("%H:%M:%S".to_string()))

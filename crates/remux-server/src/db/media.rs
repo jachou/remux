@@ -3521,7 +3521,7 @@ impl Media {
                     "failed to delete merged duplicate row");
                 continue;
             }
-            warn!(loser = %loser_id, winner = %media.id, kind = %media.kind,
+            info!(loser = %loser_id, winner = %media.id, title = %media.title, kind = %media.kind,
                 "merged duplicate root media row sharing an external id");
             merged_any = true;
         }
@@ -3562,7 +3562,7 @@ impl Media {
             .await
             .unwrap_or(None);
         if let Some(id) = winner {
-            warn!(
+            debug!(
                 ?rows,
                 winner = %id,
                 kind = %kind,
@@ -6487,6 +6487,7 @@ impl Media {
             OR (
               kind = 'series' AND (status IS NULL OR status != 'ended')
               AND datetime(created_at) < datetime('now', '-1 hour')
+              AND datetime(refreshed_at) < datetime('now', '-20 hours')
               AND (
                 datetime(refreshed_at) < datetime('now', '-{REFRESH_BACKOFF_DAYS} days')
                 OR datetime(created_at) >= datetime('now', '-{RECENTLY_ADDED_DAYS} days')
@@ -6506,6 +6507,7 @@ impl Media {
               kind = 'movie'
               AND digital_released_at IS NULL
               AND datetime(created_at) < datetime('now', '-1 hour')
+              AND datetime(refreshed_at) < datetime('now', '-20 hours')
               AND (
                 datetime(created_at) >= datetime('now', '-{RECENTLY_ADDED_DAYS} days')
                 OR (released_at IS NOT NULL AND datetime(released_at) >= datetime('now', '-365 days'))
@@ -11716,6 +11718,35 @@ mod tests {
         assert!(
             ids.contains(&movie_ids[4]),
             "never-refreshed movie must be selected"
+        );
+
+        // An active item already refreshed 2 hours ago must not be re-selected
+        // on the next sub-daily Refresh Library pass.
+        let (id_recent_refresh, ext_recent_refresh) =
+            make_id(MediaKind::Movie, "tt9992006");
+        let mut refreshed_2h_ago = Media {
+            id: id_recent_refresh,
+            title: "Refreshed 2h Ago".to_string(),
+            kind: MediaKind::Movie,
+            external_ids: ext_recent_refresh,
+            released_at: Some(now - days(5)),
+            digital_released_at: None,
+            created_at: now - days(2),
+            refreshed_at: Some(now - chrono::Duration::hours(2)),
+            ..Default::default()
+        };
+        refreshed_2h_ago
+            .save(db)
+            .await
+            .unwrap();
+        let (batch2, _) = Media::get_refreshable(db, 100, None, false)
+            .await
+            .unwrap();
+        assert!(
+            !batch2
+                .iter()
+                .any(|m| m.id == id_recent_refresh),
+            "item refreshed 2 hours ago must not be re-selected within the 20h cooldown"
         );
     }
 
