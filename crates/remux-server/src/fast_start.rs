@@ -219,7 +219,9 @@ pub const FAST_START_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Fast-start buffer cache, keyed by upstream stream URL.
 ///
-/// Bounded strictly to 2 GB aggregate RAM via LRU weigher policy, with a 30m idle / 1h TTL expiration.
+/// Bounded strictly to 2 GB aggregate RAM via LRU weigher policy.
+/// Immutable video buffers remain in RAM until evicted by the 2 GB LRU cap or explicitly invalidated
+/// by a failed liveness check; `direct_cdn_url` and `created_at` are refreshed in-place on 8-byte liveness checks.
 pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStartEntry>> =
     LazyLock::new(|| {
         moka::sync::Cache::builder()
@@ -231,8 +233,6 @@ pub(crate) static FAST_START_CACHE: LazyLock<moka::sync::Cache<String, FastStart
                     + 1024;
                 bytes.min(u32::MAX as usize) as u32
             })
-            .time_to_idle(Duration::from_secs(1800))
-            .time_to_live(FAST_START_TTL)
             .build()
     });
 
@@ -1952,16 +1952,18 @@ pub async fn handle_playback_request(
 
             // Fall through to direct redirect if tail is missing or sub-range not covered
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
-            let redirect_target = if is_remote { url } else { &entry.direct_cdn_url };
+            let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
+            let redirect_target = if is_remote || token_expired { url } else { &entry.direct_cdn_url };
             info!(
                 %item_id,
                 range = %rng,
                 target = %redirect_target,
                 is_remote,
+                token_expired,
                 "[FAST-START] Redirecting tail request (307)"
             );
             let mut redirect = Redirect::temporary(redirect_target).into_response();
-            let header_tag = if is_remote { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            let header_tag = if is_remote || token_expired { "remote-direct-resolver" } else { "redirect-direct-cdn" };
             redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }
@@ -2013,16 +2015,18 @@ pub async fn handle_playback_request(
 
             // Fall through to redirect if resume chunk doesn't cover
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
-            let redirect_target = if is_remote { url } else { &entry.direct_cdn_url };
+            let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
+            let redirect_target = if is_remote || token_expired { url } else { &entry.direct_cdn_url };
             info!(
                 %item_id,
                 range = %rng,
                 target = %redirect_target,
                 is_remote,
+                token_expired,
                 "[FAST-START] Resume range miss: redirecting (307)"
             );
             let mut redirect = Redirect::temporary(redirect_target).into_response();
-            let header_tag = if is_remote { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            let header_tag = if is_remote || token_expired { "remote-direct-resolver" } else { "redirect-direct-cdn" };
             redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }
@@ -2035,9 +2039,6 @@ pub async fn handle_playback_request(
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
             let redirect_target = if is_remote || token_expired {
-                if token_expired {
-                    FAST_START_CACHE.invalidate(url);
-                }
                 url
             } else {
                 &entry.direct_cdn_url
@@ -2948,6 +2949,102 @@ mod tests {
         assert!(
             get_active_prewarm_notify(test_url).is_none(),
             "notify entry must be removed after all guards drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn liveness_refresh_updates_torbox_cdn_url_in_place_and_evicts_on_dead_link() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+
+        let should_fail = Arc::new(AtomicBool::new(false));
+        let should_fail_clone = should_fail.clone();
+
+        let server = axum::Router::new()
+            .route(
+                "/strem/video.mkv",
+                axum::routing::get(move |req: axum::extract::Request| {
+                    let fail = should_fail_clone.load(Ordering::SeqCst);
+                    let host = req
+                        .headers()
+                        .get(header::HOST)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("127.0.0.1")
+                        .to_string();
+                    async move {
+                        if fail {
+                            Response::builder()
+                                .status(StatusCode::NOT_FOUND)
+                                .body(Body::empty())
+                                .unwrap()
+                        } else {
+                            let new_cdn = format!("http://{}/dld/{}", host, Uuid::new_v4());
+                            Redirect::temporary(&new_cdn).into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/dld/{id}",
+                axum::routing::get(|| async {
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_TYPE, "video/x-matroska")
+                        .header(header::CONTENT_RANGE, "bytes 0-7/5000000000")
+                        .body(Body::from(vec![0x1A, 0x45, 0xDF, 0xA3, 0x01, 0x02, 0x03, 0x04]))
+                        .unwrap()
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, server).await.unwrap();
+        });
+
+        let test_url = format!("http://{}/strem/video.mkv", addr);
+        let initial_cdn = format!("http://{}/dld/old-ticket-uuid", addr);
+        FAST_START_CACHE.insert(
+            test_url.clone(),
+            FastStartEntry {
+                item_id: Some(Uuid::nil()),
+                original_url: test_url.clone(),
+                direct_cdn_url: initial_cdn.clone(),
+                total_size: 5_000_000_000,
+                head_bytes: Bytes::from(vec![0x42u8; 4096]),
+                tail_bytes: Some(Bytes::from(vec![0x99u8; 512])),
+                resume_buffer: Some((100_000_000, Bytes::from(vec![0x77u8; 2048]))),
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now() - Duration::from_secs(7200),
+            },
+        );
+
+        let descriptor = crate::stream::StreamDescriptor::Http {
+            url: test_url.clone(),
+            request_headers: HashMap::new(),
+            response_headers: HashMap::new(),
+        };
+
+        // 1. 8-byte liveness check succeeds with a brand-new /dld/<uuid> path:
+        // RAM buffers must remain intact while direct_cdn_url and created_at are refreshed!
+        assert!(descriptor.refresh_liveness().await);
+        let refreshed = FAST_START_CACHE
+            .get(&test_url)
+            .expect("RAM buffer must not be evicted when TorBox mints a new /dld/<uuid> ticket");
+        assert_ne!(refreshed.direct_cdn_url, initial_cdn);
+        assert!(refreshed.direct_cdn_url.contains("/dld/"));
+        assert_eq!(refreshed.head_bytes.len(), 4096);
+        assert!(refreshed.resume_buffer.is_some());
+        assert!(refreshed.created_at.elapsed() < Duration::from_secs(5));
+
+        // 2. Simulate liveness TTL expiring (>1h later) and upstream link dying (404):
+        // 8-byte liveness check fails and MUST evict the dead RAM buffer!
+        crate::stream::STREAM_LIVENESS_CACHE.invalidate(&test_url);
+        should_fail.store(true, Ordering::SeqCst);
+        assert!(!descriptor.refresh_liveness().await);
+        assert!(
+            FAST_START_CACHE.get(&test_url).is_none(),
+            "dead upstream link must evict stale RAM buffer"
         );
     }
 }

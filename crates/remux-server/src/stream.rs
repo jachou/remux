@@ -570,29 +570,32 @@ impl StreamDescriptor {
 
                     // Keep Fast-Start RAM buffer synchronized: if direct CDN redirect URL changed, refresh it in-place
                     if let Some(mut fs_entry) = crate::fast_start::FAST_START_CACHE.get(url) {
-                        if fs_entry.direct_cdn_url != direct_url {
-                            let was_error = fs_entry.total_size < 2 * 1024 * 1024
-                                || is_error_video_url(&fs_entry.direct_cdn_url);
-                            let old_path = url::Url::parse(&fs_entry.direct_cdn_url).ok().map(|u| (u.host_str().map(str::to_string), u.path().to_string()));
-                            let new_path = url::Url::parse(&direct_url).ok().map(|u| (u.host_str().map(str::to_string), u.path().to_string()));
-                            if was_error || old_path != new_path {
+                        let was_error = fs_entry.total_size < 2 * 1024 * 1024
+                            || is_error_video_url(&fs_entry.direct_cdn_url);
+                        let size_mismatch =
+                            total_size.is_some_and(|sz| sz != fs_entry.total_size);
+                        if was_error || size_mismatch {
+                            tracing::info!(
+                                %url,
+                                old_cdn = %fs_entry.direct_cdn_url,
+                                new_cdn = %direct_url,
+                                old_size = fs_entry.total_size,
+                                new_size = ?total_size,
+                                "[FAST-START] CDN stream target size changed or recovered from error; invalidating stale RAM buffer"
+                            );
+                            crate::fast_start::FAST_START_CACHE.invalidate(url);
+                        } else {
+                            if fs_entry.direct_cdn_url != direct_url {
                                 tracing::info!(
                                     %url,
                                     old_cdn = %fs_entry.direct_cdn_url,
                                     new_cdn = %direct_url,
-                                    "[FAST-START] CDN stream target changed or recovered from error; invalidating stale RAM buffer"
-                                );
-                                crate::fast_start::FAST_START_CACHE.invalidate(url);
-                            } else {
-                                tracing::info!(
-                                    %url,
-                                    old_cdn = %fs_entry.direct_cdn_url,
-                                    new_cdn = %direct_url,
-                                    "[FAST-START] Refreshed CDN edge redirect URL from liveness check"
+                                    "[FAST-START] Refreshed CDN edge redirect URL in-place from 8-byte liveness check"
                                 );
                                 fs_entry.direct_cdn_url = direct_url;
-                                crate::fast_start::FAST_START_CACHE.insert(url.clone(), fs_entry);
                             }
+                            fs_entry.created_at = std::time::Instant::now();
+                            crate::fast_start::FAST_START_CACHE.insert(url.clone(), fs_entry);
                         }
                     }
                     true

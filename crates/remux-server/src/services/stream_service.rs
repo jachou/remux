@@ -2110,6 +2110,21 @@ pub fn spawn_preemptive_probe_opts(
             if let Some(cached) = &primary.probe_data {
                 if is_reusable_probe_cache(cached) {
                     tracing::info!(%item_id, stream_id = %primary.id, "Candidate #1 already probed in DB; pre-warming liveness & fast-start in parallel");
+                    let prewarm_notify_guard = primary
+                        .stream_info
+                        .as_ref()
+                        .and_then(|si| {
+                            if !si.descriptor.is_known_dead() {
+                                if let crate::stream::StreamDescriptor::Http { url, .. } =
+                                    &si.descriptor
+                                {
+                                    return Some(
+                                        crate::fast_start::register_active_prewarm_notify(url),
+                                    );
+                                }
+                            }
+                            None
+                        });
                     let fast_start_fut = async {
                         if let Some(si) = &primary.stream_info {
                             if !si.descriptor.is_known_dead() {
@@ -2141,6 +2156,7 @@ pub fn spawn_preemptive_probe_opts(
                                 }
                             }
                         }
+                        drop(prewarm_notify_guard);
                     };
                     let liveness_fut = async {
                         if let Some(si) = &primary.stream_info {
