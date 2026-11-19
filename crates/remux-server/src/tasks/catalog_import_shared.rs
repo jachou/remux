@@ -330,7 +330,8 @@ pub async fn import_catalog_items(
             .filter(|m| m.kind == db::MediaKind::Playlist)
             .cloned()
             .collect();
-        if !existing_playlists.is_empty() {
+        let had_existing_playlists = !existing_playlists.is_empty();
+        if had_existing_playlists {
             if let Err(e) = ctx
                 .addons
                 .process_meta_batch(existing_playlists, ctx, false, None)
@@ -344,12 +345,17 @@ pub async fn import_catalog_items(
             }
         }
 
-        // Checkpoint the WAL after each chunk so it doesn't balloon to hundreds of MB
-        // during large imports, which would make concurrent reads increasingly slow.
-        sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
-            .execute(&ctx.db)
-            .await
-            .ok();
+        let chunk_wrote_media = !new_item_kinds.is_empty()
+            || !existing_live_tv.is_empty()
+            || had_existing_playlists;
+        // Checkpoint the WAL after chunks that wrote media so it doesn't balloon to hundreds of MB
+        // during large imports, while avoiding redundant checkpoints on unchanged chunks.
+        if chunk_wrote_media {
+            sqlx::query("PRAGMA wal_checkpoint(PASSIVE)")
+                .execute(&ctx.db)
+                .await
+                .ok();
+        }
 
         // Record catalog membership and apply catalog tags for all top-level IDs.
         // Upsert for both new and existing items to keep positions accurate on re-import.
@@ -402,7 +408,9 @@ pub async fn import_catalog_items(
                 qb.push(
                     ") AS v \
                      JOIN media ON media.id = v.column4 \
-                     ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) DO UPDATE SET weight = excluded.weight",
+                     ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) \
+                     DO UPDATE SET weight = excluded.weight \
+                     WHERE weight IS NOT excluded.weight",
                 );
                 if let Err(e) = qb
                     .build()

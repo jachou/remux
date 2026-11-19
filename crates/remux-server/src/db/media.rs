@@ -6694,16 +6694,22 @@ impl Media {
             .begin()
             .await?;
         for item in items {
+            let ext_json = sqlx::types::Json(&item.external_ratings);
             sqlx::query(
                 "UPDATE media SET \
-                 rating_audience = COALESCE(?, rating_audience), \
-                 rating_critic = COALESCE(?, rating_critic), \
-                 external_ratings = COALESCE(?, external_ratings) \
-                 WHERE id = ?",
+                 rating_audience = COALESCE(?1, rating_audience), \
+                 rating_critic = COALESCE(?2, rating_critic), \
+                 external_ratings = COALESCE(?3, external_ratings) \
+                 WHERE id = ?4 \
+                   AND ( \
+                     rating_audience IS NOT COALESCE(?1, rating_audience) \
+                     OR rating_critic IS NOT COALESCE(?2, rating_critic) \
+                     OR external_ratings IS NOT COALESCE(?3, external_ratings) \
+                   )",
             )
             .bind(item.rating_audience)
             .bind(item.rating_critic)
-            .bind(sqlx::types::Json(&item.external_ratings))
+            .bind(ext_json)
             .bind(item.id)
             .execute(&mut *tx)
             .await?;
