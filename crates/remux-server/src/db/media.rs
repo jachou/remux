@@ -578,7 +578,7 @@ impl MediaRelation {
                     .push_bind(&item.character);
             });
 
-            qb.push(" ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) DO UPDATE SET weight = excluded.weight, character = excluded.character");
+            qb.push(" ON CONFLICT (left_media_id, right_media_id, COALESCE(role, '')) DO UPDATE SET weight = excluded.weight, character = excluded.character WHERE weight IS NOT excluded.weight OR character IS NOT excluded.character");
 
             qb.build()
                 .execute(&mut *conn)

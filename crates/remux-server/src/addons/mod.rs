@@ -214,9 +214,11 @@ pub(crate) async fn save_pending_relations(ctx: &AppContext, items: &[db::Media]
         .map(|(_, m)| m.id)
         .collect();
 
-    // One batched upsert for all relation media (persons/genres) across the whole slice —
-    // avoids opening a separate transaction per item (N items → N transactions otherwise).
-    let all_rel_media: Vec<db::Media> = items
+    // One batched upsert for NEW relation media (persons/genres/studios) across the whole slice —
+    // skip rows that already exist in `media` so steady-state series/movie refreshes don't rewrite
+    // thousands of unchanged Person/Genre/Studio rows into the 1GB `media` table.
+    let mut seen_rel_ids = std::collections::HashSet::new();
+    let candidate_rel_media: Vec<db::Media> = items
         .iter()
         .filter_map(|m| {
             m.relations
@@ -224,11 +226,29 @@ pub(crate) async fn save_pending_relations(ctx: &AppContext, items: &[db::Media]
         })
         .flatten()
         .map(|(_, m)| m.clone())
-        .filter(|m| !name_keyed_person_ids.contains(&m.id))
+        .filter(|m| !name_keyed_person_ids.contains(&m.id) && seen_rel_ids.insert(m.id))
         .collect();
-    if !all_rel_media.is_empty() {
-        if let Err(e) = db::Media::upsert(&ctx.db, &all_rel_media).await {
-            warn!(error = %e, "failed to upsert relation media batch");
+    if !candidate_rel_media.is_empty() {
+        let mut existing_rel_ids = std::collections::HashSet::new();
+        for id_chunk in candidate_rel_media.chunks(500) {
+            let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE id IN (");
+            let mut sep = qb.separated(", ");
+            for m in id_chunk {
+                sep.push_bind(m.id);
+            }
+            qb.push(")");
+            if let Ok(rows) = qb.build_query_scalar::<Uuid>().fetch_all(&ctx.db).await {
+                existing_rel_ids.extend(rows);
+            }
+        }
+        let new_rel_media: Vec<db::Media> = candidate_rel_media
+            .into_iter()
+            .filter(|m| !existing_rel_ids.contains(&m.id))
+            .collect();
+        if !new_rel_media.is_empty() {
+            if let Err(e) = db::Media::upsert(&ctx.db, &new_rel_media).await {
+                warn!(error = %e, "failed to upsert relation media batch");
+            }
         }
     }
 
@@ -2701,7 +2721,7 @@ impl AddonService {
         // still throttles through `semaphore` (shared for the whole batch),
         // so this can't multiply past the configured budget the way an
         // independent per-level concurrency cap would.
-        let level1: Vec<db::Media> = async {
+        let level1_tagged: Vec<(db::Media, bool)> = async {
         futures::stream::iter(raw_level1)
             .map(|mut child| {
                 let svc = self.clone();
@@ -2722,6 +2742,7 @@ impl AddonService {
                     // freshly parsed from the addon's raw response, which has no concept
                     // of it, so leaving it unset makes `child_refresh_force` below treat
                     // an already-refreshed child as brand new every single pass.
+                    let mut existed_in_db = false;
                     if let Some(idx) = child.idx {
                         let key = (
                             child
@@ -2732,6 +2753,7 @@ impl AddonService {
                         if let Some(&(existing_id, existing_refreshed_at)) =
                             existing_l1.get(&key)
                         {
+                            existed_in_db = true;
                             child.refreshed_at = existing_refreshed_at;
                             if existing_id != child.id {
                                 // When the root was remapped, cascade any references to the new
@@ -2756,9 +2778,11 @@ impl AddonService {
                     let in_active_window = is_continuing
                         && matches!(child.kind, db::MediaKind::Episode)
                         && episode_in_active_window(&child);
+                    let mut was_refreshed = false;
                     if let Some(effective_force) =
                         child_refresh_force(force_refresh, in_active_window, &child)
                     {
+                        was_refreshed = true;
                         let _permit = semaphore
                             .acquire()
                             .instrument(tracing::debug_span!(target: "remux_server::metadata_refresh", "permit_wait"))
@@ -2771,7 +2795,8 @@ impl AddonService {
                             warn!(id = %child.id, error = %e, "failed to refresh child meta");
                         }
                     }
-                    child
+                    let needs_upsert = !existed_in_db || was_refreshed || root_was_remapped;
+                    (child, needs_upsert)
                 }
             })
             .buffer_unordered(concurrency)
@@ -2781,9 +2806,24 @@ impl AddonService {
         .instrument(tracing::debug_span!(target: "remux_server::metadata_refresh", "children_refresh"))
         .await;
 
-        let mut level1_ok: Vec<&db::Media> = Vec::with_capacity(level1.len());
+        let (level1_to_upsert, level1_unchanged): (Vec<db::Media>, Vec<db::Media>) = {
+            let mut to_upsert = Vec::new();
+            let mut unchanged = Vec::new();
+            for (child, needs_upsert) in level1_tagged {
+                if needs_upsert {
+                    to_upsert.push(child);
+                } else {
+                    unchanged.push(child);
+                }
+            }
+            (to_upsert, unchanged)
+        };
+
+        let mut level1_ok: Vec<&db::Media> =
+            Vec::with_capacity(level1_to_upsert.len() + level1_unchanged.len());
+        level1_ok.extend(level1_unchanged.iter());
         async {
-            for chunk in level1.chunks(db::CHUNK_SIZE) {
+            for chunk in level1_to_upsert.chunks(db::CHUNK_SIZE) {
                 if let Err(e) = db::Media::upsert(&ctx.db, chunk).await {
                     error!(error = %e, "failed to upsert children");
                 } else {
@@ -2797,7 +2837,7 @@ impl AddonService {
         .instrument(tracing::debug_span!(
             target: "remux_server::metadata_refresh",
             "children_upsert",
-            children = level1.len()
+            children = level1_to_upsert.len()
         ))
         .await;
 
@@ -2849,6 +2889,7 @@ impl AddonService {
                         // child_refresh_force below always treats this episode as never
                         // refreshed, refetching it on every single pass.
                         let mut stored_digital = None;
+                        let mut existed_in_db = false;
                         if let Some(idx) = gc.idx {
                             let key = (
                                 actual_child_id,
@@ -2862,6 +2903,7 @@ impl AddonService {
                                 existing_digital,
                             )) = existing_l2.get(&key)
                             {
+                                existed_in_db = true;
                                 gc.id = existing_id;
                                 gc.refreshed_at = existing_refreshed_at;
                                 stored_digital = existing_digital;
@@ -2871,9 +2913,11 @@ impl AddonService {
                         let in_active_window = is_continuing
                             && matches!(gc.kind, db::MediaKind::Episode)
                             && episode_in_active_window_with(&gc, stored_digital);
+                        let mut was_refreshed = false;
                         if let Some(effective_force) =
                             child_refresh_force(force_refresh, in_active_window, &gc)
                         {
+                            was_refreshed = true;
                             let _permit = semaphore
                                 .acquire()
                                 .instrument(tracing::debug_span!(target: "remux_server::metadata_refresh", "permit_wait"))
@@ -2886,7 +2930,9 @@ impl AddonService {
                                 warn!(id = %gc.id, error = %e, "failed to refresh grandchild meta");
                             }
                         }
-                        level2.push(gc);
+                        if !existed_in_db || was_refreshed || root_was_remapped {
+                            level2.push(gc);
+                        }
                     }
                     }
                     .instrument(tracing::debug_span!(target: "remux_server::metadata_refresh", "grandchildren_refresh", grandchildren = episode_count))
