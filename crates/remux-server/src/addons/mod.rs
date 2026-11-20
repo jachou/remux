@@ -214,9 +214,9 @@ pub(crate) async fn save_pending_relations(ctx: &AppContext, items: &[db::Media]
         .map(|(_, m)| m.id)
         .collect();
 
-    // One batched upsert for NEW relation media (persons/genres/studios) across the whole slice —
-    // skip rows that already exist in `media` so steady-state series/movie refreshes don't rewrite
-    // thousands of unchanged Person/Genre/Studio rows into the 1GB `media` table.
+    // One batched upsert for NEW or CHANGED relation media (persons/genres/studios) across the whole slice —
+    // skip rows that already exist in `media` with identical title and primary image so steady-state
+    // series/movie refreshes don't rewrite thousands of unchanged Person/Genre/Studio rows into `media`.
     let mut seen_rel_ids = std::collections::HashSet::new();
     let candidate_rel_media: Vec<db::Media> = items
         .iter()
@@ -229,24 +229,54 @@ pub(crate) async fn save_pending_relations(ctx: &AppContext, items: &[db::Media]
         .filter(|m| !name_keyed_person_ids.contains(&m.id) && seen_rel_ids.insert(m.id))
         .collect();
     if !candidate_rel_media.is_empty() {
-        let mut existing_rel_ids = std::collections::HashSet::new();
+        let mut existing_rel_meta: std::collections::HashMap<Uuid, (String, Option<String>)> =
+            std::collections::HashMap::new();
         for id_chunk in candidate_rel_media.chunks(500) {
-            let mut qb = sqlx::QueryBuilder::new("SELECT id FROM media WHERE id IN (");
+            let mut qb = sqlx::QueryBuilder::new(
+                "SELECT m.id, m.title, \
+                 (SELECT i.path FROM media_images i \
+                  WHERE i.media_id = m.id AND i.image_type = 'Primary' AND i.image_index = 0 \
+                  LIMIT 1) \
+                 FROM media m WHERE m.id IN (",
+            );
             let mut sep = qb.separated(", ");
             for m in id_chunk {
                 sep.push_bind(m.id);
             }
             qb.push(")");
-            if let Ok(rows) = qb.build_query_scalar::<Uuid>().fetch_all(&ctx.db).await {
-                existing_rel_ids.extend(rows);
+            if let Ok(rows) = qb
+                .build_query_as::<(Uuid, String, Option<String>)>()
+                .fetch_all(&ctx.db)
+                .await
+            {
+                for (id, title, primary_img) in rows {
+                    existing_rel_meta.insert(id, (title, primary_img));
+                }
             }
         }
-        let new_rel_media: Vec<db::Media> = candidate_rel_media
+        let changed_rel_media: Vec<db::Media> = candidate_rel_media
             .into_iter()
-            .filter(|m| !existing_rel_ids.contains(&m.id))
+            .filter(|m| {
+                let Some((stored_title, stored_primary_img)) = existing_rel_meta.get(&m.id) else {
+                    return true;
+                };
+                if stored_title != &m.title {
+                    return true;
+                }
+                let incoming_primary = m
+                    .images
+                    .iter()
+                    .find(|img| img.image_type == "Primary" && img.image_index == 0)
+                    .map(|img| img.path.as_str());
+                match (incoming_primary, stored_primary_img.as_deref()) {
+                    (Some(inc), None) => !inc.is_empty(),
+                    (Some(inc), Some(stored)) => stored.starts_with("http") && stored != inc,
+                    _ => false,
+                }
+            })
             .collect();
-        if !new_rel_media.is_empty() {
-            if let Err(e) = db::Media::upsert(&ctx.db, &new_rel_media).await {
+        if !changed_rel_media.is_empty() {
+            if let Err(e) = db::Media::upsert(&ctx.db, &changed_rel_media).await {
                 warn!(error = %e, "failed to upsert relation media batch");
             }
         }
@@ -2437,10 +2467,32 @@ impl AddonService {
         &self,
         db: &sqlx::SqlitePool,
         parent_id: Uuid,
-    ) -> std::collections::HashMap<(String, i64), (Uuid, Option<chrono::NaiveDateTime>)>
-    {
-        sqlx::query_as::<_, (String, Option<i64>, Uuid, Option<chrono::NaiveDateTime>)>(
-            "SELECT CAST(kind AS TEXT), idx, id, refreshed_at FROM media WHERE parent_id = ? AND idx IS NOT NULL",
+    ) -> std::collections::HashMap<
+        (String, i64),
+        (
+            Uuid,
+            Option<chrono::NaiveDateTime>,
+            String,
+            Option<String>,
+            Option<chrono::NaiveDateTime>,
+            Option<i64>,
+        ),
+    > {
+        sqlx::query_as::<
+            _,
+            (
+                String,
+                Option<i64>,
+                Uuid,
+                Option<chrono::NaiveDateTime>,
+                String,
+                Option<String>,
+                Option<chrono::NaiveDateTime>,
+                Option<i64>,
+            ),
+        >(
+            "SELECT CAST(kind AS TEXT), idx, id, refreshed_at, title, description, released_at, runtime \
+             FROM media WHERE parent_id = ? AND idx IS NOT NULL",
         )
         .bind(parent_id)
         .fetch_all(db)
@@ -2448,7 +2500,9 @@ impl AddonService {
         .inspect_err(|e| error!(parent_id = %parent_id, error = %e, "child_uuid_map query failed"))
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(k, idx, id, refreshed_at)| idx.map(|i| ((k, i), (id, refreshed_at))))
+        .filter_map(|(k, idx, id, refreshed_at, title, description, released_at, runtime)| {
+            idx.map(|i| ((k, i), (id, refreshed_at, title, description, released_at, runtime)))
+        })
         .collect()
     }
 
@@ -2692,6 +2746,10 @@ impl AddonService {
                 Uuid,
                 Option<chrono::NaiveDateTime>,
                 Option<chrono::NaiveDateTime>,
+                String,
+                Option<String>,
+                Option<chrono::NaiveDateTime>,
+                Option<i64>,
             ),
         > = sqlx::query_as::<
             _,
@@ -2702,9 +2760,14 @@ impl AddonService {
                 Uuid,
                 Option<chrono::NaiveDateTime>,
                 Option<chrono::NaiveDateTime>,
+                String,
+                Option<String>,
+                Option<chrono::NaiveDateTime>,
+                Option<i64>,
             ),
         >(
-            "SELECT parent_id, CAST(kind AS TEXT), idx, id, refreshed_at, digital_released_at
+            "SELECT parent_id, CAST(kind AS TEXT), idx, id, refreshed_at, digital_released_at, \
+             title, description, released_at, runtime
              FROM media WHERE grandparent_id = ? AND idx IS NOT NULL",
         )
         .bind(actual_root_id)
@@ -2712,9 +2775,16 @@ impl AddonService {
         .await
         .unwrap_or_default()
         .into_iter()
-        .filter_map(|(pid, k, idx, id, refreshed_at, digital)| {
-            idx.map(|i| ((pid, k, i), (id, refreshed_at, digital)))
-        })
+        .filter_map(
+            |(pid, k, idx, id, refreshed_at, digital, title, description, released_at, runtime)| {
+                idx.map(|i| {
+                    (
+                        (pid, k, i),
+                        (id, refreshed_at, digital, title, description, released_at, runtime),
+                    )
+                })
+            },
+        )
         .collect();
 
         // Seasons/albums fan out concurrently — each one's own `refresh_meta`
@@ -2743,6 +2813,7 @@ impl AddonService {
                     // of it, so leaving it unset makes `child_refresh_force` below treat
                     // an already-refreshed child as brand new every single pass.
                     let mut existed_in_db = false;
+                    let mut fields_changed = false;
                     if let Some(idx) = child.idx {
                         let key = (
                             child
@@ -2750,10 +2821,24 @@ impl AddonService {
                                 .to_string(),
                             idx,
                         );
-                        if let Some(&(existing_id, existing_refreshed_at)) =
-                            existing_l1.get(&key)
+                        if let Some((
+                            existing_id,
+                            existing_refreshed_at,
+                            stored_title,
+                            stored_desc,
+                            stored_released_at,
+                            stored_runtime,
+                        )) = existing_l1.get(&key)
                         {
+                            let existing_id = *existing_id;
+                            let existing_refreshed_at = *existing_refreshed_at;
                             existed_in_db = true;
+                            fields_changed = stored_title != &child.title
+                                || (child.description.is_some()
+                                    && stored_desc != &child.description)
+                                || (child.released_at.is_some()
+                                    && stored_released_at != &child.released_at)
+                                || (child.runtime.is_some() && stored_runtime != &child.runtime);
                             child.refreshed_at = existing_refreshed_at;
                             if existing_id != child.id {
                                 // When the root was remapped, cascade any references to the new
@@ -2795,7 +2880,8 @@ impl AddonService {
                             warn!(id = %child.id, error = %e, "failed to refresh child meta");
                         }
                     }
-                    let needs_upsert = !existed_in_db || was_refreshed || root_was_remapped;
+                    let needs_upsert =
+                        !existed_in_db || was_refreshed || root_was_remapped || fields_changed;
                     (child, needs_upsert)
                 }
             })
@@ -2890,6 +2976,7 @@ impl AddonService {
                         // refreshed, refetching it on every single pass.
                         let mut stored_digital = None;
                         let mut existed_in_db = false;
+                        let mut fields_changed = false;
                         if let Some(idx) = gc.idx {
                             let key = (
                                 actual_child_id,
@@ -2897,16 +2984,26 @@ impl AddonService {
                                     .to_string(),
                                 idx,
                             );
-                            if let Some(&(
+                            if let Some((
                                 existing_id,
                                 existing_refreshed_at,
                                 existing_digital,
+                                stored_title,
+                                stored_desc,
+                                stored_released_at,
+                                stored_runtime,
                             )) = existing_l2.get(&key)
                             {
                                 existed_in_db = true;
-                                gc.id = existing_id;
-                                gc.refreshed_at = existing_refreshed_at;
-                                stored_digital = existing_digital;
+                                fields_changed = stored_title != &gc.title
+                                    || (gc.description.is_some()
+                                        && stored_desc != &gc.description)
+                                    || (gc.released_at.is_some()
+                                        && stored_released_at != &gc.released_at)
+                                    || (gc.runtime.is_some() && stored_runtime != &gc.runtime);
+                                gc.id = *existing_id;
+                                gc.refreshed_at = *existing_refreshed_at;
+                                stored_digital = *existing_digital;
                             }
                         }
 
@@ -2930,7 +3027,7 @@ impl AddonService {
                                 warn!(id = %gc.id, error = %e, "failed to refresh grandchild meta");
                             }
                         }
-                        if !existed_in_db || was_refreshed || root_was_remapped {
+                        if !existed_in_db || was_refreshed || root_was_remapped || fields_changed {
                             level2.push(gc);
                         }
                     }
