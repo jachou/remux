@@ -1960,6 +1960,19 @@ pub(crate) static ACTIVE_PROBES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(3));
+static RECENT_PREEMPTIVE_PROBES: std::sync::LazyLock<
+    dashmap::DashMap<Uuid, std::time::Instant>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+const PREEMPTIVE_PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn record_recent_preemptive_probe(item_id: Uuid) {
+    let now = std::time::Instant::now();
+    if RECENT_PREEMPTIVE_PROBES.len() > 512 {
+        RECENT_PREEMPTIVE_PROBES
+            .retain(|_, ts| now.saturating_duration_since(*ts) < std::time::Duration::from_secs(300));
+    }
+    RECENT_PREEMPTIVE_PROBES.insert(item_id, now);
+}
 
 /// If a preemptive probe is actively executing (holding a worker permit) for `item_id`,
 /// await its completion up to 3 seconds so foreground PlaybackInfo coalesces with it.
@@ -2008,6 +2021,14 @@ pub fn spawn_preemptive_probe_opts(
     if crate::stream::is_preemptive_probe_circuit_broken() {
         tracing::debug!(%item_id, "preemptive probe skipped: circuit breaker active due to upstream rate limit or outage");
         return;
+    }
+    if !force_refresh_liveness {
+        if let Some(last_ok) = RECENT_PREEMPTIVE_PROBES.get(&item_id) {
+            if last_ok.elapsed() < PREEMPTIVE_PROBE_COOLDOWN {
+                tracing::debug!(%item_id, "preemptive probe completed recently, skipping duplicate spawn");
+                return;
+            }
+        }
     }
     PREEMPTIVE_PROBES_DISPATCHED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if !QUEUED_PROBES.insert(item_id) {
@@ -2174,6 +2195,7 @@ pub fn spawn_preemptive_probe_opts(
                     };
                     let (_, is_alive) = tokio::join!(fast_start_fut, liveness_fut);
                     if is_alive {
+                        record_recent_preemptive_probe(item_id);
                         drop(active_guard);
                         prefetch_subtitles_for_media(&ctx, &media, Some(&primary), user_id).await;
                         return;
@@ -2188,6 +2210,7 @@ pub fn spawn_preemptive_probe_opts(
 
         match probe_result {
             Ok(Some(stream_id)) => {
+                record_recent_preemptive_probe(item_id);
                 tracing::info!(%item_id, %stream_id, "preemptive probe finished successfully");
                 let primary = service.streams.iter().find(|s| s.id == stream_id);
                 prefetch_subtitles_for_media(&ctx, &media, primary, user_id).await;
@@ -3457,6 +3480,36 @@ mod tests {
 
         super::QUEUED_PROBES.remove(&owner.id);
         assert!(!super::QUEUED_PROBES.contains(&owner.id));
+    }
+
+    #[tokio::test]
+    async fn spawn_preemptive_probe_respects_recent_cooldown_unless_forced() {
+        use crate::integration_test::{authenticated_server, seed_movie};
+        use std::sync::atomic::Ordering;
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let owner = seed_movie(ctx).await;
+
+        super::record_recent_preemptive_probe(owner.id);
+        let before = super::PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::Relaxed);
+        super::spawn_preemptive_probe(ctx, owner.id, None);
+        let after_unforced = super::PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::Relaxed);
+        assert_eq!(
+            before, after_unforced,
+            "Unforced preemptive probe within cooldown must be skipped"
+        );
+
+        // Forced liveness refresh at milestone must bypass the cooldown
+        assert!(super::QUEUED_PROBES.insert(owner.id));
+        super::spawn_preemptive_probe_opts(ctx, owner.id, None, true);
+        let after_forced = super::PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::Relaxed);
+        assert!(
+            after_forced > after_unforced,
+            "Forced preemptive probe must bypass recent cooldown"
+        );
+        super::QUEUED_PROBES.remove(&owner.id);
+        super::RECENT_PREEMPTIVE_PROBES.remove(&owner.id);
     }
 
     #[tokio::test]

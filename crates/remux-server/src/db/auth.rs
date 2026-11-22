@@ -253,6 +253,9 @@ impl Device {
             .bind(token)
             .execute(db)
             .await?;
+        if result.rows_affected() > 0 {
+            DEVICE_TOUCH_THROTTLE.clear();
+        }
         Ok(result.rows_affected() > 0)
     }
 
@@ -266,6 +269,7 @@ impl Device {
             .bind(user_id)
             .execute(db)
             .await?;
+        DEVICE_TOUCH_THROTTLE.remove(&(*user_id, device_id.to_string()));
         Ok(result.rows_affected() > 0)
     }
 
@@ -287,6 +291,9 @@ impl Device {
                 .execute(db)
                 .await?
         };
+        if result.rows_affected() > 0 {
+            DEVICE_TOUCH_THROTTLE.retain(|(uid, _), _| uid != user_id);
+        }
         Ok(result.rows_affected())
     }
 
@@ -328,8 +335,25 @@ impl Device {
     }
 
     /// Update last_activity_at to now and refresh runtime-identifying fields
-    /// (device name/client/version) when present.
+    /// (device name/client/version) when present. Throttled in-memory to once
+    /// per 60s per device unless identifying metadata or client IP changed,
+    /// avoiding redundant SQLite write transactions on bursty API calls.
     pub async fn touch(&self, db: &SqlitePool, remote_ip: Option<&str>) -> Result<()> {
+        let key = (self.user_id, self.id.clone());
+        let now = std::time::Instant::now();
+        if let Some(prev) = DEVICE_TOUCH_THROTTLE.get(&key) {
+            let ip_unchanged =
+                remote_ip.is_none() || prev.remote_ip.as_deref() == remote_ip;
+            if now.saturating_duration_since(prev.touched_at) < DEVICE_TOUCH_INTERVAL
+                && ip_unchanged
+                && prev.name == self.name
+                && prev.app_name == self.app_name
+                && prev.app_version == self.app_version
+            {
+                return Ok(());
+            }
+        }
+
         sqlx::query(
             "UPDATE devices SET last_activity_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now'), \
              remote_ip = COALESCE(?, remote_ip), \
@@ -346,6 +370,20 @@ impl Device {
         .bind(self.user_id)
         .execute(db)
         .await?;
+
+        let merged_ip = remote_ip
+            .map(str::to_string)
+            .or_else(|| self.remote_ip.clone());
+        DEVICE_TOUCH_THROTTLE.insert(
+            key,
+            DeviceTouchState {
+                touched_at: now,
+                remote_ip: merged_ip,
+                name: self.name.clone(),
+                app_name: self.app_name.clone(),
+                app_version: self.app_version.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -451,6 +489,19 @@ impl Device {
     }
 }
 
+struct DeviceTouchState {
+    touched_at: std::time::Instant,
+    remote_ip: Option<String>,
+    name: String,
+    app_name: String,
+    app_version: String,
+}
+
+static DEVICE_TOUCH_THROTTLE: std::sync::LazyLock<
+    dashmap::DashMap<(Uuid, String), DeviceTouchState>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+const DEVICE_TOUCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[derive(Clone)]
 pub struct AuthSession {
     pub device: Device,
@@ -465,6 +516,9 @@ impl FromRequestParts<AppState> for AuthSession {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        if let Some(cached) = parts.extensions.get::<AuthSession>() {
+            return Ok(cached.clone());
+        }
         let jfauth = JellyfinAuthHeader::from_request_parts(parts, state).await?;
         let token = jfauth
             .token
@@ -535,7 +589,9 @@ impl FromRequestParts<AppState> for AuthSession {
                 user.username
                     .as_str(),
             );
-            return Ok(AuthSession { device, user });
+            let session = AuthSession { device, user };
+            parts.extensions.insert(session.clone());
+            return Ok(session);
         }
 
         // Fall back to the api_keys table. API keys are admin-scoped tokens.
@@ -586,10 +642,12 @@ impl FromRequestParts<AppState> for AuthSession {
             user.username
                 .as_str(),
         );
-        Ok(AuthSession {
+        let session = AuthSession {
             device: synthetic_device,
             user,
-        })
+        };
+        parts.extensions.insert(session.clone());
+        Ok(session)
     }
 }
 
@@ -1004,5 +1062,47 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn device_touch_throttles_unchanged_and_flushes_on_metadata_change() {
+        let db = test_db().await;
+        let uid = Uuid::new_v4();
+        let mut dev = Device {
+            id: Uuid::new_v4().to_string(),
+            access_token: "token-touch".to_string().into(),
+            user_id: uid,
+            name: "Apple TV".to_string(),
+            app_name: "Infuse".to_string(),
+            app_version: "8.0".to_string(),
+            ..Default::default()
+        };
+        dev.save(&db).await.unwrap();
+
+        dev.touch(&db, Some("192.168.1.10")).await.unwrap();
+        let total_changes_1: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+
+        // Immediate repeat with identical metadata/IP must skip the DB write
+        dev.touch(&db, Some("192.168.1.10")).await.unwrap();
+        let total_changes_2: i64 = sqlx::query_scalar("SELECT total_changes()")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        assert_eq!(total_changes_1, total_changes_2);
+
+        // Changing app_version must bypass the throttle and write immediately
+        dev.app_version = "8.1".to_string();
+        dev.touch(&db, Some("192.168.1.10")).await.unwrap();
+        let version_in_db: String =
+            sqlx::query_scalar("SELECT app_version FROM devices WHERE id = ? AND user_id = ?")
+                .bind(&dev.id)
+                .bind(uid)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(version_in_db, "8.1");
     }
 }

@@ -967,6 +967,32 @@ where
 /// `otlp_endpoint`: when set (e.g. `http://jaeger-collector:4317`), tracing spans are
 /// also exported via OTLP — see `Config::otlp_endpoint`. Gated by the same
 /// `RUST_LOG`/`EnvFilter` as normal log output, so raising the level to see
+#[derive(Default)]
+struct FileLogFields(fmt::format::DefaultFields);
+
+impl<'writer> fmt::FormatFields<'writer> for FileLogFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
+}
+
+#[derive(Default)]
+struct RefreshSpanLogFields(fmt::format::DefaultFields);
+
+impl<'writer> fmt::FormatFields<'writer> for RefreshSpanLogFields {
+    fn format_fields<R: tracing_subscriber::field::RecordFields>(
+        &self,
+        writer: fmt::format::Writer<'writer>,
+        fields: R,
+    ) -> std::fmt::Result {
+        self.0.format_fields(writer, fields)
+    }
+}
+
 /// more logs also sends more spans. File logging is best-effort: an unavailable
 /// directory or rolling appender leaves stdout logging active.
 pub fn setup_logging(
@@ -999,6 +1025,7 @@ pub fn setup_logging(
         match appender {
             Ok(appender) => Some(
                 fmt::layer()
+                    .fmt_fields(FileLogFields::default())
                     .with_ansi(false)
                     // Daily rolling filenames are UTC; explicit UTC timestamps keep
                     // entries immediately after midnight on the matching date.
@@ -1025,6 +1052,7 @@ pub fn setup_logging(
     // start emitting close events too, at whatever level it happens to be
     // instrumented at (often its default of INFO).
     let refresh_span_layer = fmt::layer()
+        .fmt_fields(RefreshSpanLogFields::default())
         .with_timer(fmt::time::ChronoLocal::new("%H:%M:%S".to_string()))
         .with_target(true)
         .with_line_number(true)

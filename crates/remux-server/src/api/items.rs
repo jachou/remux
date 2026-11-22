@@ -1038,6 +1038,8 @@ pub async fn items_flat(
     // Jellyfin ignores the MediaTypes query parameter for this request.
     // Without this, supplying a value (e.g. Video) would exclude Series collections.
     q.media_types = None;
+    // /items/latest returns a bare JSON array without TotalRecordCount, so skip COUNT(*).
+    q.enable_total_record_count = Some(false);
     let client = session
         .device
         .jellyfin_client();

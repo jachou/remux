@@ -12090,6 +12090,36 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn date_created_sort_with_kind_uses_composite_index_not_full_sort() {
+        let db = crate::db::connect("sqlite::memory:", 10_000)
+            .await
+            .unwrap();
+        crate::db::migrate(&db)
+            .await
+            .unwrap();
+        let sql = format!(
+            "EXPLAIN QUERY PLAN SELECT * FROM media WHERE 1=1 AND kind IN ('episode') \
+             ORDER BY {DATE_CREATED_ORDER_EXPR} DESC LIMIT 50"
+        );
+        let plan = sqlx::query(&sql)
+            .fetch_all(&db)
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.get::<String, _>(3))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains("idx_media_kind_created_at_sort"),
+            "Kind-scoped DateCreated sort must use idx_media_kind_created_at_sort; plan: {plan}"
+        );
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "Kind-scoped DateCreated sort must not sort all matching rows; plan: {plan}"
+        );
+    }
+
     /// DateCreated DESC through get_by_filter returns newest first across kinds,
     /// honours LIMIT, and treats mixed fractional-second precision correctly.
     /// Dates are in the future so they sort above the seeded default rows.
@@ -15235,6 +15265,7 @@ mod played_filter_plan_tests {
             "2458 2001 1",
         ),
         ("media", "idx_media_created_at_sort", "1933995 401"),
+        ("media", "idx_media_kind_created_at_sort", "1933995 401 401"),
         ("media", "idx_media_kind_released_at", "1933995 401 36"),
         ("media", "idx_media_ext_stremio_id", "0 0"),
         ("media", "idx_media_ext_kitsu", "0 0"),
