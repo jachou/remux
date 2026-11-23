@@ -367,11 +367,13 @@ async fn refresh_cached_resume_and_head(
         return false;
     };
 
-    // Attach item_id if previously missing (e.g. from probe)
-    if entry.item_id.is_none() && item_id.is_some() {
-        let mut updated = entry.clone();
-        updated.item_id = item_id;
-        FAST_START_CACHE.insert(original_url.to_string(), updated);
+    // Attach or normalize item_id if previously missing or tagged with a child stream UUID
+    if let Some(id) = item_id {
+        if entry.item_id != Some(id) {
+            let mut updated = entry.clone();
+            updated.item_id = Some(id);
+            FAST_START_CACHE.insert(original_url.to_string(), updated);
+        }
     }
 
     if let Some(pos_secs) = resume_position_secs {
@@ -503,8 +505,10 @@ async fn refresh_cached_resume_and_head(
                                 if let Ok(b) = resp.bytes().await {
                                     let resume_size_bytes = b.len();
                                     if let Some(mut updated) = FAST_START_CACHE.get(original_url) {
-                                        if updated.item_id.is_none() && item_id.is_some() {
-                                            updated.item_id = item_id;
+                                        if let Some(id) = item_id {
+                                            if updated.item_id != Some(id) {
+                                                updated.item_id = Some(id);
+                                            }
                                         }
                                         updated.resume_buffer = Some((start_byte, b));
                                         FAST_START_CACHE.insert(original_url.to_string(), updated);
@@ -962,6 +966,8 @@ pub async fn prewarm_fast_start(
         has_error: AtomicBool::new(false),
     });
     IN_FLIGHT_PREWARMS.insert(original_url.to_string(), in_flight.clone());
+    // Wake any playback requests waiting for this active pre-warm to register its in-flight buffer
+    notify_guard.notify_waiters();
 
     struct InFlightGuard<'a>(&'a str);
     impl<'a> Drop for InFlightGuard<'a> {
@@ -1792,9 +1798,54 @@ pub async fn handle_playback_request(
             }
         }
 
-        // If not yet in IN_FLIGHT_PREWARMS but PREWARM_LOCKS is held, poll briefly (up to 500ms) for registration
-        if PREWARM_LOCKS.contains_key(&url.to_string()) {
-            for _ in 0..10 {
+        // If not yet in IN_FLIGHT_PREWARMS but PREWARM_LOCKS is actively held (e.g. awaiting upstream
+        // resolver redirect headers), wait via ACTIVE_PREWARM_NOTIFY up to 2.5s so cold starts attach
+        // cleanly to the in-flight RAM stream instead of bailing out at 500ms and double-hitting upstream.
+        let url_key = url.to_string();
+        if PREWARM_LOCKS.contains_key(&url_key) {
+            let deadline = Instant::now() + Duration::from_millis(2500);
+            loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                if let Some(notify) = get_active_prewarm_notify(url) {
+                    let notified = notify.notified();
+                    tokio::pin!(notified);
+                    // Re-check caches AFTER pinning `notified` to prevent lost wakeups
+                    if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+                        if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
+                            return Some(resp);
+                        }
+                        break;
+                    }
+                    if let Some(e) = FAST_START_CACHE.get(url) {
+                        entry = Some(e);
+                        break;
+                    }
+                    if !PREWARM_LOCKS.contains_key(&url_key) {
+                        break;
+                    }
+                    let _ = tokio::time::timeout(remaining, &mut notified).await;
+                } else {
+                    if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+                        if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
+                            return Some(resp);
+                        }
+                        break;
+                    }
+                    if let Some(e) = FAST_START_CACHE.get(url) {
+                        entry = Some(e);
+                        break;
+                    }
+                    if !PREWARM_LOCKS.contains_key(&url_key) {
+                        break;
+                    }
+                    tokio::time::sleep(remaining.min(Duration::from_millis(25))).await;
+                }
+            }
+            // Final check in case registration/completion happened right as the wait ended
+            if entry.is_none() {
                 if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
                     if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
                         return Some(resp);
@@ -1802,9 +1853,7 @@ pub async fn handle_playback_request(
                 }
                 if let Some(e) = FAST_START_CACHE.get(url) {
                     entry = Some(e);
-                    break;
                 }
-                tokio::time::sleep(Duration::from_millis(50)).await;
             }
         }
 
@@ -3177,5 +3226,130 @@ mod tests {
             resp_rd.headers().get("X-Remux-FastStart").unwrap(),
             "remote-direct-resolver"
         );
+    }
+
+    #[tokio::test]
+    async fn normalizes_item_id_for_freshness_and_purge_and_waits_for_slow_prewarm_headers() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+
+        // 1. Entry initially tagged with a child stream UUID gets normalized to episode UUID
+        let stream_uuid = Uuid::new_v4();
+        let episode_uuid = Uuid::new_v4();
+        let cached_url = format!("https://meteor.example.com/play/{}.mkv", episode_uuid);
+        FAST_START_CACHE.insert(
+            cached_url.clone(),
+            FastStartEntry {
+                item_id: Some(stream_uuid),
+                original_url: cached_url.clone(),
+                direct_cdn_url: "https://nexus.erth.tb-cdn.earth/dld/test-ticket".to_string(),
+                head_bytes: Bytes::from(vec![0x11; 4096]),
+                tail_bytes: None,
+                resume_buffer: Some((1_000_000, Bytes::from(vec![0x22; 4096]))),
+                total_size: 4_000_000_000,
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+        assert!(!is_item_cached_and_fresh(episode_uuid, Duration::from_secs(1800)));
+
+        // Re-invoking prewarm with the episode UUID normalizes item_id in-place
+        assert!(
+            prewarm_fast_start(
+                Some(episode_uuid),
+                &cached_url,
+                &HashMap::new(),
+                PrewarmPriority::Low,
+                None,
+                None,
+            )
+            .await
+        );
+        assert!(is_item_cached_and_fresh(episode_uuid, Duration::from_secs(1800)));
+        purge_resume_buffer_for_item(episode_uuid);
+        assert!(
+            FAST_START_CACHE.get(&cached_url).unwrap().resume_buffer.is_none(),
+            "resume buffer must be purged using the episode UUID"
+        );
+        FAST_START_CACHE.invalidate(&cached_url);
+
+        // 2. Slow upstream resolver (>500ms before headers) must wake concurrent remote playback via ACTIVE_PREWARM_NOTIFY
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let total_size: usize = 3 * 1024 * 1024;
+        let payload = Bytes::from(vec![0xAB; total_size]);
+        let payload_clone = payload.clone();
+        let app = axum::Router::new().route(
+            "/slow-resolve.mkv",
+            axum::routing::get(move |headers: HeaderMap| {
+                let data = payload_clone.clone();
+                async move {
+                    let range = headers
+                        .get(header::RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("bytes=0-1048575");
+                    if range.starts_with("bytes=0-") {
+                        // Simulate slow StremThru redirect resolution (750ms > old 500ms poll timeout)
+                        tokio::time::sleep(Duration::from_millis(750)).await;
+                    }
+                    let (start, end) = parse_range_bounds(range, data.len() as u64)
+                        .unwrap_or((0, (data.len() - 1) as u64));
+                    let slice = data.slice(start as usize..=end as usize);
+                    Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(header::CONTENT_TYPE, "video/x-matroska")
+                        .header(
+                            header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}", start, end, data.len()),
+                        )
+                        .header(header::CONTENT_LENGTH, slice.len().to_string())
+                        .body(Body::from(slice))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let slow_url = format!("http://{}/slow-resolve.mkv", addr);
+        let slow_item_id = Uuid::new_v4();
+        let prewarm_url = slow_url.clone();
+        let prewarm_task = tokio::spawn(async move {
+            prewarm_fast_start(
+                Some(slow_item_id),
+                &prewarm_url,
+                &HashMap::new(),
+                PrewarmPriority::Low,
+                Some(2 * 1024 * 1024),
+                None,
+            )
+            .await
+        });
+
+        // Wait briefly so prewarm_fast_start has acquired PREWARM_LOCKS and is awaiting upstream headers
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let mut remote_headers = HeaderMap::new();
+        remote_headers.insert("cf-connecting-ip", HeaderValue::from_static("97.126.3.115"));
+        remote_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-65535"));
+
+        let resp = handle_playback_request(slow_item_id, &slow_url, &remote_headers, None)
+            .await
+            .expect("should attach to in-flight prewarm once headers arrive");
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        let fs_hdr = resp
+            .headers()
+            .get("X-Remux-FastStart")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            fs_hdr == "hit-head-inflight" || fs_hdr == "hit-head",
+            "expected RAM hit instead of premature 307, got {fs_hdr}"
+        );
+
+        assert!(prewarm_task.await.unwrap());
+        FAST_START_CACHE.invalidate(&slow_url);
+        server.abort();
     }
 }

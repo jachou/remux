@@ -1498,7 +1498,7 @@ async fn check_liveness_with_fallback(
                 if !crate::stream::STREAM_LIVENESS_CACHE.contains_key(url) && crate::fast_start::get_active_prewarm_notify(url).is_none() {
                     let url_c = url.clone();
                     let hdrs_c = request_headers.clone();
-                    let item_id = stream.id;
+                    let item_id = stream.parent_id.unwrap_or(stream.id);
                     let head_sz = stream.stream_info.as_ref().map(|si| {
                         crate::fast_start::calculate_fast_start_head_size(&url_c, si.size.map(|s| s as u64), None)
                     });
