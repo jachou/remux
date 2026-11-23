@@ -1686,6 +1686,34 @@ fn is_ip_locked_cdn_url(cdn_url: &str) -> bool {
         || h.ends_with(".alldebrid.com")
 }
 
+fn build_remote_direct_handoff(
+    item_id: Uuid,
+    original_url: &str,
+    direct_cdn_url: &str,
+    token_expired: bool,
+    range_header: Option<&str>,
+) -> Response {
+    METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+    let must_use_resolver = token_expired || is_ip_locked_cdn_url(direct_cdn_url);
+    let (target_url, tag) = if must_use_resolver {
+        (original_url, "remote-direct-resolver")
+    } else {
+        (direct_cdn_url, "redirect-direct-cdn")
+    };
+    info!(
+        %item_id,
+        range = range_header.unwrap_or("none"),
+        target = %target_url,
+        token_expired,
+        "[FAST-START] Remote client fast handoff: bypassing local RAM upload and issuing 307 to CDN"
+    );
+    let mut redirect = Redirect::temporary(target_url).into_response();
+    redirect
+        .headers_mut()
+        .insert("X-Remux-FastStart", HeaderValue::from_static(tag));
+    redirect
+}
+
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///
@@ -1697,6 +1725,7 @@ pub async fn handle_playback_request(
     upstream_headers: Option<&HashMap<String, String>>,
 ) -> Option<Response> {
     let is_remote = is_remote_client(headers);
+    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
 
     if is_force_direct_307() {
         if let Some(entry) = FAST_START_CACHE.get(url) {
@@ -1790,9 +1819,19 @@ pub async fn handle_playback_request(
     // 1. Direct lookup by exact URL to avoid stream hijacking if the user selected a different version/source
     let mut entry = FAST_START_CACHE.get(url);
 
-    // 2. If not cached, check if stream is currently in-flight to stream chunks in real-time
+    // 2. If not cached, check if stream is currently in-flight to stream chunks in real-time (LAN)
+    //    or hand off immediately to the resolved CDN edge (Remote).
     if entry.is_none() {
         if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+            if is_remote {
+                return Some(build_remote_direct_handoff(
+                    item_id,
+                    url,
+                    &in_flight.direct_cdn_url,
+                    false,
+                    range_header,
+                ));
+            }
             if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
                 return Some(resp);
             }
@@ -1800,7 +1839,7 @@ pub async fn handle_playback_request(
 
         // If not yet in IN_FLIGHT_PREWARMS but PREWARM_LOCKS is actively held (e.g. awaiting upstream
         // resolver redirect headers), wait via ACTIVE_PREWARM_NOTIFY up to 2.5s so cold starts attach
-        // cleanly to the in-flight RAM stream instead of bailing out at 500ms and double-hitting upstream.
+        // cleanly to the resolved CDN / in-flight RAM stream instead of bailing out at 500ms.
         let url_key = url.to_string();
         if PREWARM_LOCKS.contains_key(&url_key) {
             let deadline = Instant::now() + Duration::from_millis(2500);
@@ -1814,6 +1853,15 @@ pub async fn handle_playback_request(
                     tokio::pin!(notified);
                     // Re-check caches AFTER pinning `notified` to prevent lost wakeups
                     if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+                        if is_remote {
+                            return Some(build_remote_direct_handoff(
+                                item_id,
+                                url,
+                                &in_flight.direct_cdn_url,
+                                false,
+                                range_header,
+                            ));
+                        }
                         if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
                             return Some(resp);
                         }
@@ -1829,6 +1877,15 @@ pub async fn handle_playback_request(
                     let _ = tokio::time::timeout(remaining, &mut notified).await;
                 } else {
                     if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+                        if is_remote {
+                            return Some(build_remote_direct_handoff(
+                                item_id,
+                                url,
+                                &in_flight.direct_cdn_url,
+                                false,
+                                range_header,
+                            ));
+                        }
                         if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
                             return Some(resp);
                         }
@@ -1847,6 +1904,15 @@ pub async fn handle_playback_request(
             // Final check in case registration/completion happened right as the wait ended
             if entry.is_none() {
                 if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+                    if is_remote {
+                        return Some(build_remote_direct_handoff(
+                            item_id,
+                            url,
+                            &in_flight.direct_cdn_url,
+                            false,
+                            range_header,
+                        ));
+                    }
                     if let Some(resp) = serve_from_in_flight(item_id, in_flight.value(), headers).await {
                         return Some(resp);
                     }
@@ -1898,7 +1964,19 @@ pub async fn handle_playback_request(
         return None;
     }
 
-    let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    // Remote WAN clients (e.g. via Cloudflare Tunnel) bypass home ISP upload & tunnel throttling
+    // by jumping directly to the pre-resolved Debrid CDN edge from byte 0 (for head, tail, and resume),
+    // while LAN clients continue streaming head/resume buffers at Gigabit LAN speeds from RAM.
+    if is_remote {
+        let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
+        return Some(build_remote_direct_handoff(
+            item_id,
+            url,
+            &entry.direct_cdn_url,
+            token_expired,
+            range_header,
+        ));
+    }
 
     match range_header {
         // Case 1: Initial probe / head sub-range request (any Range starting inside the cached head buffer)
@@ -3162,15 +3240,12 @@ mod tests {
             },
         );
 
-        // Simulate remote / Cloudflare Tunnel client headers
-        let mut remote_headers = HeaderMap::new();
-        remote_headers.insert("cf-connecting-ip", HeaderValue::from_static("97.126.3.115"));
-        remote_headers.insert(header::RANGE, HeaderValue::from_static("bytes=1000000000-"));
-
-        // 1. Open-ended resume request must be chunked to 16 MB (not all 36 MB!)
-        let resp1 = handle_playback_request(Uuid::nil(), resolver_url, &remote_headers, None)
+        // 1. LAN client open-ended resume request must be chunked to 16 MB (not all 36 MB!)
+        let mut lan_headers = HeaderMap::new();
+        lan_headers.insert(header::RANGE, HeaderValue::from_static("bytes=1000000000-"));
+        let resp1 = handle_playback_request(Uuid::nil(), resolver_url, &lan_headers, None)
             .await
-            .expect("should hit resume buffer");
+            .expect("LAN client should hit resume buffer");
         assert_eq!(resp1.status(), StatusCode::PARTIAL_CONTENT);
         assert_eq!(
             resp1.headers().get(header::CONTENT_LENGTH).unwrap(),
@@ -3181,13 +3256,31 @@ mod tests {
             "bytes 1000000000-1016777215/8000000000"
         );
 
-        // 2. Request past buffer on remote client with TorBox CDN must 307 directly to tb-cdn.earth!
+        // 2. Remote client (Cloudflare Tunnel) bypasses RAM upload from byte 0 AND on resume,
+        //    redirecting 307 straight to pre-resolved tb-cdn.earth!
+        let mut remote_head_headers = HeaderMap::new();
+        remote_head_headers.insert("cf-connecting-ip", HeaderValue::from_static("97.126.3.115"));
+        remote_head_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+        let resp_remote_head =
+            handle_playback_request(Uuid::nil(), resolver_url, &remote_head_headers, None)
+                .await
+                .expect("remote head should 307 straight to TorBox CDN");
+        assert_eq!(resp_remote_head.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp_remote_head.headers().get(header::LOCATION).unwrap(),
+            torbox_cdn
+        );
+        assert_eq!(
+            resp_remote_head.headers().get("X-Remux-FastStart").unwrap(),
+            "redirect-direct-cdn"
+        );
+
         let mut handoff_headers = HeaderMap::new();
         handoff_headers.insert("cf-connecting-ip", HeaderValue::from_static("97.126.3.115"));
-        handoff_headers.insert(header::RANGE, HeaderValue::from_static("bytes=2000000000-"));
+        handoff_headers.insert(header::RANGE, HeaderValue::from_static("bytes=1000000000-"));
         let resp_tb = handle_playback_request(Uuid::nil(), resolver_url, &handoff_headers, None)
             .await
-            .expect("should redirect directly to TorBox CDN");
+            .expect("remote resume should redirect directly to TorBox CDN");
         assert_eq!(resp_tb.status(), StatusCode::TEMPORARY_REDIRECT);
         assert_eq!(
             resp_tb.headers().get(header::LOCATION).unwrap(),
@@ -3330,22 +3423,35 @@ mod tests {
         // Wait briefly so prewarm_fast_start has acquired PREWARM_LOCKS and is awaiting upstream headers
         tokio::time::sleep(Duration::from_millis(80)).await;
 
+        let mut lan_headers = HeaderMap::new();
+        lan_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-65535"));
+
         let mut remote_headers = HeaderMap::new();
         remote_headers.insert("cf-connecting-ip", HeaderValue::from_static("97.126.3.115"));
         remote_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-65535"));
 
-        let resp = handle_playback_request(slow_item_id, &slow_url, &remote_headers, None)
-            .await
-            .expect("should attach to in-flight prewarm once headers arrive");
-        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
-        let fs_hdr = resp
+        let (lan_resp, remote_resp) = tokio::join!(
+            handle_playback_request(slow_item_id, &slow_url, &lan_headers, None),
+            handle_playback_request(slow_item_id, &slow_url, &remote_headers, None),
+        );
+
+        let lan_resp = lan_resp.expect("LAN should attach to in-flight prewarm once headers arrive");
+        assert_eq!(lan_resp.status(), StatusCode::PARTIAL_CONTENT);
+        let fs_hdr = lan_resp
             .headers()
             .get("X-Remux-FastStart")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         assert!(
             fs_hdr == "hit-head-inflight" || fs_hdr == "hit-head",
-            "expected RAM hit instead of premature 307, got {fs_hdr}"
+            "expected LAN RAM hit instead of premature 307, got {fs_hdr}"
+        );
+
+        let remote_resp = remote_resp.expect("Remote should wait for active prewarm headers then 307 straight to resolved CDN");
+        assert_eq!(remote_resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            remote_resp.headers().get("X-Remux-FastStart").unwrap(),
+            "redirect-direct-cdn"
         );
 
         assert!(prewarm_task.await.unwrap());
