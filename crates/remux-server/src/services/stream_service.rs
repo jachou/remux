@@ -2147,57 +2147,67 @@ pub fn spawn_preemptive_probe_opts(
                             }
                             None
                         });
-                    let fast_start_fut = async {
-                        if let Some(si) = &primary.stream_info {
-                            if !si.descriptor.is_known_dead() {
-                                if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                                    let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
-                                    let resume_pos = crate::fast_start::lookup_resume_position(&ctx.db, user_id, Some(item_id)).await;
+                    if let Some(si) = &primary.stream_info {
+                        if !si.descriptor.is_known_dead() {
+                            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                                let url_clone = url.clone();
+                                let headers_clone = request_headers.clone();
+                                let db_pool = ctx.db.clone();
+                                let size_opt = si.size.map(|s| s as u64);
+                                let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
+                                tokio::spawn(async move {
+                                    let _prewarm_notify_guard = prewarm_notify_guard;
+                                    let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
                                     let head_size = if resume_pos.is_some() {
                                         crate::fast_start::calculate_fast_start_resume_head_size(
-                                            url,
-                                            si.size.map(|s| s as u64),
+                                            &url_clone,
+                                            size_opt,
                                             Some(is_4k),
                                         )
                                     } else {
                                         crate::fast_start::calculate_fast_start_head_size(
-                                            url,
-                                            si.size.map(|s| s as u64),
+                                            &url_clone,
+                                            size_opt,
                                             Some(is_4k),
                                         )
                                     };
                                     crate::fast_start::prewarm_fast_start(
                                         Some(item_id),
-                                        url,
-                                        request_headers,
+                                        &url_clone,
+                                        &headers_clone,
                                         crate::fast_start::PrewarmPriority::Low,
                                         Some(head_size),
                                         resume_pos,
                                     )
                                     .await;
-                                }
-                            }
-                        }
-                        drop(prewarm_notify_guard);
-                    };
-                    let liveness_fut = async {
-                        if let Some(si) = &primary.stream_info {
-                            if force_refresh_liveness || si.descriptor.is_liveness_expiring_soon() {
-                                if force_refresh_liveness {
-                                    tracing::info!(%item_id, "force-refreshing liveness token in background at milestone");
-                                }
-                                si.descriptor.refresh_liveness().await
+                                });
                             } else {
-                                si.descriptor.is_alive().await
+                                drop(prewarm_notify_guard);
                             }
                         } else {
-                            true
+                            drop(prewarm_notify_guard);
                         }
+                    } else {
+                        drop(prewarm_notify_guard);
+                    }
+                    let is_alive = if let Some(si) = &primary.stream_info {
+                        if force_refresh_liveness || si.descriptor.is_liveness_expiring_soon() {
+                            if force_refresh_liveness {
+                                tracing::info!(%item_id, "force-refreshing liveness token in background at milestone");
+                            }
+                            si.descriptor.refresh_liveness().await
+                        } else {
+                            si.descriptor.is_alive().await
+                        }
+                    } else {
+                        true
                     };
-                    let (_, is_alive) = tokio::join!(fast_start_fut, liveness_fut);
                     if is_alive {
                         record_recent_preemptive_probe(item_id);
+                        // Drop active_guard & semaphore permit as soon as liveness is confirmed so
+                        // foreground PlaybackInfo never stalls waiting on 64-175MB RAM downloads.
                         drop(active_guard);
+                        drop(_permit);
                         prefetch_subtitles_for_media(&ctx, &media, Some(&primary), user_id).await;
                         return;
                     }
@@ -2206,8 +2216,9 @@ pub fn spawn_preemptive_probe_opts(
         }
 
         let probe_result = service.probe_primary_candidate().await;
-        // Drop active guard immediately so foreground PlaybackInfo unblocks without waiting for subtitle prefetch
+        // Drop active guard and semaphore permit immediately so foreground PlaybackInfo and queued probes unblock
         drop(active_guard);
+        drop(_permit);
 
         match probe_result {
             Ok(Some(stream_id)) => {

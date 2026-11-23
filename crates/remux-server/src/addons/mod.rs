@@ -3243,6 +3243,13 @@ impl AddonService {
         const SUBTITLE_ADDON_TIMEOUT: Duration = Duration::from_secs(5);
         static SUBTITLE_LOCKS: KeyedLock<String> = KeyedLock::new();
 
+        if !self.inner.load().iter().any(|r| {
+            r.row.resources.contains(&ResourceType::Subtitles)
+                && (r.subtitle.is_some() || r.caps.manifest_unreachable)
+        }) {
+            return Vec::new();
+        }
+
         if media.kind == db::MediaKind::Episode {
             media
                 .grandparent(&ctx.db)
