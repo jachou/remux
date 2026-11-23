@@ -1661,6 +1661,25 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// Returns true when a resolved Debrid CDN URL locks download tokens to the requesting IP
+/// (e.g. Real-Debrid / AllDebrid), requiring remote WAN clients to hit the upstream resolver
+/// URL so a token is minted for their IP. Token-authenticated CDNs like TorBox (`tb-cdn.earth`)
+/// are not IP-locked and can use the cached `direct_cdn_url` directly.
+fn is_ip_locked_cdn_url(cdn_url: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(cdn_url) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let h = host.to_ascii_lowercase();
+    h.ends_with(".download.real-debrid.com")
+        || h.ends_with(".real-debrid.com")
+        || h.ends_with(".rdeb.io")
+        || h.ends_with(".debrid.it")
+        || h.ends_with(".alldebrid.com")
+}
+
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///
@@ -1674,6 +1693,26 @@ pub async fn handle_playback_request(
     let is_remote = is_remote_client(headers);
 
     if is_force_direct_307() {
+        if let Some(entry) = FAST_START_CACHE.get(url) {
+            let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
+            let must_use_resolver =
+                token_expired || (is_remote && is_ip_locked_cdn_url(&entry.direct_cdn_url));
+            if !must_use_resolver {
+                METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
+                info!(
+                    %item_id,
+                    direct_cdn = %entry.direct_cdn_url,
+                    is_remote,
+                    "[FAST-START] FORCE_DIRECT_307=true: immediately issuing 307 directly to Debrid CDN from byte 0"
+                );
+                let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
+                redirect.headers_mut().insert(
+                    "X-Remux-FastStart",
+                    HeaderValue::from_static("force-direct-307"),
+                );
+                return Some(redirect);
+            }
+        }
         if is_remote {
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             info!(
@@ -1685,20 +1724,6 @@ pub async fn handle_playback_request(
             redirect.headers_mut().insert(
                 "X-Remux-FastStart",
                 HeaderValue::from_static("remote-direct-resolver"),
-            );
-            return Some(redirect);
-        }
-        if let Some(entry) = FAST_START_CACHE.get(url) {
-            METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
-            info!(
-                %item_id,
-                direct_cdn = %entry.direct_cdn_url,
-                "[FAST-START] FORCE_DIRECT_307=true: immediately issuing 307 directly to Debrid CDN from byte 0"
-            );
-            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
-            redirect.headers_mut().insert(
-                "X-Remux-FastStart",
-                HeaderValue::from_static("force-direct-307"),
             );
             return Some(redirect);
         }
@@ -1722,24 +1747,30 @@ pub async fn handle_playback_request(
     }
 
     if is_browser_video_request(headers) {
+        if let Some(entry) = FAST_START_CACHE.get(url) {
+            let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
+            let must_use_resolver =
+                token_expired || (is_remote && is_ip_locked_cdn_url(&entry.direct_cdn_url));
+            if !must_use_resolver {
+                info!(
+                    %item_id,
+                    direct_cdn = %entry.direct_cdn_url,
+                    is_remote,
+                    "[FAST-START] Browser <video> request detected; issuing consistent 307 to direct CDN from byte 0"
+                );
+                let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
+                redirect.headers_mut().insert(
+                    "X-Remux-FastStart",
+                    HeaderValue::from_static("browser-direct-cdn"),
+                );
+                return Some(redirect);
+            }
+        }
         if is_remote {
             let mut redirect = Redirect::temporary(url).into_response();
             redirect.headers_mut().insert(
                 "X-Remux-FastStart",
                 HeaderValue::from_static("remote-direct-resolver-browser"),
-            );
-            return Some(redirect);
-        }
-        if let Some(entry) = FAST_START_CACHE.get(url) {
-            info!(
-                %item_id,
-                direct_cdn = %entry.direct_cdn_url,
-                "[FAST-START] Browser <video> request detected; issuing consistent 307 to direct CDN from byte 0"
-            );
-            let mut redirect = Redirect::temporary(&entry.direct_cdn_url).into_response();
-            redirect.headers_mut().insert(
-                "X-Remux-FastStart",
-                HeaderValue::from_static("browser-direct-cdn"),
             );
             return Some(redirect);
         }
@@ -1953,7 +1984,9 @@ pub async fn handle_playback_request(
             // Fall through to direct redirect if tail is missing or sub-range not covered
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
-            let redirect_target = if is_remote || token_expired { url } else { &entry.direct_cdn_url };
+            let must_use_resolver =
+                token_expired || (is_remote && is_ip_locked_cdn_url(&entry.direct_cdn_url));
+            let redirect_target = if must_use_resolver { url } else { &entry.direct_cdn_url };
             info!(
                 %item_id,
                 range = %rng,
@@ -1963,7 +1996,7 @@ pub async fn handle_playback_request(
                 "[FAST-START] Redirecting tail request (307)"
             );
             let mut redirect = Redirect::temporary(redirect_target).into_response();
-            let header_tag = if is_remote || token_expired { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            let header_tag = if must_use_resolver { "remote-direct-resolver" } else { "redirect-direct-cdn" };
             redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }
@@ -1977,8 +2010,12 @@ pub async fn handle_playback_request(
                 let resume_end = resume_start + resume_len;
                 if req_start >= resume_start && req_start < resume_end {
                     let offset = (req_start - resume_start) as usize;
+                    let max_chunk_end =
+                        (offset + FAST_START_HEAD_SERVE_CHUNK_SIZE).saturating_sub(1);
                     let end_in_resume = (req_end - resume_start) as usize;
-                    let end_clamped = end_in_resume.min(resume_bytes.len() - 1);
+                    let end_clamped = end_in_resume
+                        .min(max_chunk_end)
+                        .min(resume_bytes.len() - 1);
                     let slice = resume_bytes.slice(offset..=end_clamped);
                     let slice_len = slice.len();
                     let end_byte = req_start + slice_len as u64 - 1;
@@ -1992,7 +2029,7 @@ pub async fn handle_playback_request(
                         end_byte,
                         slice_len,
                         total_size = entry.total_size,
-                        "[FAST-START] Buffer hit (resume): serving {} bytes locally over LAN",
+                        "[FAST-START] Buffer hit (resume): serving {} bytes locally over LAN (chunked)",
                         slice_len
                     );
 
@@ -2016,7 +2053,9 @@ pub async fn handle_playback_request(
             // Fall through to redirect if resume chunk doesn't cover
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
-            let redirect_target = if is_remote || token_expired { url } else { &entry.direct_cdn_url };
+            let must_use_resolver =
+                token_expired || (is_remote && is_ip_locked_cdn_url(&entry.direct_cdn_url));
+            let redirect_target = if must_use_resolver { url } else { &entry.direct_cdn_url };
             info!(
                 %item_id,
                 range = %rng,
@@ -2026,19 +2065,21 @@ pub async fn handle_playback_request(
                 "[FAST-START] Resume range miss: redirecting (307)"
             );
             let mut redirect = Redirect::temporary(redirect_target).into_response();
-            let header_tag = if is_remote || token_expired { "remote-direct-resolver" } else { "redirect-direct-cdn" };
+            let header_tag = if must_use_resolver { "remote-direct-resolver" } else { "redirect-direct-cdn" };
             redirect.headers_mut().insert("X-Remux-FastStart", HeaderValue::from_static(header_tag));
             Some(redirect)
         }
 
         // Case 5: Video cluster stream / seek / continuous playback
         // Issue 307 Temporary Redirect:
-        // - For remote clients: to upstream resolver URL (mints CDN token for remote IP)
-        // - For LAN clients: DIRECTLY to Debrid CDN edge (skips resolver 302 hop)
+        // - For IP-locked Debrid CDNs on remote clients (or expired tokens): to upstream resolver URL
+        // - Otherwise (LAN or token-auth CDNs like TorBox): DIRECTLY to Debrid CDN edge (skips resolver hop)
         Some(rng) => {
             METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
             let token_expired = entry.created_at.elapsed() >= Duration::from_secs(3600);
-            let redirect_target = if is_remote || token_expired {
+            let must_use_resolver =
+                token_expired || (is_remote && is_ip_locked_cdn_url(&entry.direct_cdn_url));
+            let redirect_target = if must_use_resolver {
                 url
             } else {
                 &entry.direct_cdn_url
@@ -2052,7 +2093,7 @@ pub async fn handle_playback_request(
                 "[FAST-START] Direct handoff outside buffer: issuing 307 redirect"
             );
             let mut redirect = Redirect::temporary(redirect_target).into_response();
-            let header_tag = if is_remote || token_expired {
+            let header_tag = if must_use_resolver {
                 "remote-direct-resolver"
             } else {
                 "redirect-direct-cdn"
@@ -3045,6 +3086,96 @@ mod tests {
         assert!(
             FAST_START_CACHE.get(&test_url).is_none(),
             "dead upstream link must evict stale RAM buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_buffer_is_chunked_to_16mb_and_remote_torbox_uses_direct_cdn() {
+        let _lock = TEST_LOCK.lock().await;
+        set_force_direct_307(false);
+
+        let resolver_url = "https://meteor.example.com/play/stream.mkv";
+        let torbox_cdn = "https://nexus.erth.tb-cdn.earth/dld/12345678-aaaa-bbbb-cccc-1234567890ab?token=abc";
+        let resume_start: u64 = 1_000_000_000;
+        let resume_size = 36 * 1024 * 1024; // 36 MB -> 16 MB + 16 MB + 4 MB
+        FAST_START_CACHE.insert(
+            resolver_url.to_string(),
+            FastStartEntry {
+                item_id: Some(Uuid::nil()),
+                original_url: resolver_url.to_string(),
+                direct_cdn_url: torbox_cdn.to_string(),
+                head_bytes: Bytes::from(vec![0x11; 4096]),
+                tail_bytes: None,
+                resume_buffer: Some((resume_start, Bytes::from(vec![0x55; resume_size]))),
+                total_size: 8_000_000_000,
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+
+        // Simulate remote / Cloudflare Tunnel client headers
+        let mut remote_headers = HeaderMap::new();
+        remote_headers.insert("cf-connecting-ip", HeaderValue::from_static("97.126.3.115"));
+        remote_headers.insert(header::RANGE, HeaderValue::from_static("bytes=1000000000-"));
+
+        // 1. Open-ended resume request must be chunked to 16 MB (not all 36 MB!)
+        let resp1 = handle_playback_request(Uuid::nil(), resolver_url, &remote_headers, None)
+            .await
+            .expect("should hit resume buffer");
+        assert_eq!(resp1.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp1.headers().get(header::CONTENT_LENGTH).unwrap(),
+            "16777216"
+        );
+        assert_eq!(
+            resp1.headers().get(header::CONTENT_RANGE).unwrap(),
+            "bytes 1000000000-1016777215/8000000000"
+        );
+
+        // 2. Request past buffer on remote client with TorBox CDN must 307 directly to tb-cdn.earth!
+        let mut handoff_headers = HeaderMap::new();
+        handoff_headers.insert("cf-connecting-ip", HeaderValue::from_static("97.126.3.115"));
+        handoff_headers.insert(header::RANGE, HeaderValue::from_static("bytes=2000000000-"));
+        let resp_tb = handle_playback_request(Uuid::nil(), resolver_url, &handoff_headers, None)
+            .await
+            .expect("should redirect directly to TorBox CDN");
+        assert_eq!(resp_tb.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp_tb.headers().get(header::LOCATION).unwrap(),
+            torbox_cdn
+        );
+        assert_eq!(
+            resp_tb.headers().get("X-Remux-FastStart").unwrap(),
+            "redirect-direct-cdn"
+        );
+
+        // 3. IP-locked Real-Debrid CDN on remote client must still fall back to resolver URL
+        let rd_resolver = "https://meteor.example.com/play/rd-stream.mkv";
+        FAST_START_CACHE.insert(
+            rd_resolver.to_string(),
+            FastStartEntry {
+                item_id: Some(Uuid::nil()),
+                original_url: rd_resolver.to_string(),
+                direct_cdn_url: "https://23.download.real-debrid.com/d/ABCDEF/movie.mkv".to_string(),
+                head_bytes: Bytes::from(vec![0x11; 4096]),
+                tail_bytes: None,
+                resume_buffer: None,
+                total_size: 8_000_000_000,
+                content_type: "video/x-matroska".to_string(),
+                created_at: Instant::now(),
+            },
+        );
+        let resp_rd = handle_playback_request(Uuid::nil(), rd_resolver, &handoff_headers, None)
+            .await
+            .expect("should redirect RD remote client to resolver");
+        assert_eq!(resp_rd.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp_rd.headers().get(header::LOCATION).unwrap(),
+            rd_resolver
+        );
+        assert_eq!(
+            resp_rd.headers().get("X-Remux-FastStart").unwrap(),
+            "remote-direct-resolver"
         );
     }
 }
