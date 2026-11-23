@@ -1067,9 +1067,10 @@ impl StreamService {
 
             // Smart check:
             // 1. If external subtitles were NOT fetched, and the probed source turns out
-            //    to have NO matching embedded subtitles, fetch on demand!
+            //    to have NO matching embedded subtitles, fetch on demand (only if subtitle addons exist).
             if external_subtitles.is_empty()
                 && cached_external_subtitles.is_none()
+                && self.ctx.addons.has_subtitle_addons()
                 && !has_matching_embedded_subtitles(&source, &sub_langs)
             {
                 if let Some(mut media) = item

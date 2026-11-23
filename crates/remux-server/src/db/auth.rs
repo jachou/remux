@@ -61,8 +61,8 @@ impl Device {
         crate::jellyfin_client::from_device(self)
     }
 
-    pub async fn save(&self, db: &SqlitePool) -> Result<()> {
-        sqlx::query(
+    pub async fn save(&mut self, db: &SqlitePool) -> Result<()> {
+        let stored_token: String = sqlx::query_scalar(
             r#"
             INSERT INTO devices
                 (user_id, access_token, id, name, app_name, app_version, created_at)
@@ -70,9 +70,10 @@ impl Device {
                 (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id, user_id) DO UPDATE SET
                 name = excluded.name,
-                access_token = excluded.access_token,
+                access_token = COALESCE(NULLIF(devices.access_token, ''), excluded.access_token),
                 app_name    = excluded.app_name,
                 app_version = excluded.app_version
+            RETURNING access_token
             "#,
         )
         .bind(self.user_id)
@@ -82,9 +83,10 @@ impl Device {
         .bind(&self.app_name)
         .bind(&self.app_version)
         .bind(Utc::now())
-        .execute(db)
+        .fetch_one(db)
         .await?;
 
+        self.access_token = stored_token.into();
         Ok(())
     }
 
@@ -1104,5 +1106,46 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(version_in_db, "8.1");
+    }
+
+    #[tokio::test]
+    async fn device_save_preserves_existing_access_token_on_reauth() {
+        let db = test_db().await;
+        let uid = Uuid::new_v4();
+        let dev_id = Uuid::new_v4().to_string();
+
+        let mut first = Device {
+            id: dev_id.clone(),
+            access_token: "token-first".to_string().into(),
+            user_id: uid,
+            name: "Infuse".to_string(),
+            app_name: "Infuse-Direct".to_string(),
+            app_version: "8.0".to_string(),
+            ..Default::default()
+        };
+        first.save(&db).await.unwrap();
+        assert_eq!(first.access_token.expose(), "token-first");
+
+        let mut second = Device {
+            id: dev_id.clone(),
+            access_token: "token-second".to_string().into(),
+            user_id: uid,
+            name: "Infuse".to_string(),
+            app_name: "Infuse-Direct".to_string(),
+            app_version: "8.1".to_string(),
+            ..Default::default()
+        };
+        second.save(&db).await.unwrap();
+        assert_eq!(
+            second.access_token.expose(),
+            "token-first",
+            "Re-authenticating an active device must keep its existing access_token"
+        );
+        assert!(
+            Device::get_by_access_token(&db, "token-first")
+                .await
+                .unwrap()
+                .is_some()
+        );
     }
 }

@@ -657,9 +657,11 @@ fn episode_in_active_window_with(
         .or(child.digital_released_at)
         .or(child.released_at)
     {
-        None => true,
+        // Undated episodes only need an active refresh until their first refresh completes;
+        // otherwise long-running shows with thousands of undated episodes get re-fetched forever.
+        None => child.refreshed_at.is_none(),
         Some(dt) => {
-            let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(180);
+            let cutoff = chrono::Utc::now().naive_utc() - chrono::Duration::days(45);
             dt > cutoff
         }
     }
@@ -2975,6 +2977,13 @@ impl AddonService {
                         // child_refresh_force below always treats this episode as never
                         // refreshed, refetching it on every single pass.
                         let mut stored_digital = None;
+                        let mut existing_refreshed_at_val = None;
+                        let mut stored_l2_fields: Option<(
+                            &String,
+                            &Option<String>,
+                            &Option<chrono::NaiveDateTime>,
+                            &Option<i64>,
+                        )> = None;
                         let mut existed_in_db = false;
                         let mut fields_changed = false;
                         if let Some(idx) = gc.idx {
@@ -2995,6 +3004,13 @@ impl AddonService {
                             )) = existing_l2.get(&key)
                             {
                                 existed_in_db = true;
+                                existing_refreshed_at_val = *existing_refreshed_at;
+                                stored_l2_fields = Some((
+                                    stored_title,
+                                    stored_desc,
+                                    stored_released_at,
+                                    stored_runtime,
+                                ));
                                 fields_changed = stored_title != &gc.title
                                     || (gc.description.is_some()
                                         && stored_desc != &gc.description)
@@ -3026,8 +3042,29 @@ impl AddonService {
                             {
                                 warn!(id = %gc.id, error = %e, "failed to refresh grandchild meta");
                             }
+                            if let Some((
+                                stored_title,
+                                stored_desc,
+                                stored_released_at,
+                                stored_runtime,
+                            )) = stored_l2_fields
+                            {
+                                fields_changed = stored_title != &gc.title
+                                    || (gc.description.is_some()
+                                        && stored_desc != &gc.description)
+                                    || (gc.released_at.is_some()
+                                        && stored_released_at != &gc.released_at)
+                                    || (gc.digital_released_at.is_some()
+                                        && stored_digital != gc.digital_released_at)
+                                    || (gc.runtime.is_some() && stored_runtime != &gc.runtime);
+                            }
                         }
-                        if !existed_in_db || was_refreshed || root_was_remapped || fields_changed {
+                        let needs_upsert = !existed_in_db
+                            || force_refresh
+                            || root_was_remapped
+                            || fields_changed
+                            || (was_refreshed && existing_refreshed_at_val.is_none());
+                        if needs_upsert {
                             level2.push(gc);
                         }
                     }
@@ -3315,6 +3352,15 @@ impl AddonService {
                 .save(cache_key, subs.clone(), SUBTITLES_TTL);
         }
         subs
+    }
+
+    pub fn has_subtitle_addons(&self) -> bool {
+        self.inner.load().iter().any(|r| {
+            r.subtitle.is_some()
+                && r.row
+                    .resources
+                    .contains(&ResourceType::Subtitles)
+        })
     }
 
     pub async fn get_streams(
@@ -4588,6 +4634,12 @@ mod tests {
     fn no_released_at_is_active() {
         let child = child_with(None, None);
         assert!(episode_in_active_window(&child));
+    }
+
+    #[test]
+    fn no_released_at_already_refreshed_is_inactive() {
+        let child = child_with(Some(days_ago(7)), None);
+        assert!(!episode_in_active_window(&child));
     }
 
     #[test]

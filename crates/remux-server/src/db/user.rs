@@ -1156,6 +1156,10 @@ impl UserMediaState {
         runtime_seconds: Option<i64>,
     ) -> Result<bool> {
         let mut ms = Self::get_or_new(db, user, media).await?;
+        let was_blank = ms.is_blank();
+        let prev_pos = ms.playback_position;
+        let prev_audio = ms.audio_idx;
+        let prev_sub = ms.subtitle_idx;
         let position_seconds = position_ticks / 10_000_000;
         ms.playback_position = position_seconds;
 
@@ -1217,8 +1221,14 @@ impl UserMediaState {
             }
             played
         } else {
-            ms.save(db)
-                .await?;
+            let unchanged = !was_blank
+                && ms.playback_position == prev_pos
+                && ms.audio_idx == prev_audio
+                && ms.subtitle_idx == prev_sub;
+            if !unchanged {
+                ms.save(db)
+                    .await?;
+            }
             false
         };
 

@@ -317,7 +317,7 @@ pub async fn users_authenticatebyname(
     )
     .await?
     .context_unauthorized("not found")?;
-    let device = auth::Device::new_from_header(auth_header, &user)?;
+    let mut device = auth::Device::new_from_header(auth_header, &user)?;
     device
         .save(
             &state
@@ -359,7 +359,7 @@ pub async fn authenticate_with_quickconnect(
     .await?
     .context_unauthorized("User not found")?;
 
-    let device = auth::Device {
+    let mut device = auth::Device {
         id: auth_header
             .device_id
             .unwrap_or_else(|| get_uuid().to_string()),
