@@ -1418,7 +1418,11 @@ impl UserMediaState {
                 qb.push_in("media_id", &media_ids);
             }
             if let Some(played) = &filter.played {
-                qb.push(" AND play_count > 0");
+                if *played {
+                    qb.push(" AND play_count > 0");
+                } else {
+                    qb.push(" AND play_count = 0");
+                }
             }
             if let Some(favorite) = &filter.favorite {
                 qb.push(" AND favorite = ")

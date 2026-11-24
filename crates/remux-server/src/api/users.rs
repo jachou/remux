@@ -1495,14 +1495,12 @@ async fn default_userviews(
             .cloned(),
         ..Default::default()
     };
-    let channel_filter = db::MediaFilter {
-        kind: Some(vec![db::MediaKind::TvChannel]),
-        enabled: Some(true),
-        ..Default::default()
-    };
-    let (library_result, channel_result) = tokio::join!(
+    let (library_result, has_channels_res) = tokio::join!(
         db::Media::get_by_filter(db, &library_filter),
-        db::Media::get_by_filter(db, &channel_filter),
+        sqlx::query_scalar::<_, i64>(
+            "SELECT EXISTS(SELECT 1 FROM media WHERE kind = 'tv_channel' AND enabled = 1)",
+        )
+        .fetch_one(db),
     );
 
     let mut libraries = library_result?.records;
@@ -1515,9 +1513,7 @@ async fn default_userviews(
         libraries.retain(|m| !excluded.contains(&m.id));
     }
 
-    let has_channels = !channel_result?
-        .records
-        .is_empty();
+    let has_channels = has_channels_res.unwrap_or(0) != 0;
     Ok((libraries, has_channels))
 }
 

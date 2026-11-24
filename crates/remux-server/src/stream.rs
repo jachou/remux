@@ -199,9 +199,15 @@ pub fn is_error_video_url(url: &str) -> bool {
 pub fn is_upstream_rate_limit_url(url: &str) -> bool {
     let lower = url.to_lowercase();
     lower.contains("rate-limit")
+        || lower.contains("rate_limit")
+        || lower.contains("ratelimit")
         || lower.contains("too-many-requests")
         || lower.contains("too_many_requests")
+        || lower.contains("429.mp4")
         || lower.contains("public-rate-limit-exceeded")
+        || lower.contains("store_limit_exceeded")
+        || lower.contains("content_proxy_limit_reached")
+        || lower.contains("payment_required")
         || lower.contains("cooldown.mp4")
         || lower.contains("account-expired")
         || lower.contains("debrid-error")
@@ -528,19 +534,25 @@ impl StreamDescriptor {
                         .is_some_and(|(_, clip)| AIOSTREAMS_ERROR_CLIPS.contains(&clip));
 
                     if is_error_video_url(&direct_url) || is_error_video_url(url) || is_tiny_video || is_aiostreams_clip {
+                        let is_rate_limit =
+                            is_upstream_rate_limit_url(&direct_url) || is_upstream_rate_limit_url(url);
                         tracing::warn!(
                             %url,
                             direct_url = %direct_url,
                             ?total_size,
                             ?status,
                             ?elapsed,
+                            is_rate_limit,
                             "liveness check rejected upstream error placeholder video"
                         );
-                        STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
-                        crate::fast_start::FAST_START_CACHE.invalidate(url);
-                        if is_upstream_rate_limit_url(&direct_url) || is_upstream_rate_limit_url(url) {
+                        if is_rate_limit {
+                            STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new_rate_limited_or_timeout());
                             trip_preemptive_circuit_breaker(None, "liveness check detected upstream rate limit video URL");
+                        } else {
+                            // Item-level error clip (e.g. download_failed.mp4, 500.mp4): mark dead so fallback tries Candidate #2!
+                            STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(false));
                         }
+                        crate::fast_start::FAST_START_CACHE.invalidate(url);
                         return false;
                     }
 

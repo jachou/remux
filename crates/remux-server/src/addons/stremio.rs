@@ -94,10 +94,14 @@ impl AddonPreset for StremioPreset {
             addon_id,
             manifest_url,
             client,
-            medias_cache: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
-            failed: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            medias_cache: moka::sync::Cache::builder()
+                .max_capacity(256)
+                .time_to_live(std::time::Duration::from_secs(5 * 60))
+                .build(),
+            failed: moka::sync::Cache::builder()
+                .max_capacity(2048)
+                .time_to_live(std::time::Duration::from_secs(60))
+                .build(),
             manifest: Default::default(),
         });
         Ok(AddonCapabilities {
@@ -222,16 +226,15 @@ pub struct StremioAddon {
     client: reqwest::Client,
     /// Raw Stremio `Meta` cached per series lookup-id for the duration of one tree sync.
     /// Shared between the tree-children path and `stremio_meta_fetch` so the API is
-    /// called exactly once per series. Evicted by `on_series_done`.
-    medias_cache: Arc<
-        std::sync::Mutex<std::collections::HashMap<String, Arc<sdks::stremio::Meta>>>,
-    >,
+    /// called exactly once per series. Evicted by `on_series_done` and bounded by
+    /// capacity + TTL so ad-hoc lookups cannot leak memory indefinitely.
+    medias_cache: moka::sync::Cache<String, Arc<sdks::stremio::Meta>>,
     /// Series-level lookup ids whose fetch already failed during this tree
     /// walk. Without this, every season and episode under a series whose
     /// fetch failed independently retries the identical failing request —
     /// once for the series, then again for every child. Checked alongside
-    /// `medias_cache` and evicted at the same point, by `on_series_done`.
-    failed: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// `medias_cache` and evicted by `on_series_done` or after a short TTL.
+    failed: moka::sync::Cache<String, ()>,
     manifest: super::ManifestCache,
 }
 
@@ -472,9 +475,7 @@ impl MetaAddon for StremioAddon {
         // independently retry the identical request that just timed out.
         if let Some(meta_id) = stremio_meta_lookup_id(media) {
             self.failed
-                .lock()
-                .unwrap()
-                .insert(meta_id);
+                .insert(meta_id, ());
         }
     }
 
@@ -486,13 +487,9 @@ impl MetaAddon for StremioAddon {
 
     fn on_series_done(&self, meta_id: &str) {
         self.medias_cache
-            .lock()
-            .unwrap()
-            .remove(meta_id);
+            .invalidate(meta_id);
         self.failed
-            .lock()
-            .unwrap()
-            .remove(meta_id);
+            .invalidate(meta_id);
     }
 }
 
@@ -549,10 +546,7 @@ impl TreeAddon for StremioAddon {
                     })?;
                 let meta_arc = self
                     .medias_cache
-                    .lock()
-                    .unwrap()
-                    .get(&meta_id)
-                    .cloned();
+                    .get(&meta_id);
                 let Some(meta_arc) = meta_arc else {
                     return Ok(None);
                 };
@@ -882,32 +876,21 @@ fn stremio_meta_lookup_id(media: &db::Media) -> Option<String> {
 async fn fetch_and_cache_meta(
     svc: &stremio_service::StremioService,
     media: &db::Media,
-    cache: &std::sync::Mutex<
-        std::collections::HashMap<String, Arc<sdks::stremio::Meta>>,
-    >,
-    failed: &std::sync::Mutex<std::collections::HashSet<String>>,
+    cache: &moka::sync::Cache<String, Arc<sdks::stremio::Meta>>,
+    failed: &moka::sync::Cache<String, ()>,
     ctx: &AppContext,
 ) -> Result<Option<Arc<sdks::stremio::Meta>>> {
     let meta_id: String = stremio_meta_lookup_id(media)
         .ok_or_else(|| anyhow!("no resolvable meta id for {}", media.id))?;
 
-    if let Some(cached) = cache
-        .lock()
-        .unwrap()
-        .get(&meta_id)
-        .cloned()
-    {
+    if let Some(cached) = cache.get(&meta_id) {
         return Ok(Some(cached));
     }
 
     // The series-level fetch for this meta_id already failed once during
     // this tree walk — don't let every other season/episode under it retry
     // the identical failing request. Bail immediately instead.
-    if failed
-        .lock()
-        .unwrap()
-        .contains(&meta_id)
-    {
+    if failed.contains_key(&meta_id) {
         return Err(anyhow!(
             "skipping {meta_id}: already failed earlier in this refresh"
         ));
@@ -997,17 +980,11 @@ async fn fetch_and_cache_meta(
         // `{}`). Not an error: record it so the rest of this tree walk skips
         // the lookup, and report "nothing to add".
         Ok(None) => {
-            failed
-                .lock()
-                .unwrap()
-                .insert(meta_id);
+            failed.insert(meta_id, ());
             return Ok(None);
         }
         Err(e) => {
-            failed
-                .lock()
-                .unwrap()
-                .insert(meta_id);
+            failed.insert(meta_id, ());
             return Err(e);
         }
     };
@@ -1021,20 +998,14 @@ async fn fetch_and_cache_meta(
     // one real attempt (and one log line) per series per run, not one per
     // episode.
     if arc.is_error() {
-        failed
-            .lock()
-            .unwrap()
-            .insert(meta_id.clone());
+        failed.insert(meta_id.clone(), ());
         return Err(anyhow!(
             "{meta_id} returned an error meta: {}",
             arc.get_name()
                 .unwrap_or_default()
         ));
     }
-    cache
-        .lock()
-        .unwrap()
-        .insert(meta_id, Arc::clone(&arc));
+    cache.insert(meta_id, Arc::clone(&arc));
     Ok(Some(arc))
 }
 
@@ -1042,10 +1013,8 @@ async fn stremio_meta_fetch(
     svc: &stremio_service::StremioService,
     media: &db::Media,
     ctx: &AppContext,
-    medias_cache: &std::sync::Mutex<
-        std::collections::HashMap<String, Arc<sdks::stremio::Meta>>,
-    >,
-    failed: &std::sync::Mutex<std::collections::HashSet<String>>,
+    medias_cache: &moka::sync::Cache<String, Arc<sdks::stremio::Meta>>,
+    failed: &moka::sync::Cache<String, ()>,
 ) -> Result<Option<db::Media>> {
     // This series already failed once this tree walk. Return quietly — the
     // original failure was already logged; every episode re-surfacing it as
@@ -1060,16 +1029,8 @@ async fn stremio_meta_fetch(
     // real, cached success because of a marker from an earlier, unrelated
     // failure would be strictly worse than the redundant lock check.
     if let Some(meta_id) = stremio_meta_lookup_id(media) {
-        let cached = medias_cache
-            .lock()
-            .unwrap()
-            .contains_key(&meta_id);
-        if !cached
-            && failed
-                .lock()
-                .unwrap()
-                .contains(&meta_id)
-        {
+        let cached = medias_cache.contains_key(&meta_id);
+        if !cached && failed.contains_key(&meta_id) {
             return Ok(None);
         }
     }
@@ -2717,11 +2678,9 @@ mod tests {
             }))
             .unwrap()
         };
-        let cache = std::sync::Mutex::new(std::collections::HashMap::from([(
-            "tt0386676".to_string(),
-            Arc::new(meta),
-        )]));
-        let failed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let cache = moka::sync::Cache::new(16);
+        cache.insert("tt0386676".to_string(), Arc::new(meta));
+        let failed = moka::sync::Cache::new(16);
 
         let series = db::Media {
             id: Uuid::new_v4(),
@@ -2785,8 +2744,8 @@ mod tests {
                 .json_body(serde_json::json!({}));
         });
         let svc = stremio_service::StremioService::from_url(&addon.base_url()).unwrap();
-        let cache = std::sync::Mutex::new(std::collections::HashMap::new());
-        let failed = std::sync::Mutex::new(std::collections::HashSet::new());
+        let cache = moka::sync::Cache::new(16);
+        let failed = moka::sync::Cache::new(16);
 
         let series = db::Media {
             id: Uuid::new_v4(),

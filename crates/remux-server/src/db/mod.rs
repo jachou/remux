@@ -38,8 +38,8 @@ pub async fn connect(url: &str, slow_query_threshold_ms: u64) -> Result<SqlitePo
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .pragma("wal_autocheckpoint", "1000")
-        .pragma("cache_size", "-16384")
-        .pragma("mmap_size", "33554432")
+        .pragma("cache_size", "-65536")
+        .pragma("mmap_size", "536870912")
         .pragma("temp_store", "memory")
         // Allow up to 10s of retrying when blocked by another connection's
         // write lock. This is what makes wal_checkpoint(TRUNCATE) actually
@@ -52,7 +52,7 @@ pub async fn connect(url: &str, slow_query_threshold_ms: u64) -> Result<SqlitePo
     // In-memory SQLite databases are per-connection; a pool with >1 connection
     // gives each connection its own independent database, making inserts on one
     // connection invisible to queries on another. Cap to 1 for :memory: URLs.
-    let max_conns = if url.contains(":memory:") { 1 } else { 5 };
+    let max_conns = if url.contains(":memory:") { 1 } else { 16 };
     Ok(SqlitePoolOptions::new()
         .max_connections(max_conns)
         .connect_with(opts)

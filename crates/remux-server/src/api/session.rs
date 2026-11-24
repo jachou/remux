@@ -509,7 +509,8 @@ pub async fn report_playback_stopped(
                     already_probed_next,
                 );
             } else {
-                // Stopped mid-way: immediately pre-warm / refill the resume buffer at the new stop position!
+                // Stopped mid-way: bypass 30s probe cooldown and immediately refresh the resume buffer at the new stop position!
+                crate::services::stream_service::clear_recent_preemptive_probe(item_id);
                 crate::services::stream_service::spawn_preemptive_probe(
                     &state.ctx,
                     item_id,

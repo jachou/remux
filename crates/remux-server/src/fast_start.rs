@@ -332,6 +332,15 @@ pub fn get_fast_start_db() -> Option<&'static sqlx::SqlitePool> {
 static UPGRADING_PROBES: LazyLock<dashmap::DashSet<String>> =
     LazyLock::new(dashmap::DashSet::new);
 
+/// Bounded set of stream URLs already verified/upgraded with reusable probe data in SQLite,
+/// avoiding redundant DB lookups on repeat cache hits in `refresh_cached_resume_and_head`.
+static PROBED_UPGRADE_DONE: LazyLock<moka::sync::Cache<String, ()>> = LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(2048)
+        .time_to_live(Duration::from_secs(6 * 3600))
+        .build()
+});
+
 struct ProbeUpgradeGuard(String);
 impl Drop for ProbeUpgradeGuard {
     fn drop(&mut self) {
@@ -447,10 +456,13 @@ async fn refresh_cached_resume_and_head(
                     } else {
                         FAST_START_RESUME_BUFFER_SIZE_1080P
                     };
+                    let min_forward_bytes =
+                        (resume_buffer_size as u64).saturating_sub(preroll_bytes) / 2;
+                    let min_end = (target_offset + min_forward_bytes).min(entry.total_size);
                     let already_covered = entry.resume_buffer.as_ref().map(|(start, bytes)| {
                         let end = *start + bytes.len() as u64;
                         let min_start = target_offset.saturating_sub(preroll_bytes / 2);
-                        target_offset >= *start && target_offset < end && *start <= min_start
+                        target_offset >= *start && end >= min_end && *start <= min_start
                     }).unwrap_or(false);
 
                     if !already_covered {
@@ -461,7 +473,7 @@ async fn refresh_cached_resume_and_head(
                             let covered_now = current_entry.resume_buffer.as_ref().map(|(start, bytes)| {
                                 let end = *start + bytes.len() as u64;
                                 let min_start = target_offset.saturating_sub(preroll_bytes / 2);
-                                target_offset >= *start && target_offset < end && *start <= min_start
+                                target_offset >= *start && end >= min_end && *start <= min_start
                             }).unwrap_or(false);
                             if covered_now {
                                 return true;
@@ -628,14 +640,21 @@ pub async fn prewarm_fast_start(
 
         let is_tiny = total_size > 0 && total_size < 2 * 1024 * 1024;
         if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) || is_tiny {
-            warn!(%original_url, direct_url = %direct_cdn_url, total_size, "[FAST-START] Upstream resolved to error video URL or tiny payload; marking dead");
-            if crate::stream::is_upstream_rate_limit_url(&direct_cdn_url) || crate::stream::is_upstream_rate_limit_url(original_url) {
+            let is_rate_limit = crate::stream::is_upstream_rate_limit_url(&direct_cdn_url)
+                || crate::stream::is_upstream_rate_limit_url(original_url);
+            warn!(%original_url, direct_url = %direct_cdn_url, total_size, is_rate_limit, "[FAST-START] Upstream resolved to error video URL or tiny payload; marking dead");
+            if is_rate_limit {
                 crate::stream::trip_preemptive_circuit_breaker(None, "fast-start direct-307 rate-limit video URL");
+                crate::stream::STREAM_LIVENESS_CACHE.insert(
+                    original_url.to_string(),
+                    crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+                );
+            } else {
+                crate::stream::STREAM_LIVENESS_CACHE.insert(
+                    original_url.to_string(),
+                    crate::stream::LivenessEntry::new(false),
+                );
             }
-            crate::stream::STREAM_LIVENESS_CACHE.insert(
-                original_url.to_string(),
-                crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
-            );
             return false;
         }
 
@@ -899,19 +918,27 @@ pub async fn prewarm_fast_start(
     let is_tiny_video = total_size < 2 * 1024 * 1024;
     if crate::stream::is_error_video_url(&direct_cdn_url) || crate::stream::is_error_video_url(original_url) || is_tiny_video {
         METRICS.prewarms_failed.fetch_add(1, Ordering::Relaxed);
+        let is_rate_limit = crate::stream::is_upstream_rate_limit_url(&direct_cdn_url)
+            || crate::stream::is_upstream_rate_limit_url(original_url);
         warn!(
             %original_url,
             direct_url = %direct_cdn_url,
             total_size,
+            is_rate_limit,
             "[FAST-START] Upstream resolved to error placeholder video URL or tiny payload; marking dead"
         );
-        if crate::stream::is_upstream_rate_limit_url(&direct_cdn_url) || crate::stream::is_upstream_rate_limit_url(original_url) {
+        if is_rate_limit {
             crate::stream::trip_preemptive_circuit_breaker(None, "fast-start upstream rate-limit video detected");
+            crate::stream::STREAM_LIVENESS_CACHE.insert(
+                original_url.to_string(),
+                crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
+            );
+        } else {
+            crate::stream::STREAM_LIVENESS_CACHE.insert(
+                original_url.to_string(),
+                crate::stream::LivenessEntry::new(false),
+            );
         }
-        crate::stream::STREAM_LIVENESS_CACHE.insert(
-            original_url.to_string(),
-            crate::stream::LivenessEntry::new_rate_limited_or_timeout(),
-        );
         crate::fast_start::FAST_START_CACHE.invalidate(original_url);
         notify_guard.notify_waiters();
         return false;
@@ -1257,15 +1284,18 @@ pub async fn upgrade_probe_data_from_fast_start(
     item_id: Option<Uuid>,
     original_url: &str,
 ) {
+    if PROBED_UPGRADE_DONE.contains_key(original_url) {
+        return;
+    }
     if !UPGRADING_PROBES.insert(original_url.to_string()) {
         return;
     }
     let _guard = ProbeUpgradeGuard(original_url.to_string());
 
-    // 1. Look up stream in DB
-    let stream_opt = if let Some(id) = item_id {
+    // 1. Look up stream in DB (scoped to kind = 'stream' so partial index idx_media_stream_http_url applies)
+    let stream_opt = if let Some(id) = item_id.filter(|id| !id.is_nil()) {
         sqlx::query_as::<_, crate::db::Media>(
-            "SELECT * FROM media WHERE (parent_id = ?1 OR id = ?1) AND json_extract(stream_info, '$.descriptor.Http.url') = ?2 LIMIT 1",
+            "SELECT * FROM media WHERE kind = 'stream' AND (parent_id = ?1 OR id = ?1) AND json_extract(stream_info, '$.descriptor.Http.url') = ?2 LIMIT 1",
         )
         .bind(id)
         .bind(original_url)
@@ -1281,7 +1311,7 @@ pub async fn upgrade_probe_data_from_fast_start(
         Some(s) => s,
         None => {
             match sqlx::query_as::<_, crate::db::Media>(
-                "SELECT * FROM media WHERE json_extract(stream_info, '$.descriptor.Http.url') = ?1 LIMIT 1",
+                "SELECT * FROM media WHERE kind = 'stream' AND json_extract(stream_info, '$.descriptor.Http.url') = ?1 LIMIT 1",
             )
             .bind(original_url)
             .fetch_optional(db)
@@ -1296,6 +1326,7 @@ pub async fn upgrade_probe_data_from_fast_start(
     // 2. Check if stream already has reusable probe data
     if let Some(cached) = &stream.probe_data {
         if crate::playback::probe::is_reusable_probe_cache(cached) {
+            PROBED_UPGRADE_DONE.insert(original_url.to_string(), ());
             return;
         }
     }
@@ -1327,6 +1358,7 @@ pub async fn upgrade_probe_data_from_fast_start(
             if let Err(e) = crate::db::Media::save_probe_data(db, &stream_id, &probed_info).await {
                 warn!(%stream_id, error = %e, "[FAST-START] Failed to save upgraded probe data to DB");
             } else {
+                PROBED_UPGRADE_DONE.insert(original_url.to_string(), ());
                 info!(
                     %stream_id,
                     streams = probed_info.media_streams.len(),
@@ -1626,44 +1658,55 @@ pub fn is_remote_client(headers: &HeaderMap) -> bool {
         return true;
     }
 
-    // 2. Check X-Forwarded-For if present
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|h| h.to_str().ok()) {
-        if let Some(first_ip) = xff.split(',').next().map(str::trim) {
-            if let Ok(ip) = first_ip.parse::<std::net::IpAddr>() {
-                if !ip.is_loopback() && !is_private_ip(&ip) {
-                    return true;
+    // 2. Check X-Forwarded-For or X-Real-IP if present: if it parses to a valid client IP,
+    //    decide immediately (so LAN clients behind a local reverse proxy with a domain Host
+    //    are NOT falsely classified as remote).
+    for hdr in ["x-forwarded-for", "x-real-ip"] {
+        if let Some(val) = headers.get(hdr).and_then(|h| h.to_str().ok()) {
+            if let Some(first_ip) = val.split(',').next().map(str::trim) {
+                if let Ok(ip) = first_ip.parse::<std::net::IpAddr>() {
+                    let canon = ip.to_canonical();
+                    return !canon.is_loopback() && !is_private_ip(&canon);
                 }
             }
         }
     }
 
-    // 3. Check Host header — if it targets a public domain rather than local LAN IP / hostname
+    // 3. Check Host header — strip IPv6 brackets `[::1]:3000` properly before IP / domain check
     if let Some(host) = headers.get(header::HOST).and_then(|h| h.to_str().ok()) {
-        let host_name = host.split(':').next().unwrap_or(host);
+        let host_name = if let Some(rest) = host.strip_prefix('[') {
+            rest.split(']').next().unwrap_or(host)
+        } else {
+            host.split(':').next().unwrap_or(host)
+        };
         if let Ok(ip) = host_name.parse::<std::net::IpAddr>() {
-            if !ip.is_loopback() && !is_private_ip(&ip) {
-                return true;
-            }
-        } else if !host_name.starts_with("192.168.")
-            && !host_name.starts_with("10.")
-            && !host_name.starts_with("127.")
-            && host_name != "localhost"
-            && !host_name.ends_with(".local")
-            && !host_name.ends_with(".lan")
-            && !host_name.ends_with(".home")
-            && !host_name.ends_with(".home.arpa")
-        {
-            return true;
+            let canon = ip.to_canonical();
+            return !canon.is_loopback() && !is_private_ip(&canon);
         }
+        let lower = host_name.to_ascii_lowercase();
+        // Single-label hostnames (e.g. "localhost", "nas", "remux") and local domains are LAN
+        if !lower.contains('.')
+            || lower.ends_with(".local")
+            || lower.ends_with(".lan")
+            || lower.ends_with(".home")
+            || lower.ends_with(".home.arpa")
+        {
+            return false;
+        }
+        return true;
     }
 
     false
 }
 
 fn is_private_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => v4.is_private(),
-        std::net::IpAddr::V6(v6) => (v6.segments()[0] & 0xfe00) == 0xfc00,
+    match ip.to_canonical() {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => {
+            let seg0 = v6.segments()[0];
+            // ULA (fc00::/7) or link-local (fe80::/10)
+            (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+        }
     }
 }
 
@@ -2410,6 +2453,7 @@ pub fn find_mkv_video_track(head_bytes: &[u8]) -> u64 {
 /// Extracts the TimestampScale (in nanoseconds, default 1,000,000) from the MKV Info header in head_bytes.
 pub fn find_mkv_timestamp_scale(head_bytes: &[u8]) -> u64 {
     let info_id = [0x15u8, 0x49, 0xA9, 0x66];
+    let seek_id_prefix = [0x53u8, 0xAB, 0x84];
     let mut pos = 0;
     while pos < head_bytes.len() {
         let Some(idx) = head_bytes[pos..].windows(4).position(|w| w == info_id) else {
@@ -2417,6 +2461,11 @@ pub fn find_mkv_timestamp_scale(head_bytes: &[u8]) -> u64 {
         };
         let actual_pos = pos + idx;
         pos = actual_pos + 4;
+
+        // Skip SeekHead SeekID references (`53 AB 84 15 49 A9 66`)
+        if actual_pos >= 3 && head_bytes[actual_pos - 3..actual_pos] == seek_id_prefix {
+            continue;
+        }
 
         let Some((ilen, vlen)) = read_ebml_vint(&head_bytes[pos..]) else {
             continue;
@@ -2438,53 +2487,64 @@ pub fn find_mkv_timestamp_scale(head_bytes: &[u8]) -> u64 {
                 }
             }
         }
-        break;
     }
     1_000_000
 }
 
-/// Extracts the cluster byte offset for a given timestamp (in seconds) from an MKV head and tail index (Cues).
-pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_secs: f64) -> Option<u64> {
-    if tail_bytes.len() < 16 {
-        return None;
-    }
-    let seg_offset = find_mkv_segment_data_offset(head_bytes);
-    let vid_track = find_mkv_video_track(head_bytes);
-    let time_scale = find_mkv_timestamp_scale(head_bytes);
-
-    // Search for Cues element ID: [0x1C, 0x53, 0xBB, 0x6B]
+fn parse_mkv_cues_in_buf(
+    buf: &[u8],
+    seg_offset: u64,
+    vid_track: u64,
+    target_time_ticks: u64,
+) -> Option<u64> {
     let cues_id = [0x1Cu8, 0x53, 0xBB, 0x6B];
-    let cues_pos = tail_bytes.windows(4).position(|w| w == cues_id)?;
+    let seek_id_prefix = [0x53u8, 0xAB, 0x84];
 
-    let mut cursor = cues_pos + 4;
-    let (_cues_len, vint_len) = read_ebml_vint(&tail_bytes[cursor..])?;
-    cursor += vint_len;
-
-    // Search for the keyframe cluster at or immediately before the target resume timestamp in ticks
-    let target_time_ticks = ((target_time_secs.max(0.0) * 1_000_000_000.0) / (time_scale as f64)) as u64;
-    let mut best_cue: Option<(u64, u64)> = None; // (time_ticks, cluster_offset)
-
-    // Iterate through CuePoint elements (ID: 0xBB)
-    while cursor < tail_bytes.len() {
-        if tail_bytes[cursor] != 0xBB {
-            cursor += 1;
+    let mut search_pos = 0;
+    let cues_pos = loop {
+        let idx = buf[search_pos..].windows(4).position(|w| w == cues_id)?;
+        let actual = search_pos + idx;
+        if actual >= 3 && buf[actual - 3..actual] == seek_id_prefix {
+            search_pos = actual + 4;
             continue;
         }
-        cursor += 1; // skip 0xBB
-        let Some((point_len, point_vint_len)) = read_ebml_vint(&tail_bytes[cursor..]) else {
+        break actual;
+    };
+
+    let mut cursor = cues_pos + 4;
+    let (cues_len, vint_len) = read_ebml_vint(&buf[cursor..])?;
+    cursor += vint_len;
+    let cues_end = (cursor + cues_len as usize).min(buf.len());
+
+    let mut best_cue: Option<(u64, u64)> = None; // (time_ticks, cluster_offset)
+
+    // Iterate through CuePoint elements (ID: 0xBB) strictly within the Cues element bounds
+    while cursor < cues_end {
+        let Some((pt_id, pt_id_len)) = read_ebml_id(&buf[cursor..cues_end]) else {
+            break;
+        };
+        cursor += pt_id_len;
+        let Some((point_len, point_vint_len)) = read_ebml_vint(&buf[cursor..cues_end]) else {
             break;
         };
         cursor += point_vint_len;
-        let point_end = (cursor + point_len as usize).min(tail_bytes.len());
+        let point_end = (cursor + point_len as usize).min(cues_end);
+
+        if pt_id != 0xBB {
+            cursor = point_end;
+            continue;
+        }
 
         let mut sub_cursor = cursor;
         let mut cue_time_ms: Option<u64> = None;
         let mut matching_cluster_pos: Option<u64> = None;
 
         while sub_cursor < point_end {
-            let elem_id = tail_bytes[sub_cursor];
-            sub_cursor += 1;
-            let Some((elem_len, elem_vint_len)) = read_ebml_vint(&tail_bytes[sub_cursor..]) else {
+            let Some((elem_id, elem_id_len)) = read_ebml_id(&buf[sub_cursor..point_end]) else {
+                break;
+            };
+            sub_cursor += elem_id_len;
+            let Some((elem_len, elem_vint_len)) = read_ebml_vint(&buf[sub_cursor..point_end]) else {
                 break;
             };
             sub_cursor += elem_vint_len;
@@ -2492,28 +2552,29 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
 
             if elem_id == 0xB3 {
                 // CueTime
-                cue_time_ms = Some(read_ebml_uint(&tail_bytes[sub_cursor..elem_end]));
+                cue_time_ms = Some(read_ebml_uint(&buf[sub_cursor..elem_end]));
             } else if elem_id == 0xB7 {
-                // CueTrackPositions: scan inside for CueTrack (0xF7) and CueClusterPosition (0xF1)
+                // CueTrackPositions: use read_ebml_id so 2-byte IDs like CueBlockNumber (0x5378) don't corrupt offsets
                 let mut track_cursor = sub_cursor;
                 let mut this_track: Option<u64> = None;
                 let mut this_pos: Option<u64> = None;
                 while track_cursor < elem_end {
-                    let tid = tail_bytes[track_cursor];
-                    track_cursor += 1;
-                    let Some((tlen, tvint_len)) = read_ebml_vint(&tail_bytes[track_cursor..]) else {
+                    let Some((tid, tid_len)) = read_ebml_id(&buf[track_cursor..elem_end]) else {
+                        break;
+                    };
+                    track_cursor += tid_len;
+                    let Some((tlen, tvint_len)) = read_ebml_vint(&buf[track_cursor..elem_end]) else {
                         break;
                     };
                     track_cursor += tvint_len;
                     let tend = (track_cursor + tlen as usize).min(elem_end);
                     if tid == 0xF7 {
-                        this_track = Some(read_ebml_uint(&tail_bytes[track_cursor..tend]));
+                        this_track = Some(read_ebml_uint(&buf[track_cursor..tend]));
                     } else if tid == 0xF1 {
-                        this_pos = Some(read_ebml_uint(&tail_bytes[track_cursor..tend]));
+                        this_pos = Some(read_ebml_uint(&buf[track_cursor..tend]));
                     }
                     track_cursor = tend;
                 }
-                // If this CueTrackPositions entry matches the video track (or track not specified), keep its cluster position
                 if this_track.is_none() || this_track == Some(vid_track) {
                     if let Some(pos) = this_pos {
                         matching_cluster_pos = Some(pos);
@@ -2544,6 +2605,29 @@ pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_sec
 
     // CueClusterPosition is relative to Segment data offset.
     best_cue.map(|(_, pos)| pos + seg_offset)
+}
+
+/// Extracts the cluster byte offset for a given timestamp (in seconds) from an MKV head and tail index (Cues).
+/// Searches tail_bytes first, then falls back to head_bytes for front-indexed MKVs.
+pub fn find_mkv_cue_offset(head_bytes: &[u8], tail_bytes: &[u8], target_time_secs: f64) -> Option<u64> {
+    if tail_bytes.len() < 16 && head_bytes.len() < 16 {
+        return None;
+    }
+    let seg_offset = find_mkv_segment_data_offset(head_bytes);
+    let vid_track = find_mkv_video_track(head_bytes);
+    let time_scale = find_mkv_timestamp_scale(head_bytes);
+    let target_time_ticks =
+        ((target_time_secs.max(0.0) * 1_000_000_000.0) / (time_scale as f64)) as u64;
+
+    if tail_bytes.len() >= 16 {
+        if let Some(offset) = parse_mkv_cues_in_buf(tail_bytes, seg_offset, vid_track, target_time_ticks) {
+            return Some(offset);
+        }
+    }
+    if head_bytes.len() >= 16 {
+        return parse_mkv_cues_in_buf(head_bytes, seg_offset, vid_track, target_time_ticks);
+    }
+    None
 }
 
 /// Looks up any saved playback position (in seconds) for a user and item.

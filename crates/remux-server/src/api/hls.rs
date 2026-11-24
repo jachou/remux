@@ -620,7 +620,13 @@ async fn create_hls_session(
         state
             .ctx
             .sessions
-            .attach_transcode(&play_session_id, session.clone());
+            .attach_transcode_for_session(
+                &play_session_id,
+                auth.user.id,
+                auth.device.id.clone(),
+                id,
+                session.clone(),
+            );
 
         // Start transcoding in background
         let session_clone = session.clone();

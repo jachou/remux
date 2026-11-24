@@ -35,17 +35,19 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
     /// Acquire the lock for `key`, inserting an entry if none exists.
     pub async fn lock(&self, key: K) -> KeyedLockGuard<K> {
         let map = self.inner();
-        let entry = map
-            .entry(key.clone())
-            .or_insert_with(|| {
+        let entry = {
+            let entry_ref = map.entry(key.clone()).or_insert_with(|| {
                 Arc::new(KeyEntry {
                     mutex: Arc::new(Mutex::new(())),
                     waiters: AtomicUsize::new(0),
                 })
-            })
-            .clone();
+            });
+            // Increment waiters WHILE holding the DashMap shard lock so a concurrent
+            // Drop cannot observe waiters == 0 and evict this entry out from under us.
+            entry_ref.waiters.fetch_add(1, Ordering::SeqCst);
+            entry_ref.clone()
+        };
 
-        entry.waiters.fetch_add(1, Ordering::SeqCst);
         let waiter_guard = WaiterGuard {
             map: map.clone(),
             key: key.clone(),
@@ -75,11 +77,12 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
     /// Returns `None` immediately if no entry is found.
     pub async fn lock_if_exists(&self, key: &K) -> Option<KeyedLockGuard<K>> {
         let map = self.inner();
-        let entry = map
-            .get(key)
-            .map(|e| Arc::clone(&e))?;
+        let entry = {
+            let entry_ref = map.get(key)?;
+            entry_ref.waiters.fetch_add(1, Ordering::SeqCst);
+            Arc::clone(&entry_ref)
+        };
 
-        entry.waiters.fetch_add(1, Ordering::SeqCst);
         let waiter_guard = WaiterGuard {
             map: map.clone(),
             key: key.clone(),
@@ -112,8 +115,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for WaiterGuard<K> {
         if !self.acquired {
             let prev = self.entry.waiters.fetch_sub(1, Ordering::SeqCst);
             if prev == 1 {
-                self.map
-                    .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.entry));
+                self.map.remove_if(&self.key, |_, current| {
+                    Arc::ptr_eq(current, &self.entry)
+                        && current.waiters.load(Ordering::SeqCst) == 0
+                });
             }
         }
     }
@@ -131,8 +136,10 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> Drop for KeyedLockGuard<K> {
         drop(self._guard.take());
         let prev = self.entry.waiters.fetch_sub(1, Ordering::SeqCst);
         if prev == 1 {
-            self.map
-                .remove_if(&self.key, |_, current| Arc::ptr_eq(current, &self.entry));
+            self.map.remove_if(&self.key, |_, current| {
+                Arc::ptr_eq(current, &self.entry)
+                    && current.waiters.load(Ordering::SeqCst) == 0
+            });
         }
     }
 }

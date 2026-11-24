@@ -1712,7 +1712,6 @@ async fn videos_stream_inner(
     if q.static_
         .unwrap_or(false)
         || resolved_codecs.direct_play_only
-        || crate::fast_start::is_remote_client(&headers)
     {
         record_served(ServedPlayback::Direct);
         // If the producing addon has http_redirect_stream enabled, issue a 302

@@ -666,7 +666,7 @@ pub async fn get_items(
                         .ctx
                         .db,
                     &q,
-                    true,
+                    q.enable_total_record_count.unwrap_or(true),
                     Some(&session.user),
                     Some(&server_config),
                     None,
@@ -703,7 +703,7 @@ pub async fn get_items(
                         .ctx
                         .db,
                     &q,
-                    true,
+                    q.enable_total_record_count.unwrap_or(true),
                     Some(&session.user),
                     Some(&server_config),
                     smart_filter,
@@ -733,7 +733,7 @@ pub async fn get_items(
                         .ctx
                         .db,
                     &q,
-                    true,
+                    q.enable_total_record_count.unwrap_or(true),
                     Some(&session.user),
                     Some(&server_config),
                     None,
@@ -4239,17 +4239,27 @@ pub async fn media_segments(
     };
     let filter_ref = type_filter.as_deref();
 
-    let mut media = db::Media::get_by_id(
-        &state
-            .ctx
-            .db,
-        &id,
-    )
-    .await?
-    .unwrap_or_else(|| db::Media {
-        id,
-        ..Default::default()
-    });
+    let mut media = match MediaResolveService::resolve_item(id, &state.ctx).await? {
+        Some(m) => {
+            // If the caller passed a Stream or StreamGroup UUID (e.g. MediaSourceId),
+            // unwrap to its parent Episode/Movie so segment addons see the actual item.
+            if matches!(m.kind, db::MediaKind::Stream | db::MediaKind::StreamGroup) {
+                if let Some(pid) = m.parent_id {
+                    MediaResolveService::resolve_item(pid, &state.ctx)
+                        .await?
+                        .unwrap_or(m)
+                } else {
+                    m
+                }
+            } else {
+                m
+            }
+        }
+        None => db::Media {
+            id,
+            ..Default::default()
+        },
+    };
     let _ = media
         .grandparent(
             &state

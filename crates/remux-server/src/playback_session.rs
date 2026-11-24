@@ -769,9 +769,9 @@ impl PlaybackSessionManager {
                 .sessions
                 .iter()
                 .filter(|e| {
-                    e.value()
-                        .device_id
-                        == session.device_id
+                    let s = e.value();
+                    s.device_id == session.device_id
+                        && (s.user_id == session.user_id || s.user_id.is_nil())
                         && e.key() != &session.play_session_id
                 })
                 .map(|e| {
@@ -975,38 +975,49 @@ impl PlaybackSessionManager {
         id: &str,
         ts: Arc<tokio::sync::RwLock<TranscodeSession>>,
     ) {
+        self.attach_transcode_for_session(id, Uuid::nil(), String::new(), Uuid::nil(), ts);
+    }
+
+    pub fn attach_transcode_for_session(
+        &self,
+        id: &str,
+        user_id: Uuid,
+        device_id: String,
+        item_id: Uuid,
+        ts: Arc<tokio::sync::RwLock<TranscodeSession>>,
+    ) {
         if let Some(mut entry) = self
             .sessions
             .get_mut(id)
         {
-            entry
-                .value_mut()
-                .transcode = Some(ts);
+            let s = entry.value_mut();
+            s.transcode = Some(ts);
+            if s.user_id.is_nil() && !user_id.is_nil() {
+                s.user_id = user_id;
+            }
+            if s.device_id.is_empty() && !device_id.is_empty() {
+                s.device_id = device_id;
+            }
+            if s.item_id.is_nil() && !item_id.is_nil() {
+                s.item_id = item_id;
+            }
         } else {
-            // Inherit device_id from the freshest transcodeless session so that
-            // get_sessions can find this stub by device_id immediately.
-            let inherited_device_id = self
-                .sessions
-                .iter()
-                .filter(|e| {
-                    e.value()
-                        .transcode
-                        .is_none()
-                        && !e
-                            .value()
-                            .device_id
-                            .is_empty()
-                })
-                .max_by_key(|e| {
-                    e.value()
-                        .last_activity
-                })
-                .map(|e| {
-                    e.value()
-                        .device_id
-                        .clone()
-                })
-                .unwrap_or_default();
+            // Only fall back to inheriting device_id when the caller did not supply one (legacy tests).
+            let resolved_device_id = if !device_id.is_empty() {
+                device_id
+            } else {
+                self.sessions
+                    .iter()
+                    .filter(|e| {
+                        let s = e.value();
+                        s.transcode.is_none()
+                            && !s.device_id.is_empty()
+                            && (user_id.is_nil() || s.user_id == user_id)
+                    })
+                    .max_by_key(|e| e.value().last_activity)
+                    .map(|e| e.value().device_id.clone())
+                    .unwrap_or_default()
+            };
 
             self.sessions
                 .insert(
@@ -1014,10 +1025,10 @@ impl PlaybackSessionManager {
                     PlaybackSession {
                         play_session_id: id.to_string(),
                         transcode: Some(ts),
-                        user_id: Uuid::nil(),
-                        item_id: Uuid::nil(),
+                        user_id,
+                        item_id,
                         media_source_id: None,
-                        device_id: inherited_device_id,
+                        device_id: resolved_device_id,
                         client_name: String::new(),
                         position_ticks: 0,
                         can_seek: true,

@@ -44,15 +44,35 @@ fn subtitle_query_for(stream: &db::Media) -> crate::addons::SubtitleQuery {
     }
 }
 
-/// Checks whether a media source (or probed stream) already contains embedded subtitle
-/// tracks covering any of the user's preferred subtitle languages.
-/// If `preferred_languages` is empty, returns true if ANY embedded subtitle track exists.
+fn is_bitmap_subtitle_codec(codec: Option<&str>) -> bool {
+    matches!(
+        codec.map(|c| c.to_ascii_lowercase()).as_deref(),
+        Some(
+            "pgssub"
+                | "hdmv_pgs_subtitle"
+                | "dvdsub"
+                | "dvd_subtitle"
+                | "vobsub"
+                | "dvbsub"
+                | "dvb_subtitle"
+                | "xsub"
+        )
+    )
+}
+
+/// Checks whether a media source (or probed stream) already contains playable, non-forced
+/// text embedded subtitle tracks covering any of the user's preferred subtitle languages.
+/// Bitmap tracks (PGS/DVD/DVB) and forced-only tracks do not satisfy full-subtitle coverage.
 pub(crate) fn has_matching_embedded_subtitles(
     source: &api::MediaSourceInfo,
     preferred_languages: &[String],
 ) -> bool {
     source.media_streams.iter().any(|stream| {
-        if stream.type_ != Some(MediaStreamType::Subtitle) || stream.is_external {
+        if stream.type_ != Some(MediaStreamType::Subtitle)
+            || stream.is_external
+            || stream.is_forced
+            || is_bitmap_subtitle_codec(stream.codec.as_deref())
+        {
             return false;
         }
         if preferred_languages.is_empty() {
@@ -1975,6 +1995,12 @@ fn record_recent_preemptive_probe(item_id: Uuid) {
     RECENT_PREEMPTIVE_PROBES.insert(item_id, now);
 }
 
+/// Clears any 30s preemptive-probe cooldown for `item_id` (e.g. on mid-way playback stop)
+/// so a resume-buffer refresh at the new stop position is never silently dropped.
+pub fn clear_recent_preemptive_probe(item_id: Uuid) {
+    RECENT_PREEMPTIVE_PROBES.remove(&item_id);
+}
+
 /// If a preemptive probe is actively executing (holding a worker permit) for `item_id`,
 /// await its completion up to 3 seconds so foreground PlaybackInfo coalesces with it.
 /// If the probe is merely waiting in the queue (or not scheduled), returns immediately (0ms).
@@ -2281,6 +2307,12 @@ async fn prefetch_subtitles_for_media(
         }
     }
 
+    if !ctx.addons.has_subtitle_addons() || sub_langs.is_empty() {
+        let _ = seg_media.grandparent(&ctx.db).await;
+        ctx.addons.fetch_segments(&seg_media, ctx, true).await;
+        return;
+    }
+
     let query = target_stream
         .as_ref()
         .map(|s| subtitle_query_for(s))
@@ -2296,30 +2328,25 @@ async fn prefetch_subtitles_for_media(
     let mut descriptors: Vec<crate::stream::StreamDescriptor> = subs
         .into_iter()
         .filter(|s| {
-            sub_langs.is_empty()
-                || s.lang
-                    .as_deref()
-                    .is_some_and(|l| sub_langs.iter().any(|lang| l.eq_ignore_ascii_case(lang)))
+            let s_lang = crate::subtitle_selection::normalized_language(s.lang.as_deref());
+            sub_langs.iter().any(|lang| {
+                crate::subtitle_selection::normalized_language(Some(lang.as_str())) == s_lang
+            })
         })
+        .take(sub_langs.len().max(1) * 2)
         .filter_map(|s| s.url)
         .collect();
 
-    if let Ok(streams) = streams_res {
-        for stream in streams {
-            if let Some(si) = stream.stream_info.as_ref() {
-                for s in &si.subtitles {
-                    let info = crate::conversions::stremio_subtitle_to_subtitle_info(s);
-                    if (sub_langs.is_empty()
-                        || info
-                            .lang
-                            .as_deref()
-                            .is_some_and(|l| {
-                                sub_langs.iter().any(|lang| l.eq_ignore_ascii_case(lang))
-                            }))
-                        && let Some(url) = info.url
-                    {
-                        descriptors.push(url);
-                    }
+    if let Some(ref target) = target_stream {
+        if let Some(si) = target.stream_info.as_ref() {
+            for s in &si.subtitles {
+                let info = crate::conversions::stremio_subtitle_to_subtitle_info(s);
+                let s_lang = crate::subtitle_selection::normalized_language(info.lang.as_deref());
+                if sub_langs.iter().any(|lang| {
+                    crate::subtitle_selection::normalized_language(Some(lang.as_str())) == s_lang
+                }) && let Some(url) = info.url
+                {
+                    descriptors.push(url);
                 }
             }
         }

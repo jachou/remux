@@ -1960,6 +1960,17 @@ impl Media {
                 Arc::new(m)
             };
 
+        // Pre-build one shared Arc<Media> stub per parent/grandparent UUID so sibling items
+        // sharing a season, series, album, or artist all receive its artwork instead of
+        // only the first item (parent_images.remove() inside the child loop stripped items 2..N).
+        let stub_map: HashMap<Uuid, Arc<Media>> = parent_map
+            .iter()
+            .map(|(&id, row)| {
+                let imgs = parent_images.remove(&id).unwrap_or_default();
+                (id, make_stub(row, imgs))
+            })
+            .collect();
+
         for media in records.iter_mut() {
             if !matches!(
                 media.kind,
@@ -1973,11 +1984,8 @@ impl Media {
             }
 
             if let Some(pid) = media.parent_id {
-                if let Some(row) = parent_map.get(&pid) {
-                    let imgs = parent_images
-                        .remove(&pid)
-                        .unwrap_or_default();
-                    media.parent = Some(make_stub(row, imgs));
+                if let Some(stub) = stub_map.get(&pid) {
+                    media.parent = Some(Arc::clone(stub));
                 }
             }
 
@@ -1990,11 +1998,8 @@ impl Media {
                 _ => media.grandparent_id,
             };
             if let Some(gid) = gp_id {
-                if let Some(row) = parent_map.get(&gid) {
-                    let imgs = parent_images
-                        .remove(&gid)
-                        .unwrap_or_default();
-                    media.grandparent = Some(make_stub(row, imgs));
+                if let Some(stub) = stub_map.get(&gid) {
+                    media.grandparent = Some(Arc::clone(stub));
                 }
             }
         }
@@ -2739,15 +2744,15 @@ impl Media {
         .bind(self.rating_critic)
         .bind(self.rating_audience)
         .bind(&self.description)
-        .bind(sqlx::types::Json(&self.trailers))
-        .bind(sqlx::types::Json(&self.stream_info))
+        .bind(self.trailers.as_ref().map(sqlx::types::Json))
+        .bind(self.stream_info.as_ref().map(sqlx::types::Json))
         .bind(self.probe_data.as_ref().map(sqlx::types::Json))
         .bind(self.promoted)
         .bind(&self.collection_kind)
         .bind(&self.collection_media_kind)
         .bind(self.collection_max_items)
         .bind(sqlx::types::Json(&self.external_ids))
-        .bind(sqlx::types::Json(&self.external_ratings))
+        .bind(self.external_ratings.as_ref().map(sqlx::types::Json))
         .bind(self.created_at)
         .bind(updated_at)
         .bind(&self.certification)
@@ -2764,14 +2769,14 @@ impl Media {
         .bind(&self.status)
         .bind(self.refreshed_at)
         .bind(self.grandparent_id)
-        .bind(sqlx::types::Json(&self.collection_smart_filter))
+        .bind(self.collection_smart_filter.as_ref().map(sqlx::types::Json))
         .bind(self.country.as_deref().map(normalize_country_alpha2))
         .bind(&self.program_kind)
         .bind(self.collection_latest_auto_unplayed)
         .bind(self.collection_latest_sort_digital)
-        .bind(sqlx::types::Json(&self.collection_default_sort))
-        .bind(sqlx::types::Json(&self.collection_default_sort_order))
-        .bind(sqlx::types::Json(&self.collection_image_config))
+        .bind(self.collection_default_sort.as_ref().map(sqlx::types::Json))
+        .bind(self.collection_default_sort_order.as_ref().map(sqlx::types::Json))
+        .bind(self.collection_image_config.as_ref().map(sqlx::types::Json))
         .bind(&self.original_language)
         .bind(self.is_locked)
         .bind(sqlx::types::Json(&self.locked_fields))
@@ -2882,8 +2887,16 @@ impl Media {
                     .push_bind(&item.rating_critic)
                     .push_bind(&item.rating_audience)
                     .push_bind(&item.description)
-                    .push_bind(sqlx::types::Json(&item.trailers))
-                    .push_bind(sqlx::types::Json(&item.stream_info))
+                    .push_bind(
+                        item.trailers
+                            .as_ref()
+                            .map(sqlx::types::Json),
+                    )
+                    .push_bind(
+                        item.stream_info
+                            .as_ref()
+                            .map(sqlx::types::Json),
+                    )
                     .push_bind(
                         item.probe_data
                             .as_ref()
@@ -2893,7 +2906,11 @@ impl Media {
                     .push_bind(&item.collection_kind)
                     .push_bind(&item.collection_media_kind)
                     .push_bind(sqlx::types::Json(&item.external_ids))
-                    .push_bind(sqlx::types::Json(&item.external_ratings))
+                    .push_bind(
+                        item.external_ratings
+                            .as_ref()
+                            .map(sqlx::types::Json),
+                    )
                     .push_bind(&item.created_at)
                     .push_bind(Utc::now())
                     .push_bind(&item.certification)
@@ -2917,8 +2934,16 @@ impl Media {
                     .push_bind(&item.program_kind)
                     .push_bind(&item.collection_latest_auto_unplayed)
                     .push_bind(&item.collection_latest_sort_digital)
-                    .push_bind(sqlx::types::Json(&item.collection_default_sort))
-                    .push_bind(sqlx::types::Json(&item.collection_default_sort_order))
+                    .push_bind(
+                        item.collection_default_sort
+                            .as_ref()
+                            .map(sqlx::types::Json),
+                    )
+                    .push_bind(
+                        item.collection_default_sort_order
+                            .as_ref()
+                            .map(sqlx::types::Json),
+                    )
                     .push_bind(&item.original_language)
                     .push_bind(&item.is_locked)
                     .push_bind(sqlx::types::Json(&item.locked_fields))
@@ -3001,8 +3026,8 @@ impl Media {
                     .push_bind(&item.rating_critic)
                     .push_bind(&item.rating_audience)
                     .push_bind(&item.description)
-                    .push_bind(sqlx::types::Json(&item.trailers))
-                    .push_bind(sqlx::types::Json(&item.stream_info))
+                    .push_bind(item.trailers.as_ref().map(sqlx::types::Json))
+                    .push_bind(item.stream_info.as_ref().map(sqlx::types::Json))
                     .push_bind(
                         item.probe_data
                             .as_ref()
@@ -3012,7 +3037,7 @@ impl Media {
                     .push_bind(&item.collection_kind)
                     .push_bind(&item.collection_media_kind)
                     .push_bind(sqlx::types::Json(&item.external_ids))
-                    .push_bind(sqlx::types::Json(&item.external_ratings))
+                    .push_bind(item.external_ratings.as_ref().map(sqlx::types::Json))
                     .push_bind(&item.created_at)
                     .push_bind(&now)
                     .push_bind(&item.certification)
@@ -3037,8 +3062,8 @@ impl Media {
                     .push_bind(&item.program_kind)
                     .push_bind(&item.collection_latest_auto_unplayed)
                     .push_bind(&item.collection_latest_sort_digital)
-                    .push_bind(sqlx::types::Json(&item.collection_default_sort))
-                    .push_bind(sqlx::types::Json(&item.collection_default_sort_order))
+                    .push_bind(item.collection_default_sort.as_ref().map(sqlx::types::Json))
+                    .push_bind(item.collection_default_sort_order.as_ref().map(sqlx::types::Json))
                     .push_bind(&item.original_language)
                     .push_bind(&item.is_locked)
                     .push_bind(sqlx::types::Json(&item.locked_fields))
@@ -3056,14 +3081,14 @@ impl Media {
                 rating_critic = COALESCE(excluded.rating_critic, media.rating_critic),
                 rating_audience = COALESCE(excluded.rating_audience, media.rating_audience),
                 description = COALESCE(excluded.description, media.description),
-                trailers = COALESCE(excluded.trailers, media.trailers),
-                stream_info = COALESCE(excluded.stream_info, media.stream_info),
+                trailers = COALESCE(NULLIF(excluded.trailers, 'null'), NULLIF(media.trailers, 'null')),
+                stream_info = COALESCE(NULLIF(excluded.stream_info, 'null'), NULLIF(media.stream_info, 'null')),
                 external_ids = json_patch(
                     CASE WHEN json_valid(media.external_ids)
                          THEN media.external_ids ELSE '{}' END,
                     excluded.external_ids
                 ),
-                external_ratings = COALESCE(excluded.external_ratings, media.external_ratings),
+                external_ratings = COALESCE(NULLIF(excluded.external_ratings, 'null'), NULLIF(media.external_ratings, 'null')),
                 probe_data = COALESCE(excluded.probe_data, media.probe_data),
                 grandparent_id = excluded.grandparent_id,
                 updated_at = excluded.updated_at,
@@ -4959,10 +4984,8 @@ impl Media {
                             qb.push(" OR ");
                         }
                         first = false;
-                        qb.push(
-                            "CAST(json_extract(external_ids, '$.tmdb') AS TEXT) = ",
-                        )
-                        .push_bind(tmdb.to_string());
+                        qb.push("json_extract(external_ids, '$.tmdb') = ")
+                            .push_bind(tmdb);
                     }
                     for imdb in &ids.imdb {
                         if !first {
@@ -4977,10 +5000,8 @@ impl Media {
                             qb.push(" OR ");
                         }
                         first = false;
-                        qb.push(
-                            "CAST(json_extract(external_ids, '$.tvdb') AS TEXT) = ",
-                        )
-                        .push_bind(tvdb.to_string());
+                        qb.push("json_extract(external_ids, '$.tvdb') = ")
+                            .push_bind(tvdb);
                     }
                     qb.push(")");
                 }
@@ -6694,17 +6715,17 @@ impl Media {
             .begin()
             .await?;
         for item in items {
-            let ext_json = sqlx::types::Json(&item.external_ratings);
+            let ext_json = item.external_ratings.as_ref().map(sqlx::types::Json);
             sqlx::query(
                 "UPDATE media SET \
                  rating_audience = COALESCE(?1, rating_audience), \
                  rating_critic = COALESCE(?2, rating_critic), \
-                 external_ratings = COALESCE(?3, external_ratings) \
+                 external_ratings = COALESCE(?3, NULLIF(external_ratings, 'null')) \
                  WHERE id = ?4 \
                    AND ( \
                      rating_audience IS NOT COALESCE(?1, rating_audience) \
                      OR rating_critic IS NOT COALESCE(?2, rating_critic) \
-                     OR external_ratings IS NOT COALESCE(?3, external_ratings) \
+                     OR NULLIF(external_ratings, 'null') IS NOT COALESCE(?3, NULLIF(external_ratings, 'null')) \
                    )",
             )
             .bind(item.rating_audience)
@@ -7805,6 +7826,7 @@ async fn bulk_mark_played(
         }
         qb.push(") ON CONFLICT(user_id, media_id) DO UPDATE SET \
                play_count = CASE WHEN user_media_state.play_count > 0 THEN user_media_state.play_count ELSE excluded.play_count END, \
+               playback_position = 0, \
                played_at  = CASE WHEN user_media_state.play_count > 0 THEN user_media_state.played_at  ELSE excluded.played_at  END, \
                last_played_at = excluded.last_played_at");
         if let Err(e) = qb

@@ -4049,6 +4049,7 @@ impl AddonService {
         let addon_count = addons.len();
         let instant = Instant::now();
         let mut merged = MediaSegments::default();
+        let mut any_errored = false;
         for (name, addon) in addons {
             match addon
                 .segment_fetch(media, ctx)
@@ -4057,6 +4058,7 @@ impl AddonService {
                 Ok(segs) if !segs.is_empty() => merged.merge_from(segs),
                 Ok(_) => {}
                 Err(e) => {
+                    any_errored = true;
                     error!(addon = %name, item = %media.id, error = %e, "segment addon failed")
                 }
             }
@@ -4072,8 +4074,17 @@ impl AddonService {
         .filter(|s| s.is_some())
         .count();
 
-        ctx.store
-            .save(cache_key, merged.clone(), SEGMENTS_TTL);
+        if !any_errored {
+            let ttl = if found > 0 {
+                SEGMENTS_TTL
+            } else {
+                // Short negative-cache TTL so transient empty responses (or
+                // pre-probe chapter misses) don't poison the cache for 7 days.
+                std::time::Duration::from_secs(5 * 60)
+            };
+            ctx.store
+                .save(cache_key, merged.clone(), ttl);
+        }
 
         if background {
             debug!(segments = found, addons = addon_count, elapsed = ?instant.elapsed(), "segments fetched");

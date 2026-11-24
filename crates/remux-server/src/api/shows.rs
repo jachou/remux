@@ -671,14 +671,44 @@ async fn shows_nextup_all(
         );
     }
 
-    let order: HashMap<Uuid, usize> = candidates
+    let total = candidates.len() as i64;
+    let start = q.start_index.unwrap_or(0) as usize;
+    let limit = q.limit.unwrap_or(u32::MAX) as usize;
+    // Slice to the requested page before hydrating via get_items (unless parental policy rules
+    // might filter out some candidates, in which case keep the full candidate list).
+    let has_policy_filters = session
+        .user
+        .policy
+        .as_ref()
+        .is_some_and(|p| {
+            p.0.max_parental_rating.is_some()
+                || !p.0.blocked_tags.is_empty()
+                || !p.0.allowed_tags.is_empty()
+                || p.0.filter_rules.is_some()
+        });
+
+    let page_candidates: Vec<_> = if has_policy_filters {
+        candidates
+    } else {
+        candidates.into_iter().skip(start).take(limit).collect()
+    };
+
+    if page_candidates.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "Items": [],
+            "TotalRecordCount": total,
+            "StartIndex": q.start_index.unwrap_or_default(),
+        })));
+    }
+
+    let order: HashMap<Uuid, usize> = page_candidates
         .iter()
         .enumerate()
         .map(|(index, (media, _))| (media.id, index))
         .collect();
     let mut query = q.clone();
     query.ids = Some(
-        candidates
+        page_candidates
             .into_iter()
             .map(|(media, _)| media.id)
             .collect(),
@@ -687,28 +717,26 @@ async fn shows_nextup_all(
     query.strict_item_filters = true;
     query.start_index = None;
     query.limit = Some(order.len() as u32);
+    let db_pool = state.ctx.db.clone();
     let mut items = get_items(state, session, query, false)
         .await?
+        .preload_playlist_runtimes(&db_pool)
+        .await
         .with_permissions()
         .with_client_patches()
         .build()
         .items;
     items.sort_by_key(|item| order[&item.id]);
-    let total = items.len() as i64;
-    let items: Vec<_> = items
-        .into_iter()
-        .skip(
-            q.start_index
-                .unwrap_or(0) as usize,
-        )
-        .take(
-            q.limit
-                .unwrap_or(u32::MAX) as usize,
-        )
-        .collect();
+    let (final_total, items) = if has_policy_filters {
+        let filtered_total = items.len() as i64;
+        let paged: Vec<_> = items.into_iter().skip(start).take(limit).collect();
+        (filtered_total, paged)
+    } else {
+        (total, items)
+    };
     Ok(Json(serde_json::json!({
         "Items": super::items::serialize_item_list(&items, q.fields.as_deref()),
-        "TotalRecordCount": total,
+        "TotalRecordCount": final_total,
         "StartIndex": q.start_index.unwrap_or_default(),
     })))
 }

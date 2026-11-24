@@ -489,7 +489,8 @@ pub async fn init_app(
                 })
                 .on_failure(()),
         )
-        .layer(cors);
+        .layer(cors)
+        .layer(tower_http::compression::CompressionLayer::new());
 
     Ok((router, ctx))
 }
