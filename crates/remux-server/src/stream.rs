@@ -313,6 +313,27 @@ mod error_video_tests {
     }
 
     #[test]
+    fn liveness_expiry_uses_short_ttl_for_transient_errors() {
+        use moka::Expiry;
+        let expiry = LivenessExpiry;
+        let now = std::time::Instant::now();
+        let key = "https://example.com/stream.mkv".to_string();
+
+        assert_eq!(
+            expiry.expire_after_create(&key, &LivenessEntry::new_rate_limited_or_timeout(), now),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            expiry.expire_after_create(&key, &LivenessEntry::new(false), now),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(
+            expiry.expire_after_create(&key, &LivenessEntry::new(true), now),
+            Some(std::time::Duration::from_secs(3600))
+        );
+    }
+
+    #[test]
     fn allows_normal_media_urls() {
         assert!(!is_error_video_url("https://direct-cdn.torbox.app/d/12345/Tracker.S04E03.1080p.mkv"));
         assert!(!is_error_video_url("https://real-debrid.com/d/abc/Movie.2024.2160p.mp4"));

@@ -241,3 +241,110 @@ impl Task for CleanTranscodeFolderTask {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{Media, MediaKind};
+    use uuid::Uuid;
+
+    #[tokio::test]
+    async fn sweep_preserves_stream_groups_and_fresh_streams_and_resets_stale_parents() {
+        let (_server, guard) = crate::integration_test::new_test_server()
+            .await
+            .unwrap();
+        let ctx = guard.0.clone();
+
+        let movie_id = Uuid::new_v4();
+        let group_id = Uuid::new_v4();
+        let fresh_stream_id = Uuid::new_v4();
+        let stale_stream_id = Uuid::new_v4();
+
+        let movie = Media {
+            id: movie_id,
+            kind: MediaKind::Movie,
+            title: "Test Movie".into(),
+            external_ids: crate::db::ExternalIds {
+                tmdb: Some(12345),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let group = Media {
+            id: group_id,
+            kind: MediaKind::StreamGroup,
+            title: "4K Remux Group".into(),
+            ..Default::default()
+        };
+        let fresh_stream = Media {
+            id: fresh_stream_id,
+            kind: MediaKind::Stream,
+            parent_id: Some(movie_id),
+            title: "Fresh Stream".into(),
+            ..Default::default()
+        };
+        let stale_stream = Media {
+            id: stale_stream_id,
+            kind: MediaKind::Stream,
+            parent_id: Some(movie_id),
+            title: "Stale Stream".into(),
+            ..Default::default()
+        };
+        Media::insert(&ctx.db, &[movie, group, fresh_stream, stale_stream])
+            .await
+            .unwrap();
+
+        // Age stream_group and both streams' created_at to 10 days ago;
+        // keep fresh_stream.updated_at recent, age stale_stream.updated_at to 5 days ago,
+        // and stamp movie.streams_refreshed_at.
+        sqlx::query(
+            "UPDATE media SET created_at = datetime('now', '-10 days'), updated_at = datetime('now', '-10 days') WHERE id = ?",
+        )
+        .bind(group_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE media SET created_at = datetime('now', '-10 days'), updated_at = datetime('now') WHERE id = ?",
+        )
+        .bind(fresh_stream_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE media SET created_at = datetime('now', '-10 days'), updated_at = datetime('now', '-5 days') WHERE id = ?",
+        )
+        .bind(stale_stream_id)
+        .execute(&ctx.db)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE media SET streams_refreshed_at = datetime('now') WHERE id = ?")
+            .bind(movie_id)
+            .execute(&ctx.db)
+            .await
+            .unwrap();
+
+        let tasks = Arc::new(TaskService::new(ctx.clone()).await.unwrap());
+        let progress =
+            ProgressReporter::new(Arc::new(std::sync::atomic::AtomicU64::new(0)));
+        CleanTranscodeFolderTask
+            .run(ctx.clone(), tasks, progress)
+            .await
+            .unwrap();
+
+        // StreamGroup must NEVER be deleted
+        assert!(Media::get_by_id(&ctx.db, &group_id).await.unwrap().is_some());
+        // Fresh-updated stream (even with 10-day-old created_at) must survive
+        assert!(Media::get_by_id(&ctx.db, &fresh_stream_id).await.unwrap().is_some());
+        // Stale stream must be deleted
+        assert!(Media::get_by_id(&ctx.db, &stale_stream_id).await.unwrap().is_none());
+        // Parent's streams_refreshed_at must be cleared
+        let refreshed_at: Option<String> =
+            sqlx::query_scalar("SELECT streams_refreshed_at FROM media WHERE id = ?")
+                .bind(movie_id)
+                .fetch_one(&ctx.db)
+                .await
+                .unwrap();
+        assert!(refreshed_at.is_none());
+    }
+}

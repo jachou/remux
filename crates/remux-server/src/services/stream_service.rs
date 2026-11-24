@@ -3624,8 +3624,42 @@ mod tests {
         let spa_prefs = vec!["spa".to_string()];
         assert!(!has_matching_embedded_subtitles(&source, &spa_prefs));
 
+        // Empty preferences ("show all subtitles" default) must NOT suppress external subtitles
         let empty_prefs: Vec<String> = vec![];
-        assert!(has_matching_embedded_subtitles(&source, &empty_prefs));
+        assert!(!has_matching_embedded_subtitles(&source, &empty_prefs));
+
+        // Multi-language preferences require ALL configured languages to be embedded
+        let multi_prefs = vec!["eng".to_string(), "spa".to_string()];
+        assert!(!has_matching_embedded_subtitles(&source, &multi_prefs));
+        source.media_streams.push(remux_sdks::remux::MediaStream {
+            type_: Some(MediaStreamType::Subtitle),
+            is_external: false,
+            language: Some("spa".into()),
+            codec: Some("subrip".into()),
+            ..Default::default()
+        });
+        assert!(has_matching_embedded_subtitles(&source, &multi_prefs));
+
+        // Bitmap (PGS/DVD) and forced-only subtitle tracks do not satisfy full coverage
+        let mut bitmap_and_forced = api::MediaSourceInfo::default();
+        bitmap_and_forced.media_streams = vec![
+            remux_sdks::remux::MediaStream {
+                type_: Some(MediaStreamType::Subtitle),
+                is_external: false,
+                language: Some("eng".into()),
+                codec: Some("pgssub".into()),
+                ..Default::default()
+            },
+            remux_sdks::remux::MediaStream {
+                type_: Some(MediaStreamType::Subtitle),
+                is_external: false,
+                is_forced: true,
+                language: Some("eng".into()),
+                codec: Some("subrip".into()),
+                ..Default::default()
+            },
+        ];
+        assert!(!has_matching_embedded_subtitles(&bitmap_and_forced, &eng_prefs));
 
         // External stream does not count as embedded
         let mut ext_source = api::MediaSourceInfo::default();

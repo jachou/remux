@@ -3487,4 +3487,99 @@ mod tests {
         FAST_START_CACHE.invalidate(&slow_url);
         server.abort();
     }
+
+    #[tokio::test]
+    async fn no_range_and_custom_headers_fall_back_to_proxy() {
+        let url = "https://example.invalid/no-range-test.mkv";
+        FAST_START_CACHE.insert(
+            url.to_string(),
+            FastStartEntry {
+                item_id: Some(Uuid::new_v4()),
+                original_url: url.to_string(),
+                head_bytes: Bytes::from(vec![0u8; 64 * 1024]),
+                tail_bytes: None,
+                resume_buffer: None,
+                direct_cdn_url: "https://nexus.erth.tb-cdn.earth/dld/test".to_string(),
+                content_type: "video/x-matroska".to_string(),
+                total_size: 100 * 1024 * 1024,
+                created_at: Instant::now(),
+            },
+        );
+
+        // LAN request with NO Range header must NOT receive an unsolicited 206 Partial Content
+        let mut lan_no_range = HeaderMap::new();
+        lan_no_range.insert(header::HOST, HeaderValue::from_static("192.168.1.50:8096"));
+        let resp = handle_playback_request(Uuid::new_v4(), url, &lan_no_range, None).await;
+        assert!(resp.is_none(), "no-Range LAN request should fall back to 200 OK proxy");
+
+        // Remote request with custom upstream request_headers must NOT 307-redirect (would drop headers)
+        let mut remote_headers = HeaderMap::new();
+        remote_headers.insert(header::HOST, HeaderValue::from_static("media.example.com"));
+        remote_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+        let mut custom_upstream = HashMap::new();
+        custom_upstream.insert("Authorization".to_string(), "Bearer secret".to_string());
+        let resp_auth =
+            handle_playback_request(Uuid::new_v4(), url, &remote_headers, Some(&custom_upstream))
+                .await;
+        assert!(resp_auth.is_none(), "custom upstream headers must proxy instead of 307");
+
+        FAST_START_CACHE.invalidate(url);
+    }
+
+    #[test]
+    fn is_remote_client_handles_ipv6_local_and_forwarded_headers() {
+        let mut h = HeaderMap::new();
+        h.insert(header::HOST, HeaderValue::from_static("[::1]:8096"));
+        assert!(!is_remote_client(&h));
+
+        let mut h_ll = HeaderMap::new();
+        h_ll.insert(header::HOST, HeaderValue::from_static("[fe80::1]:8096"));
+        assert!(!is_remote_client(&h_ll));
+
+        let mut h_v4mapped = HeaderMap::new();
+        h_v4mapped.insert(
+            header::HeaderName::from_static("x-real-ip"),
+            HeaderValue::from_static("::ffff:192.168.1.42"),
+        );
+        assert!(!is_remote_client(&h_v4mapped));
+
+        let mut h_single = HeaderMap::new();
+        h_single.insert(header::HOST, HeaderValue::from_static("remux:8096"));
+        assert!(!is_remote_client(&h_single));
+
+        let mut h_wan = HeaderMap::new();
+        h_wan.insert(
+            header::HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("203.0.113.55, 172.17.0.1"),
+        );
+        h_wan.insert(header::HOST, HeaderValue::from_static("192.168.1.50:8096"));
+        assert!(is_remote_client(&h_wan));
+    }
+
+    #[test]
+    fn find_mkv_cue_offset_supports_head_only_front_indexed_cues() {
+        // Minimal synthetic MKV head: Segment (0x18538067) + Cues (0x1C53BB6B) with one
+        // CuePoint (0xBB) at CueTime=120_000ms -> CueClusterPosition=50_000_000.
+        let mut head = Vec::new();
+        // Segment header: ID 18 53 80 67, unknown size 01 FF FF FF FF FF FF FF
+        head.extend_from_slice(&[0x18, 0x53, 0x80, 0x67, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]);
+        let seg_data_start = head.len() as u64;
+        // CueClusterPosition (0xF1, size=4 -> 0x84, val=50_000_000 = 0x02FAF080)
+        let cue_track_pos = [0xF1, 0x84, 0x02, 0xFA, 0xF0, 0x80];
+        // CueTrackPositions (0xB7, size=6 -> 0x86)
+        let mut ctp = vec![0xB7, 0x80 | (cue_track_pos.len() as u8)];
+        ctp.extend_from_slice(&cue_track_pos);
+        // CueTime (0xB3, size=3 -> 0x83, val=120_000 = 0x01D4C0)
+        let cue_time = [0xB3, 0x83, 0x01, 0xD4, 0xC0];
+        // CuePoint (0xBB)
+        let mut cp = vec![0xBB, 0x80 | ((cue_time.len() + ctp.len()) as u8)];
+        cp.extend_from_slice(&cue_time);
+        cp.extend_from_slice(&ctp);
+        // Cues (0x1C53BB6B)
+        head.extend_from_slice(&[0x1C, 0x53, 0xBB, 0x6B, 0x80 | (cp.len() as u8)]);
+        head.extend_from_slice(&cp);
+
+        let offset = find_mkv_cue_offset(&head, &[], 120.0);
+        assert_eq!(offset, Some(seg_data_start + 50_000_000));
+    }
 }

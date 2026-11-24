@@ -234,4 +234,20 @@ mod tests {
         let _ = waiter.await;
         assert!(!locks.contains_key(&"session_cancel"));
     }
+
+    #[tokio::test]
+    async fn lock_and_lock_if_exists_do_not_leak_key_entry() {
+        let locks = KeyedLock::new();
+        let weak_entry = {
+            let guard = locks.lock("leak_check".to_string()).await;
+            let weak = Arc::downgrade(&guard.entry);
+            assert!(weak.upgrade().is_some());
+            weak
+        };
+        assert!(!locks.contains_key(&"leak_check".to_string()));
+        assert!(
+            weak_entry.upgrade().is_none(),
+            "KeyEntry leaked after KeyedLockGuard dropped"
+        );
+    }
 }
