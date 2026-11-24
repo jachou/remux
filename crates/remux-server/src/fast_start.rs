@@ -1962,8 +1962,29 @@ pub async fn handle_playback_request(
         }
 
         if entry.is_none() {
-            // For remote clients, do not stall on uncached items: immediately 307 to upstream resolver
+            // For remote clients, first check STREAM_LIVENESS_CACHE for an already-resolved
+            // direct CDN URL (populated by lightweight remote preemptive probes that intentionally
+            // skip the 64 MB RAM buffer). Fall back to the upstream resolver only on a true miss.
             if is_remote {
+                if let Some(live) = crate::stream::STREAM_LIVENESS_CACHE.get(url) {
+                    if live.alive {
+                        if let Some(ref direct_cdn) = live.direct_url {
+                            if !direct_cdn.is_empty()
+                                && !crate::stream::is_error_video_url(direct_cdn)
+                            {
+                                let token_expired =
+                                    live.verified_at.elapsed() >= Duration::from_secs(90 * 60);
+                                return Some(build_remote_direct_handoff(
+                                    item_id,
+                                    url,
+                                    direct_cdn,
+                                    token_expired,
+                                    range_header,
+                                ));
+                            }
+                        }
+                    }
+                }
                 METRICS.redirects_issued.fetch_add(1, Ordering::Relaxed);
                 info!(
                     %item_id,
@@ -3599,5 +3620,83 @@ mod tests {
 
         let offset = find_mkv_cue_offset(&head, &[], 120.0);
         assert_eq!(offset, Some(seg_data_start + 50_000_000));
+    }
+
+    #[tokio::test]
+    async fn remote_handle_playback_request_uses_liveness_cache_direct_url_without_ram_cache() {
+        let item_id = Uuid::new_v4();
+        let mut remote_headers = HeaderMap::new();
+        remote_headers.insert(
+            header::HeaderName::from_static("cf-connecting-ip"),
+            HeaderValue::from_static("203.0.113.99"),
+        );
+        remote_headers.insert(header::RANGE, HeaderValue::from_static("bytes=0-"));
+
+        // 1. Non-IP-locked CDN (TorBox) cached in STREAM_LIVENESS_CACHE (no RAM buffer):
+        // must 307 straight to direct_url, NOT back to the upstream resolver.
+        let resolver_tb = format!("https://resolver.example.test/stremio/tb/{item_id}.mkv");
+        let direct_tb = "https://nexus.erth.tb-cdn.earth/dld/test-uuid?token=abc".to_string();
+        FAST_START_CACHE.invalidate(&resolver_tb);
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            resolver_tb.clone(),
+            crate::stream::LivenessEntry::new_alive_with_direct_url(direct_tb.clone()),
+        );
+        let resp = handle_playback_request(item_id, &resolver_tb, &remote_headers, None)
+            .await
+            .expect("remote playback should return 307 response");
+        assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some(direct_tb.as_str()),
+            "remote client must 307 directly to cached TorBox CDN URL without needing RAM pre-warm"
+        );
+        assert_eq!(
+            resp.headers().get("X-Remux-FastStart").and_then(|v| v.to_str().ok()),
+            Some("redirect-direct-cdn")
+        );
+
+        // 2. IP-locked CDN (Real-Debrid) cached in STREAM_LIVENESS_CACHE:
+        // must redirect back to original resolver URL so the client IP mints its own token.
+        let resolver_rd = format!("https://resolver.example.test/stremio/rd/{item_id}.mkv");
+        let direct_rd = "https://chi4.download.real-debrid.com/d/ABC/file.mkv".to_string();
+        FAST_START_CACHE.invalidate(&resolver_rd);
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            resolver_rd.clone(),
+            crate::stream::LivenessEntry::new_alive_with_direct_url(direct_rd),
+        );
+        let resp_rd = handle_playback_request(item_id, &resolver_rd, &remote_headers, None)
+            .await
+            .expect("remote RD playback should return 307 response");
+        assert_eq!(resp_rd.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp_rd.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some(resolver_rd.as_str())
+        );
+        assert_eq!(
+            resp_rd.headers().get("X-Remux-FastStart").and_then(|v| v.to_str().ok()),
+            Some("remote-direct-resolver")
+        );
+
+        // 3. Error video URL in liveness cache must never be handed off as direct CDN.
+        let resolver_err = format!("https://resolver.example.test/stremio/err/{item_id}.mkv");
+        FAST_START_CACHE.invalidate(&resolver_err);
+        crate::stream::STREAM_LIVENESS_CACHE.insert(
+            resolver_err.clone(),
+            crate::stream::LivenessEntry::new_alive_with_direct_url(
+                "https://cdn.example.test/static/download_failed.mp4".to_string(),
+            ),
+        );
+        let resp_err = handle_playback_request(item_id, &resolver_err, &remote_headers, None)
+            .await
+            .expect("fallback 307 response");
+        assert_eq!(resp_err.status(), StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            resp_err.headers().get(header::LOCATION).and_then(|v| v.to_str().ok()),
+            Some(resolver_err.as_str())
+        );
+        assert_eq!(
+            resp_err.headers().get("X-Remux-FastStart").and_then(|v| v.to_str().ok()),
+            Some("remote-direct-resolver-uncached")
+        );
     }
 }

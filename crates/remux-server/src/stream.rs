@@ -618,7 +618,10 @@ impl StreamDescriptor {
 
                     record_upstream_success();
                     tracing::info!(%url, ?status, ?elapsed, direct_url = %direct_url, "liveness check passed, cached");
-                    STREAM_LIVENESS_CACHE.insert(url.clone(), LivenessEntry::new(true));
+                    STREAM_LIVENESS_CACHE.insert(
+                        url.clone(),
+                        LivenessEntry::new_alive_with_direct_url(direct_url.clone()),
+                    );
 
                     // Keep Fast-Start RAM buffer synchronized: if direct CDN redirect URL changed, refresh it in-place
                     if let Some(mut fs_entry) = crate::fast_start::FAST_START_CACHE.get(url) {
@@ -942,11 +945,12 @@ pub trait StreamSource: Send + Sync {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response>;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LivenessEntry {
     pub alive: bool,
     pub verified_at: std::time::Instant,
     pub rate_limited_or_timeout: bool,
+    pub direct_url: Option<String>,
 }
 
 impl LivenessEntry {
@@ -955,6 +959,16 @@ impl LivenessEntry {
             alive,
             verified_at: std::time::Instant::now(),
             rate_limited_or_timeout: false,
+            direct_url: None,
+        }
+    }
+
+    pub fn new_alive_with_direct_url(direct_url: String) -> Self {
+        Self {
+            alive: true,
+            verified_at: std::time::Instant::now(),
+            rate_limited_or_timeout: false,
+            direct_url: (!direct_url.is_empty()).then_some(direct_url),
         }
     }
 
@@ -963,6 +977,7 @@ impl LivenessEntry {
             alive: false,
             verified_at: std::time::Instant::now(),
             rate_limited_or_timeout: true,
+            direct_url: None,
         }
     }
 }
@@ -2054,6 +2069,7 @@ mod tests {
                 alive: true,
                 verified_at: std::time::Instant::now() - std::time::Duration::from_secs(45 * 60),
                 rate_limited_or_timeout: false,
+                direct_url: None,
             },
         );
         assert!(desc.is_liveness_expiring_soon());

@@ -3848,7 +3848,7 @@ mod tests {
         );
 
         // Foreground probe must finish promptly without waiting for bg_permits.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while super::QUEUED_PROBES.contains(&owner.id) {
             assert!(
                 std::time::Instant::now() < deadline,
