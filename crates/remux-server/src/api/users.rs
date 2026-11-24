@@ -411,16 +411,18 @@ pub async fn users(
     State(state): State<AppState>,
     session: auth::AuthSession,
 ) -> Result<impl IntoResponse> {
-    let users = db::User::get_by_filter(
-        &state
-            .ctx
-            .db,
-        &db::UserFilter {
-            ..Default::default()
-        },
-    )
-    .await?
-    .records;
+    let users = if session.user.is_admin {
+        db::User::get_by_filter(
+            &state.ctx.db,
+            &db::UserFilter {
+                ..Default::default()
+            },
+        )
+        .await?
+        .records
+    } else {
+        vec![session.user]
+    };
 
     Ok(Json(
         user_dtos(
@@ -1283,6 +1285,7 @@ pub async fn update_user_policy(
             ));
         }
     }
+    let is_now_disabled = policy.is_disabled;
     user.is_admin = policy.is_administrator;
     user.policy = Some(sqlx::types::Json(policy));
     user.save(
@@ -1291,6 +1294,12 @@ pub async fn update_user_policy(
             .db,
     )
     .await?;
+    if is_now_disabled {
+        let _ = sqlx::query("DELETE FROM devices WHERE user_id = ?1")
+            .bind(user_id)
+            .execute(&state.ctx.db)
+            .await;
+    }
     state
         .ctx
         .signals
@@ -2242,6 +2251,7 @@ pub async fn upload_user_image_legacy(
     Path((user_id, _image_type)): Path<(Uuid, String)>,
     image: crate::api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
+    require_self_or_admin(user_id, &session)?;
     upload_avatar_for(
         &state
             .ctx
@@ -2262,6 +2272,7 @@ pub async fn upload_user_image_indexed(
     Path((user_id, _image_type, _index)): Path<(Uuid, String, usize)>,
     image: crate::api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
+    require_self_or_admin(user_id, &session)?;
     upload_avatar_for(
         &state
             .ctx
@@ -2302,6 +2313,7 @@ pub async fn delete_user_image_legacy(
     session: auth::AuthSession,
     Path((user_id, _image_type)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse> {
+    require_self_or_admin(user_id, &session)?;
     delete_avatar_for(
         &state
             .ctx
@@ -2320,6 +2332,7 @@ pub async fn delete_user_image_indexed(
     session: auth::AuthSession,
     Path((user_id, _image_type, _index)): Path<(Uuid, String, usize)>,
 ) -> Result<impl IntoResponse> {
+    require_self_or_admin(user_id, &session)?;
     delete_avatar_for(
         &state
             .ctx

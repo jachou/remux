@@ -1027,12 +1027,14 @@ pub(crate) fn save_sidecar_subtitle_routes(
     media_source_id: Uuid,
     routes: Vec<SidecarSubtitleRoute>,
 ) {
+    let key = sidecar_subtitle_routes_key(device_id, item_id, media_source_id);
     if routes.is_empty() {
+        ctx.store.delete(&key);
         return;
     }
     ctx.store
         .save(
-            sidecar_subtitle_routes_key(device_id, item_id, media_source_id),
+            key,
             routes,
             std::time::Duration::from_secs(6 * 60 * 60),
         );
@@ -1484,7 +1486,7 @@ async fn subtitles_stream_inner(
         &url,
         &probe,
         item_id,
-        media_source_id,
+        media.id,
         stream_index,
         cache_codec,
     )

@@ -240,7 +240,8 @@ pub async fn report_playback_progress(
     let was_paused = state
         .ctx
         .sessions
-        .get_by_device(
+        .get_by_user_device(
+            session.user.id,
             &session
                 .device
                 .id,
@@ -253,7 +254,8 @@ pub async fn report_playback_progress(
             state
                 .ctx
                 .sessions
-                .get_by_device(
+                .get_by_user_device(
+                    session.user.id,
                     &session
                         .device
                         .id,
@@ -261,6 +263,11 @@ pub async fn report_playback_progress(
                 .map(|s| s.play_session_id)
         });
     if let Some(ref psid) = effective_psid {
+        if let Some(existing) = state.ctx.sessions.get(psid) {
+            if !existing.user_id.is_nil() && existing.user_id != session.user.id && !session.user.is_admin {
+                return Err(anyhow::anyhow!("cannot update another user's playback session").context_forbidden("forbidden"));
+            }
+        }
         let before = state
             .ctx
             .sessions
@@ -424,7 +431,8 @@ pub async fn report_playback_stopped(
             state
                 .ctx
                 .sessions
-                .get_by_device(
+                .get_by_user_device(
+                    session.user.id,
                     &session
                         .device
                         .id,
@@ -438,6 +446,11 @@ pub async fn report_playback_stopped(
             .ctx
             .sessions
             .get(psid);
+        if let Some(ref existing) = playback {
+            if !existing.user_id.is_nil() && existing.user_id != session.user.id && !session.user.is_admin {
+                return Err(anyhow::anyhow!("cannot stop another user's playback session").context_forbidden("forbidden"));
+            }
+        }
         let changed_item_id = (!data
             .item_id
             .is_nil())
@@ -511,8 +524,15 @@ pub async fn report_playback_stopped(
                 }));
 
             if played {
-                crate::fast_start::purge_resume_buffer_for_item(item_id);
                 let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
+                if allow_ram_prewarm {
+                    crate::fast_start::purge_resume_buffer_for_user(
+                        &state.ctx.db,
+                        item_id,
+                        session.user.id,
+                    )
+                    .await;
+                }
                 crate::services::stream_service::spawn_next_episode_probe_with_prewarm(
                     &state.ctx,
                     item_id,
@@ -566,8 +586,15 @@ pub async fn report_playback_stopped(
             }));
 
         if played {
-            crate::fast_start::purge_resume_buffer_for_item(data.item_id);
             let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
+            if allow_ram_prewarm {
+                crate::fast_start::purge_resume_buffer_for_user(
+                    &state.ctx.db,
+                    data.item_id,
+                    session.user.id,
+                )
+                .await;
+            }
             crate::services::stream_service::spawn_next_episode_probe_with_prewarm(
                 &state.ctx,
                 data.item_id,
@@ -596,9 +623,14 @@ pub struct PingQuery {
 #[post("/sessions/playing/ping")]
 pub async fn ping_playback_session(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Query(q): Query<PingQuery>,
 ) -> Result<impl IntoResponse> {
+    if let Some(existing) = state.ctx.sessions.get(&q.play_session_id) {
+        if !existing.user_id.is_nil() && existing.user_id != session.user.id && !session.user.is_admin {
+            return Err(anyhow::anyhow!("cannot ping another user's playback session").context_forbidden("forbidden"));
+        }
+    }
     state
         .ctx
         .sessions
@@ -693,7 +725,7 @@ pub(crate) async fn build_session_list(
         // that had its transcode cleared.
         let ps = playback_sessions
             .iter()
-            .filter(|s| s.device_id == device.id)
+            .filter(|s| s.device_id == device.id && (s.user_id == device.user_id || s.user_id.is_nil()))
             .max_by_key(|s| {
                 (
                     s.transcode

@@ -175,12 +175,22 @@ async fn save_cache_record(
     db::Settings::set(db_pool, &storage_key, &raw).await
 }
 
+const MAX_USER_CACHE_VALUE_BYTES: usize = 256 * 1024;
+
+fn scoped_cache_ns(user_id: Uuid, ns: &str) -> String {
+    format!("{}:{ns}", user_id.simple())
+}
+
 #[get("/remux/cache/stats")]
 pub async fn remux_cache_stats(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
 ) -> Result<Response> {
-    let pattern = format!("{CACHE_KEY_PREFIX}%");
+    let pattern = if session.user.is_admin {
+        format!("{CACHE_KEY_PREFIX}%")
+    } else {
+        format!("{CACHE_KEY_PREFIX}{}:%", session.user.id.simple())
+    };
     let rows = sqlx::query_as::<_, (String, String)>(
         "SELECT key, value FROM settings WHERE key LIKE ?1",
     )
@@ -240,11 +250,11 @@ pub async fn remux_cache_stats(
 #[get("/remux/cache/{key}")]
 pub async fn remux_cache_get(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path(key): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Response> {
-    let ns = query.ns;
+    let ns = scoped_cache_ns(session.user.id, &query.ns);
 
     let record = load_cache_record(
         &state
@@ -268,16 +278,20 @@ pub async fn remux_cache_get(
 #[post("/remux/cache/{key}")]
 pub async fn remux_cache_set(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path(key): Path<String>,
     Query(query): Query<NamespaceQuery>,
     Json(payload): Json<CacheSetRequest>,
 ) -> Result<Response> {
+    if payload.value.len() > MAX_USER_CACHE_VALUE_BYTES {
+        return Ok((StatusCode::BAD_REQUEST, "cache value exceeds 256 KiB limit").into_response());
+    }
+    let ns = scoped_cache_ns(session.user.id, &query.ns);
     save_cache_record(
         &state
             .ctx
             .db,
-        &query.ns,
+        &ns,
         &key,
         &payload.value,
         payload.ttl_seconds,
@@ -290,15 +304,16 @@ pub async fn remux_cache_set(
 #[delete("/remux/cache/{key}")]
 pub async fn remux_cache_delete(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path(key): Path<String>,
     Query(query): Query<NamespaceQuery>,
 ) -> Result<Response> {
+    let ns = scoped_cache_ns(session.user.id, &query.ns);
     delete_cache_record(
         &state
             .ctx
             .db,
-        &query.ns,
+        &ns,
         &key,
     )
     .await?;
@@ -308,18 +323,19 @@ pub async fn remux_cache_delete(
 #[post("/remux/cache/bulk")]
 pub async fn remux_cache_bulk(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Query(query): Query<NamespaceQuery>,
     Json(payload): Json<CacheBulkRequest>,
 ) -> Result<Response> {
     let mut out = HashMap::<String, String>::new();
+    let ns = scoped_cache_ns(session.user.id, &query.ns);
 
     for key in payload.keys {
         if let Some(record) = load_cache_record(
             &state
                 .ctx
                 .db,
-            &query.ns,
+            &ns,
             &key,
         )
         .await?
@@ -607,31 +623,25 @@ pub async fn remux_metrics_status(
 }
 
 #[get("/remux/faststart/stats")]
-pub async fn remux_faststart_stats() -> Result<impl IntoResponse> {
+pub async fn remux_faststart_stats(
+    _session: auth::AdminSession,
+) -> Result<impl IntoResponse> {
     Ok(Json(crate::fast_start::stats_json()))
-}
-
-#[query]
-#[derive(Debug, Default)]
-pub struct FastStartModeQuery {
-    pub force_direct_307: Option<bool>,
 }
 
 #[get("/remux/faststart/mode")]
 pub async fn remux_faststart_mode(
-    Query(q): Query<FastStartModeQuery>,
+    _session: auth::AdminSession,
 ) -> Result<impl IntoResponse> {
-    if let Some(force) = q.force_direct_307 {
-        crate::fast_start::set_force_direct_307(force);
-        tracing::info!(force_direct_307 = force, "[FAST-START] Set FORCE_DIRECT_307 mode");
-    }
     Ok(Json(json!({
         "force_direct_307": crate::fast_start::is_force_direct_307()
     })))
 }
 
 #[post("/remux/faststart/toggle")]
-pub async fn remux_faststart_toggle() -> Result<impl IntoResponse> {
+pub async fn remux_faststart_toggle(
+    _session: auth::AdminSession,
+) -> Result<impl IntoResponse> {
     let current = crate::fast_start::is_force_direct_307();
     crate::fast_start::set_force_direct_307(!current);
     tracing::info!(force_direct_307 = !current, "[FAST-START] Toggled FORCE_DIRECT_307 mode");

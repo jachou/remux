@@ -161,7 +161,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: AuthSess
                     None => std::future::pending::<()>().await,
                 }
             } => {
-                let sessions = build_sessions(&state).await;
+                let sessions = build_sessions(&state, &session.user).await;
                 if !send_msg(&mut socket, SessionMessageType::Sessions, Some(sessions)).await {
                     return;
                 }
@@ -170,7 +170,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: AuthSess
 
             result = event_rx.recv() => {
                 match result {
-                    Ok(WsEvent::UserUpdated(user_id)) => {
+                    Ok(WsEvent::UserUpdated(user_id)) if session.user.is_admin || user_id == session.user.id => {
                         if let Ok(Some(user)) = db::User::get_by_id(&state.ctx.db, &user_id).await {
                             let Ok(dto) = crate::api::users::user_dto(&state.ctx.db, &state.ctx.config.data_dir, user).await else {
                                 continue;
@@ -180,11 +180,13 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: AuthSess
                             }
                         }
                     }
-                    Ok(WsEvent::UserDeleted(user_id)) => {
+                    Ok(WsEvent::UserUpdated(_)) => {}
+                    Ok(WsEvent::UserDeleted(user_id)) if session.user.is_admin || user_id == session.user.id => {
                         if !send_msg(&mut socket, SessionMessageType::UserDeleted, Some(user_id.to_string())).await {
                             return;
                         }
                     }
+                    Ok(WsEvent::UserDeleted(_)) => {}
                     Ok(WsEvent::UserDataChanged { user_id, item_id }) if user_id == session.user.id => {
                         if let Ok(Some(media)) = db::Media::get_by_id(&state.ctx.db, &item_id).await {
                             let user_data_list = db::UserMediaState::get_by_user_and_media(
@@ -222,7 +224,7 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, session: AuthSess
                         }
                     }
                     Ok(WsEvent::SessionsChanged) => {
-                        let sessions = build_sessions(&state).await;
+                        let sessions = build_sessions(&state, &session.user).await;
                         if !send_msg(&mut socket, SessionMessageType::Sessions, Some(sessions)).await {
                             return;
                         }
@@ -305,10 +307,15 @@ fn parse_sessions_data(data: Option<&serde_json::Value>) -> (u64, u64) {
     (initial, interval)
 }
 
-async fn build_sessions(state: &AppState) -> Vec<api::SessionInfoDto> {
-    build_session_list(state, Some(Duration::from_secs(120)), None)
+async fn build_sessions(state: &AppState, user: &db::User) -> Vec<api::SessionInfoDto> {
+    let mut sessions = build_session_list(state, Some(Duration::from_secs(120)), None)
         .await
-        .unwrap_or_default()
+        .unwrap_or_default();
+    if !user.is_admin && !user.can_remote_control_others() {
+        let caller_uid = user.id.simple().to_string();
+        sessions.retain(|s| s.user_id == caller_uid);
+    }
+    sessions
 }
 
 pub struct WebSocketSubscriber {

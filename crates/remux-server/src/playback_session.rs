@@ -874,6 +874,19 @@ impl PlaybackSessionManager {
             .collect()
     }
 
+    /// Return the most recently active session for a device owned by `user_id`
+    /// (falling back to nil-user legacy stubs on that device).
+    pub fn get_by_user_device(&self, user_id: Uuid, device_id: &str) -> Option<PlaybackSession> {
+        self.sessions
+            .iter()
+            .filter(|e| {
+                let s = e.value();
+                s.device_id == device_id && (s.user_id == user_id || s.user_id.is_nil())
+            })
+            .max_by_key(|e| e.value().last_activity)
+            .map(|e| e.value().clone())
+    }
+
     /// Return the most recently active session for a device.
     /// Used as a fallback when the client omits PlaySessionId (e.g. DirectPlay).
     pub fn get_by_device(&self, device_id: &str) -> Option<PlaybackSession> {

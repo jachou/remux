@@ -286,6 +286,12 @@ impl User {
         Ok(hash.to_string())
     }
 
+    pub fn is_disabled(&self) -> bool {
+        self.policy
+            .as_ref()
+            .is_some_and(|p| p.is_disabled)
+    }
+
     pub async fn authenticate(
         db: &SqlitePool,
         username: &str,
@@ -294,6 +300,9 @@ impl User {
         let Some(user) = Self::get_by_username(db, username).await? else {
             return Ok(None);
         };
+        if user.is_disabled() {
+            return Ok(None);
+        }
 
         let hash = user.password_hash.expose().to_string();
         let pw = password.to_string();
@@ -879,22 +888,21 @@ impl UserMediaState {
         let raw_jsons: Vec<&String> = raw_to_new
             .keys()
             .collect();
-        let placeholders = raw_jsons
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT * FROM user_media_state WHERE media_raw IN ({placeholders})"
-        );
-        let mut q = sqlx::query_as::<_, Self>(&sql);
-        for r in &raw_jsons {
-            q = q.bind(r.as_str());
+        let mut stale_rows: Vec<Self> = Vec::new();
+        for chunk in raw_jsons.chunks(900) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT * FROM user_media_state WHERE media_raw IN ({placeholders})"
+            );
+            let mut q = sqlx::query_as::<_, Self>(&sql);
+            for r in chunk {
+                q = q.bind(r.as_str());
+            }
+            match q.fetch_all(db).await {
+                Ok(rows) => stale_rows.extend(rows),
+                Err(e) => tracing::warn!(error = %e, "remap_orphaned_for failed querying media_raw chunk"),
+            }
         }
-        let stale_rows: Vec<Self> = q
-            .fetch_all(db)
-            .await
-            .unwrap_or_default();
 
         let moves: Vec<Self> = stale_rows
             .into_iter()
@@ -924,24 +932,21 @@ impl UserMediaState {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        let placeholders = new_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT user_id, media_id FROM user_media_state WHERE media_id IN ({placeholders})"
-        );
-        let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql);
-        for id in &new_ids {
-            q = q.bind(id);
+        let mut existing: std::collections::HashSet<(Uuid, Uuid)> = std::collections::HashSet::new();
+        for chunk in new_ids.chunks(900) {
+            let placeholders = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT user_id, media_id FROM user_media_state WHERE media_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query_as::<_, (Uuid, Uuid)>(&sql);
+            for id in chunk {
+                q = q.bind(id);
+            }
+            match q.fetch_all(db).await {
+                Ok(rows) => existing.extend(rows),
+                Err(e) => tracing::warn!(error = %e, "remap_orphaned_for failed querying media_id chunk"),
+            }
         }
-        let existing: std::collections::HashSet<(Uuid, Uuid)> = q
-            .fetch_all(db)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
 
         // An old media_id is only safe to batch if *every* row sitting under
         // it is non-colliding; if even one user collides, handle all of that
@@ -1552,19 +1557,18 @@ pub struct JellyfinDisplayPrefsFilter {
 
 impl JellyfinDisplayPrefs {
     pub async fn save(&self, db: &SqlitePool) -> Result<()> {
+        let normalized_client = self.client.as_deref().unwrap_or("");
         sqlx::query(
             r#"
             INSERT INTO jellyfin_display_prefs (id, user_id, client, data)
             VALUES (?1, ?2, ?3, ?4)
-            ON CONFLICT(id) DO UPDATE SET
-                user_id = excluded.user_id,
-                client  = excluded.client,
-                data    = excluded.data
+            ON CONFLICT(user_id, client, id) DO UPDATE SET
+                data = excluded.data
             "#,
         )
         .bind(&self.id)
         .bind(self.user_id)
-        .bind(&self.client)
+        .bind(normalized_client)
         .bind(&self.data)
         .execute(db)
         .await?;

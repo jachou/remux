@@ -554,10 +554,11 @@ pub async fn remove_playlist_items(
     .context_not_found("Playlist not found")?;
     require_playlist_write(&media, &session)?;
 
-    db::MediaRelation::delete_by_relation_ids(
+    db::MediaRelation::delete_playlist_entries(
         &state
             .ctx
             .db,
+        &id,
         &q.entry_ids,
     )
     .await?;

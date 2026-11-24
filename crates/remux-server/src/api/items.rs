@@ -904,15 +904,13 @@ pub async fn get_items(
             .take();
     }
 
-    // Always provide user_id so user-state filters work
-    if q.user_id
-        .is_none()
-    {
-        q.user_id = Some(
-            session
-                .user
-                .id,
-        );
+    // Prevent non-admin users from querying another user's watch state / private playlists via `?userId=`.
+    if let Some(req_uid) = q.user_id {
+        if req_uid != session.user.id && !session.user.is_admin {
+            return Err(anyhow::anyhow!("cannot query another user's items").context_forbidden("forbidden"));
+        }
+    } else {
+        q.user_id = Some(session.user.id);
     }
 
     // Safety cap: if an unbounded or top-level query omitted limit, default to 250

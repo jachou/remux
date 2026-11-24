@@ -42,6 +42,15 @@ enum HlsSessionResult {
 }
 
 /// Shared session setup: look up or create the transcode session for an HLS
+/// Strict allowlist for path-component HLS identifiers (`PlaySessionId`, `segment_id`)
+/// to prevent path traversal (`..`, `/`, `\`) on `output_dir` deletion and segment reads.
+pub(crate) fn is_safe_hls_token(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
 /// request. Returns the session handle and the resolved play_session_id.
 async fn create_hls_session(
     state: &AppState,
@@ -57,6 +66,19 @@ async fn create_hls_session(
                 .as_simple()
                 .to_string()
         });
+    if !is_safe_hls_token(&play_session_id) {
+        return Err(anyhow::anyhow!("invalid PlaySessionId").context_bad_request("invalid PlaySessionId"));
+    }
+
+    // Prevent cross-user session hijack: if a session with this PlaySessionId already
+    // exists and belongs to a different user, reject before stopping or reusing it.
+    if let Some(existing_ps) = state.ctx.sessions.get(&play_session_id) {
+        if !existing_ps.user_id.is_nil() && existing_ps.user_id != auth.user.id && !auth.user.is_admin {
+            return Ok(HlsSessionResult::Forbidden(
+                "PlaySessionId belongs to another user",
+            ));
+        }
+    }
 
     debug!("Using play session ID: {}", play_session_id);
 
@@ -1506,6 +1528,12 @@ async fn hls_segment_inner(
                 .clone()
         })
         .context_not_found("PlaySessionId is required")?;
+    if !is_safe_hls_token(&play_session_id) || !is_safe_hls_token(&segment_id) {
+        return Err(
+            anyhow::anyhow!("invalid HLS session or segment identifier")
+                .context_bad_request("invalid HLS identifier"),
+        );
+    }
     trace!(
         segment_id = %segment_id,
         play_session_id = %play_session_id,
@@ -1599,243 +1627,164 @@ async fn hls_segment_inner(
 
     // If the segment doesn't exist and we have a live session, check whether
     // FFmpeg needs to be restarted at a different position (like Jellyfin does).
+    // Serialize restarts per play_session_id under TRANSCODE_CREATE_LOCKS so two
+    // concurrent segment requests after a seek cannot both kill & respawn FFmpeg.
     if !segment_path.exists() {
         if let (Some(session), Some(requested_idx)) = (&session, requested_idx) {
-            let s = session
-                .read()
+            let _restart_guard = TRANSCODE_CREATE_LOCKS
+                .lock(play_session_id.clone())
                 .await;
-            let output_dir = s
-                .output_dir
-                .clone();
-            let segment_length = s.segment_length;
-            let current_idx = get_current_transcoding_index(&output_dir);
-            let segment_gap_threshold = 24 / segment_length;
+            if !segment_path.exists() {
+                let s = session
+                    .read()
+                    .await;
+                let output_dir = s
+                    .output_dir
+                    .clone();
+                let segment_length = s.segment_length;
+                let saved_is_live = s.is_live;
+                let current_idx = get_current_transcoding_index(&output_dir);
+                let segment_gap_threshold = 24 / segment_length.max(1);
 
-            let needs_restart = match current_idx {
-                None => {
-                    // No segments on disk yet. Restart if FFmpeg exited/errored, OR if the
-                    // client requested a segment strictly before our resumed start_index
-                    // (which FFmpeg will never generate, preventing a 60s hang).
-                    let start_idx = s.start_time_secs / segment_length.max(1);
-                    requested_idx < start_idx
-                        || matches!(
-                            s.state,
-                            TranscodeState::Error(_) | TranscodeState::Complete
-                        )
-                }
-                Some(cur) if requested_idx < cur => true, // seeking backward
-                Some(cur)
-                    if requested_idx.saturating_sub(cur) > segment_gap_threshold =>
-                {
-                    true
-                } // too far ahead
-                _ => false, // within range — just wait for FFmpeg
-            };
-
-            if needs_restart {
-                // Guard against concurrent restart: only proceed if FFmpeg
-                // is actually running (kill_tx is Some). If another request
-                // already killed it and started a new one, just wait.
-                let has_running_ffmpeg = s
-                    .kill_tx
-                    .is_some();
-                if !has_running_ffmpeg {
-                    drop(s);
-                    // Another request already restarted — fall through to wait loop.
-                } else {
-                    debug!(
-                        requested_idx,
-                        ?current_idx,
-                        segment_gap_threshold,
-                        "Segment-driven transcode restart"
-                    );
-
-                    // Gather params we need before dropping the read lock.
-                    let input_url = s
-                        .input_url
-                        .clone();
-                    let video_codec = s
-                        .video_codec
-                        .clone();
-                    let audio_codec = s
-                        .audio_codec
-                        .clone();
-                    let audio_stream_index = s.audio_stream_index;
-                    let audio_channels = s.audio_channels;
-                    let subtitle_stream_index = s.subtitle_stream_index;
-                    let burn_subtitle = s.burn_subtitle;
-                    let saved_video_bitrate = s.video_bitrate;
-                    drop(s);
-
-                    // Kill running FFmpeg and clean up stale segments (params
-                    // like bitrate/codec may change, so old segments are invalid).
-                    {
-                        let (kill_tx, wait_done) = {
-                            let mut s = session
-                                .write()
-                                .await;
-                            (
-                                s.kill_tx
-                                    .take(),
-                                s.wait_done
-                                    .clone(),
+                let needs_restart = match current_idx {
+                    None => {
+                        let start_idx = s.start_time_secs / segment_length.max(1);
+                        requested_idx < start_idx
+                            || matches!(
+                                s.state,
+                                TranscodeState::Error(_) | TranscodeState::Complete
                             )
-                        };
-                        if let Some(kill_tx) = kill_tx {
-                            let notification = wait_done.notified();
-                            let _ = kill_tx.send(());
-                            notification.await;
-                        }
                     }
-                    let _ = std::fs::remove_dir_all(&output_dir);
-                    let _ = std::fs::create_dir_all(&output_dir);
-
-                    // Calculate the seek position from the runtimeTicks query param
-                    // (cumulative ticks to start of this segment) provided by our
-                    // server-generated VOD playlist. Fall back to segment_index * segment_length.
-                    let start_time_ticks = q
-                        .runtime_ticks
-                        .unwrap_or_else(|| {
-                            (requested_idx as i64 * segment_length as i64)
-                                .to_ticks(TickUnit::Seconds)
-                                .unwrap_or(0)
-                        });
-
-                    let encoding_opts = crate::db::Settings::get_encoding_config(
-                        &state
-                            .ctx
-                            .db,
-                    )
-                    .await
-                    .unwrap_or_default();
-                    let params = crate::playback::engine::TranscodeParams {
-                        input_url,
-                        output_dir: output_dir.clone(),
-                        video_codec,
-                        audio_codec: audio_codec.clone(),
-                        segment_length,
-                        start_time_ticks: Some(start_time_ticks),
-                        max_width: q
-                            .max_width
-                            .map(|v| v as u32),
-                        max_height: q
-                            .max_height
-                            .map(|v| v as u32),
-                        video_bitrate: q
-                            .video_bit_rate
-                            .map(|v| v as u32)
-                            .or(saved_video_bitrate),
-                        audio_bitrate: q
-                            .audio_bit_rate
-                            .map(|v| v as u32),
-                        audio_channels,
-                        audio_stream_index,
-                        subtitle_stream_index,
-                        burn_subtitle,
-                        subtitle_width: None,
-                        subtitle_height: None,
-                        encoding_preset: encoding_opts.encoding_preset,
-                        source_video_codec: session
-                            .read()
-                            .await
-                            .source_video_codec
-                            .clone(),
-                        source_audio_codec: session
-                            .read()
-                            .await
-                            .source_audio_codec
-                            .clone(),
-                        hevc_copy_tag: session
-                            .read()
-                            .await
-                            .hevc_copy_tag
-                            .clone(),
-                        hevc_in_ts: session
-                            .read()
-                            .await
-                            .hevc_in_ts,
-                        source_frame_rate: session
-                            .read()
-                            .await
-                            .source_frame_rate,
-                        accelerator: hw_accel::from_encoding_opts(&encoding_opts),
-                        source_video_range_type: session
-                            .read()
-                            .await
-                            .source_video_range_type,
-                        enable_tonemapping: encoding_opts
-                            .enable_tonemapping
-                            .unwrap_or(false),
-                        enable_vpp_tonemapping: encoding_opts
-                            .enable_vpp_tonemapping
-                            .unwrap_or(false),
-                        tonemapping_algorithm: encoding_opts
-                            .tonemapping_algorithm
-                            .unwrap_or_else(|| "hable".to_string()),
-                        tonemapping_desat: encoding_opts
-                            .tonemapping_desat
-                            .unwrap_or(0.0),
-                        tonemapping_peak: encoding_opts
-                            .tonemapping_peak
-                            .unwrap_or(0.0),
-                        allow_hevc_encoding: encoding_opts
-                            .allow_hevc_encoding
-                            .unwrap_or(false),
-                        allow_av1_encoding: encoding_opts
-                            .allow_av1_encoding
-                            .unwrap_or(false),
-                        h264_crf: encoding_opts
-                            .h264_crf
-                            .unwrap_or(23),
-                        h265_crf: encoding_opts
-                            .h265_crf
-                            .unwrap_or(28),
-                        is_live: false,
-                        normalize_audio_loudness: encoding_opts
-                            .normalize_audio_loudness
-                            .unwrap_or(false),
-                    };
-
-                    // Reinitialise the session's state for the new transcode run.
+                    Some(cur) if requested_idx < cur => true,
+                    Some(cur)
+                        if requested_idx.saturating_sub(cur) > segment_gap_threshold =>
                     {
-                        let mut s = session
-                            .write()
-                            .await;
-                        s.state = TranscodeState::Starting;
-                        let _ = s
-                            .state_tx
-                            .send(TranscodeState::Starting);
-                        s.start_time_secs = (start_time_ticks / 10_000_000) as u32;
-                        s.playback_offset_secs
-                            .store(
-                                0,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                        let seek_start_idx =
-                            crate::playback::engine::segment_start_index(
+                        true
+                    }
+                    _ => false,
+                };
+
+                if needs_restart {
+                    let has_running_ffmpeg = s.kill_tx.is_some();
+                    if !has_running_ffmpeg && !matches!(s.state, TranscodeState::Error(_) | TranscodeState::Complete) {
+                        drop(s);
+                    } else {
+                        debug!(
+                            requested_idx,
+                            ?current_idx,
+                            segment_gap_threshold,
+                            "Segment-driven transcode restart"
+                        );
+
+                        let input_url = s.input_url.clone();
+                        let video_codec = s.video_codec.clone();
+                        let audio_codec = s.audio_codec.clone();
+                        let audio_stream_index = s.audio_stream_index;
+                        let audio_channels = s.audio_channels;
+                        let subtitle_stream_index = s.subtitle_stream_index;
+                        let burn_subtitle = s.burn_subtitle;
+                        let saved_video_bitrate = s.video_bitrate;
+                        drop(s);
+
+                        {
+                            let (kill_tx, wait_done) = {
+                                let mut s = session.write().await;
+                                (s.kill_tx.take(), s.wait_done.clone())
+                            };
+                            if let Some(kill_tx) = kill_tx {
+                                let notification = wait_done.notified();
+                                let _ = kill_tx.send(());
+                                notification.await;
+                            }
+                        }
+                        let _ = std::fs::remove_dir_all(&output_dir);
+                        let _ = std::fs::create_dir_all(&output_dir);
+
+                        let start_time_ticks = q
+                            .runtime_ticks
+                            .unwrap_or_else(|| {
+                                (requested_idx as i64 * segment_length as i64)
+                                    .to_ticks(TickUnit::Seconds)
+                                    .unwrap_or(0)
+                            });
+
+                        let encoding_opts = crate::db::Settings::get_encoding_config(&state.ctx.db)
+                            .await
+                            .unwrap_or_default();
+                        let params = crate::playback::engine::TranscodeParams {
+                            input_url,
+                            output_dir: output_dir.clone(),
+                            video_codec,
+                            audio_codec: audio_codec.clone(),
+                            segment_length,
+                            start_time_ticks: Some(start_time_ticks),
+                            max_width: q.max_width.map(|v| v as u32),
+                            max_height: q.max_height.map(|v| v as u32),
+                            video_bitrate: q
+                                .video_bit_rate
+                                .map(|v| v as u32)
+                                .or(saved_video_bitrate),
+                            audio_bitrate: q.audio_bit_rate.map(|v| v as u32),
+                            audio_channels,
+                            audio_stream_index,
+                            subtitle_stream_index,
+                            burn_subtitle,
+                            subtitle_width: None,
+                            subtitle_height: None,
+                            encoding_preset: encoding_opts.encoding_preset,
+                            source_video_codec: session.read().await.source_video_codec.clone(),
+                            source_audio_codec: session.read().await.source_audio_codec.clone(),
+                            hevc_copy_tag: session.read().await.hevc_copy_tag.clone(),
+                            hevc_in_ts: session.read().await.hevc_in_ts,
+                            source_frame_rate: session.read().await.source_frame_rate,
+                            accelerator: hw_accel::from_encoding_opts(&encoding_opts),
+                            source_video_range_type: session.read().await.source_video_range_type,
+                            enable_tonemapping: encoding_opts.enable_tonemapping.unwrap_or(false),
+                            enable_vpp_tonemapping: encoding_opts.enable_vpp_tonemapping.unwrap_or(false),
+                            tonemapping_algorithm: encoding_opts
+                                .tonemapping_algorithm
+                                .unwrap_or_else(|| "hable".to_string()),
+                            tonemapping_desat: encoding_opts.tonemapping_desat.unwrap_or(0.0),
+                            tonemapping_peak: encoding_opts.tonemapping_peak.unwrap_or(0.0),
+                            allow_hevc_encoding: encoding_opts.allow_hevc_encoding.unwrap_or(false),
+                            allow_av1_encoding: encoding_opts.allow_av1_encoding.unwrap_or(false),
+                            h264_crf: encoding_opts.h264_crf.unwrap_or(23),
+                            h265_crf: encoding_opts.h265_crf.unwrap_or(28),
+                            is_live: saved_is_live,
+                            normalize_audio_loudness: encoding_opts
+                                .normalize_audio_loudness
+                                .unwrap_or(false),
+                        };
+
+                        {
+                            let mut s = session.write().await;
+                            s.state = TranscodeState::Starting;
+                            let _ = s.state_tx.send(TranscodeState::Starting);
+                            s.start_time_secs = (start_time_ticks / 10_000_000) as u32;
+                            s.playback_offset_secs
+                                .store(0, std::sync::atomic::Ordering::Relaxed);
+                            let seek_start_idx = crate::playback::engine::segment_start_index(
                                 Some(start_time_ticks),
                                 s.segment_length,
                             );
-                        s.last_segment_index
-                            .store(
-                                seek_start_idx,
-                                std::sync::atomic::Ordering::Relaxed,
-                            );
-                    }
-
-                    let session_clone = session.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = crate::playback::engine::start_transcode(
-                            session_clone,
-                            params,
-                        )
-                        .await
-                        {
-                            error!("Transcode restart failed: {:#}", e);
+                            s.last_segment_index
+                                .store(seek_start_idx, std::sync::atomic::Ordering::Relaxed);
                         }
-                    });
-                } // else: has_running_ffmpeg
-            } // needs_restart
+
+                        let session_clone = session.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = crate::playback::engine::start_transcode(
+                                session_clone,
+                                params,
+                            )
+                            .await
+                            {
+                                error!("Transcode restart failed: {:#}", e);
+                            }
+                        });
+                    }
+                }
+            }
         }
     }
 

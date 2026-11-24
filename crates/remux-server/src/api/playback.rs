@@ -1277,6 +1277,14 @@ pub async fn items_file(
     Path(id): Path<Uuid>,
     Query(mut q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
+    if session
+        .user
+        .policy
+        .as_ref()
+        .is_some_and(|p| !p.enable_content_downloading || !p.enable_media_playback)
+    {
+        return Err(anyhow::anyhow!("content downloading is disabled for this user").context_forbidden("forbidden"));
+    }
     q.static_ = Some(true);
     let filename = db::Media::get_by_id(
         &state
@@ -1559,9 +1567,16 @@ async fn videos_stream_inner(
             return Ok(no_streams_response().into_response());
         }
     };
-    // Refuse streams of a title the user's policy hides. A request without a
-    // token has no known user, so there is nothing to check it against.
+    // Refuse streams for disabled users or users whose policy forbids playback or hides the title.
     if let Some(user) = &user {
+        if user.is_disabled()
+            || user
+                .policy
+                .as_ref()
+                .is_some_and(|p| !p.enable_media_playback)
+        {
+            return Err(anyhow!("playback disabled").context_forbidden("forbidden"));
+        }
         if media
             .is_hidden_by_policy(
                 &state
@@ -1791,9 +1806,10 @@ async fn videos_stream_inner(
                 }
 
                 // If Fast-Start could not serve from buffer:
-                // Check if we have a direct CDN URL in cache or in-flight to redirect to.
+                // Check if we have a fresh (<60m) direct CDN URL in cache or in-flight to redirect to.
                 if let Some(direct_cdn_url) = crate::fast_start::FAST_START_CACHE
                     .get(url)
+                    .filter(|e| e.created_at.elapsed() < std::time::Duration::from_secs(3600))
                     .map(|e| e.direct_cdn_url.clone())
                     .or_else(|| crate::fast_start::IN_FLIGHT_PREWARMS.get(url).map(|e| e.direct_cdn_url.clone()))
                 {

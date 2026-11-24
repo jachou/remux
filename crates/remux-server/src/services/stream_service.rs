@@ -1788,7 +1788,17 @@ impl StreamService {
         });
 
         let primary = if let Some(pref_id) = saved_pref {
-            sel.candidates.iter().find(|s| s.id == *pref_id).cloned().or_else(|| sel.candidates.first().cloned())
+            sel.candidates
+                .iter()
+                .find(|s| {
+                    s.id == *pref_id
+                        && !s
+                            .stream_info
+                            .as_ref()
+                            .is_some_and(|si| si.descriptor.is_known_dead())
+                })
+                .cloned()
+                .or_else(|| sel.candidates.first().cloned())
         } else {
             sel.candidates.first().cloned()
         };
@@ -1997,28 +2007,29 @@ static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
 static FOREGROUND_PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 static RECENT_PREEMPTIVE_PROBES: std::sync::LazyLock<
-    dashmap::DashMap<Uuid, (std::time::Instant, bool)>,
+    dashmap::DashMap<(Uuid, Option<Uuid>), (std::time::Instant, bool)>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 const PREEMPTIVE_PROBE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
 
-fn record_recent_preemptive_probe(item_id: Uuid, ram_warmed: bool) {
+fn record_recent_preemptive_probe(item_id: Uuid, user_id: Option<Uuid>, ram_warmed: bool) {
     let now = std::time::Instant::now();
     if RECENT_PREEMPTIVE_PROBES.len() > 512 {
         RECENT_PREEMPTIVE_PROBES.retain(|_, (ts, _)| {
             now.saturating_duration_since(*ts) < std::time::Duration::from_secs(300)
         });
     }
+    let key = (item_id, user_id);
     let effective_ram_warmed = ram_warmed
         || RECENT_PREEMPTIVE_PROBES
-            .get(&item_id)
+            .get(&key)
             .is_some_and(|e| e.1 && e.0.elapsed() < PREEMPTIVE_PROBE_COOLDOWN);
-    RECENT_PREEMPTIVE_PROBES.insert(item_id, (now, effective_ram_warmed));
+    RECENT_PREEMPTIVE_PROBES.insert(key, (now, effective_ram_warmed));
 }
 
 /// Clears any 30s preemptive-probe cooldown for `item_id` (e.g. on mid-way playback stop)
 /// so a resume-buffer refresh at the new stop position is never silently dropped.
 pub fn clear_recent_preemptive_probe(item_id: Uuid) {
-    RECENT_PREEMPTIVE_PROBES.remove(&item_id);
+    RECENT_PREEMPTIVE_PROBES.retain(|(id, _), _| *id != item_id);
 }
 
 /// If a preemptive probe is actively executing (holding a worker permit) for `item_id`,
@@ -2115,7 +2126,7 @@ pub fn spawn_preemptive_probe_with_opts(
         return;
     }
     if !force_refresh_liveness {
-        if let Some(entry) = RECENT_PREEMPTIVE_PROBES.get(&item_id) {
+        if let Some(entry) = RECENT_PREEMPTIVE_PROBES.get(&(item_id, user_id)) {
             let (last_ok, ram_warmed) = *entry;
             let needs_ram_upgrade = opts.allow_ram_prewarm && !ram_warmed;
             if !needs_ram_upgrade && last_ok.elapsed() < PREEMPTIVE_PROBE_COOLDOWN {
@@ -2319,7 +2330,7 @@ pub fn spawn_preemptive_probe_with_opts(
                         true
                     };
                     if is_alive {
-                        record_recent_preemptive_probe(item_id, opts.allow_ram_prewarm);
+                        record_recent_preemptive_probe(item_id, user_id, opts.allow_ram_prewarm);
                         // Drop active_guard & semaphore permit as soon as liveness is confirmed so
                         // foreground PlaybackInfo never stalls waiting on 64-175MB RAM downloads.
                         drop(active_guard);
@@ -2343,7 +2354,7 @@ pub fn spawn_preemptive_probe_with_opts(
 
         match probe_result {
             Ok(Some(stream_id)) => {
-                record_recent_preemptive_probe(item_id, opts.allow_ram_prewarm);
+                record_recent_preemptive_probe(item_id, user_id, opts.allow_ram_prewarm);
                 tracing::info!(%item_id, %stream_id, "preemptive probe finished successfully");
                 let primary = service.streams.iter().find(|s| s.id == stream_id);
                 prefetch_subtitles_for_media(&ctx, &media, primary, user_id).await;
@@ -3665,7 +3676,7 @@ mod tests {
         let ctx = &guard.0;
         let owner = seed_movie(ctx).await;
 
-        super::record_recent_preemptive_probe(owner.id, true);
+        super::record_recent_preemptive_probe(owner.id, None, true);
         let before = super::PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::Relaxed);
         super::spawn_preemptive_probe(ctx, owner.id, None);
         let after_unforced = super::PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::Relaxed);
@@ -3683,7 +3694,7 @@ mod tests {
             "Forced preemptive probe must bypass recent cooldown"
         );
         super::QUEUED_PROBES.remove(&owner.id);
-        super::RECENT_PREEMPTIVE_PROBES.remove(&owner.id);
+        super::clear_recent_preemptive_probe(owner.id);
     }
 
     #[tokio::test]
@@ -3888,21 +3899,22 @@ mod tests {
 
     #[tokio::test]
     async fn lan_probe_upgrades_recent_remote_only_cooldown() {
-        use crate::integration_test::{authenticated_server, seed_movie};
+        use crate::integration_test::authenticated_server;
         use std::sync::atomic::Ordering;
 
         let (_server, guard, _token) = authenticated_server().await;
         let ctx = &guard.0;
-        let owner = seed_movie(ctx).await;
+        // Use a unique item_id so this test never collides with tests using seed_movie's fixed UUID.
+        let unique_item_id = Uuid::new_v4();
 
         // Simulate a remote-only probe finishing (liveness cached, RAM not warmed).
-        super::record_recent_preemptive_probe(owner.id, false);
+        super::record_recent_preemptive_probe(unique_item_id, None, false);
         let before = super::PREEMPTIVE_PROBES_DISPATCHED.load(Ordering::Relaxed);
 
         // Another remote-only probe within 30s must be skipped.
         super::spawn_preemptive_probe_with_opts(
             ctx,
-            owner.id,
+            unique_item_id,
             None,
             super::PreemptiveProbeOpts {
                 allow_ram_prewarm: false,
@@ -3919,7 +3931,7 @@ mod tests {
         // so the LAN client still gets its RAM pre-warm.
         super::spawn_preemptive_probe_with_opts(
             ctx,
-            owner.id,
+            unique_item_id,
             None,
             super::PreemptiveProbeOpts {
                 allow_ram_prewarm: true,
@@ -3933,6 +3945,6 @@ mod tests {
         );
 
         // Cleanup cooldown state.
-        super::RECENT_PREEMPTIVE_PROBES.remove(&owner.id);
+        super::clear_recent_preemptive_probe(unique_item_id);
     }
 }

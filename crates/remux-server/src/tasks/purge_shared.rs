@@ -10,6 +10,7 @@ pub(super) async fn purge_by_kinds(ctx: &AppContext, kinds: &[&str]) -> Result<(
         .collect::<Vec<_>>()
         .join(", ");
 
+    let _write_permit = crate::db::DB_WRITE_SEMAPHORE.acquire().await?;
     let mut conn = ctx
         .db
         .acquire()
@@ -34,6 +35,18 @@ pub(super) async fn purge_by_kinds(ctx: &AppContext, kinds: &[&str]) -> Result<(
             .execute(&mut *conn)
             .await?;
 
+        // Include child rows (e.g. `kind = 'stream'`) whose parent/grandparent is being purged,
+        // since `PRAGMA foreign_keys = OFF` suppresses ON DELETE CASCADE.
+        sqlx::query(
+            "INSERT INTO _purge_batch \
+             SELECT id FROM media \
+             WHERE (parent_id IN (SELECT id FROM _purge_batch) \
+                 OR grandparent_id IN (SELECT id FROM _purge_batch)) \
+               AND id NOT IN (SELECT id FROM _purge_batch)",
+        )
+        .execute(&mut *conn)
+        .await?;
+
         // left_media_id has no FK/cascade — must delete those orphans explicitly.
         sqlx::query(
             "DELETE FROM media_relations \
@@ -55,7 +68,7 @@ pub(super) async fn purge_by_kinds(ctx: &AppContext, kinds: &[&str]) -> Result<(
             .execute(&mut *conn)
             .await?;
 
-        sqlx::query(&format!("DELETE FROM media WHERE kind IN ({kinds_sql})"))
+        sqlx::query("DELETE FROM media WHERE id IN (SELECT id FROM _purge_batch)")
             .execute(&mut *conn)
             .await?;
 

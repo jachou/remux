@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::{
     AppState, OptionExt, ResultExt, api, db,
     db::{ImageKind, auth},
+    result_ext::IntoApiError,
     sdks,
     services::image::{ImageProcessOptions, ImageService},
 };
@@ -27,8 +28,67 @@ static IMAGE_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .expect("failed to build image proxy client")
     });
 
+fn is_safe_upstream_image_url(raw: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let h = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    if h == "localhost" || h.ends_with(".localhost") || h.ends_with(".local") {
+        return false;
+    }
+    if let Ok(ip) = h.parse::<std::net::IpAddr>() {
+        return match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_loopback()
+                    && !v4.is_private()
+                    && !v4.is_link_local()
+                    && !v4.is_unspecified()
+                    && !v4.is_broadcast()
+            }
+            std::net::IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    !v4.is_loopback() && !v4.is_private() && !v4.is_link_local() && !v4.is_unspecified()
+                } else {
+                    let seg0 = v6.segments()[0];
+                    !v6.is_loopback()
+                        && !v6.is_unspecified()
+                        && (seg0 & 0xfe00) != 0xfc00
+                        && (seg0 & 0xffc0) != 0xfe80
+                }
+            }
+        };
+    }
+    true
+}
+
+fn sanitize_image_content_type(raw: &str) -> String {
+    let mime = raw
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "image/jpeg" | "image/jpg" => "image/jpeg".to_string(),
+        "image/png" => "image/png".to_string(),
+        "image/webp" => "image/webp".to_string(),
+        "image/gif" => "image/gif".to_string(),
+        "image/avif" => "image/avif".to_string(),
+        _ => "image/jpeg".to_string(),
+    }
+}
+
 /// Fetch an upstream URL, returning (bytes, content_type).
 async fn fetch_upstream(url: &str) -> anyhow::Result<(Vec<u8>, String)> {
+    if !is_safe_upstream_image_url(url) {
+        anyhow::bail!("refusing unsafe upstream image URL");
+    }
     let resp = remux_utils::retry! {
         attempts: 3,
         delay: 500,
@@ -39,15 +99,12 @@ async fn fetch_upstream(url: &str) -> anyhow::Result<(Vec<u8>, String)> {
     if !status.is_success() {
         anyhow::bail!("upstream image returned {status}");
     }
-    let ct = resp
+    let raw_ct = resp
         .headers()
         .get(header::CONTENT_TYPE)
-        .and_then(|v| {
-            v.to_str()
-                .ok()
-        })
-        .unwrap_or("image/jpeg")
-        .to_string();
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg");
+    let ct = sanitize_image_content_type(raw_ct);
     let bytes = resp
         .bytes()
         .await
@@ -82,16 +139,38 @@ async fn items_images_inner(
     // Resolve to (raw_bytes, content_type, source_key_for_cache, is_remote).
     // is_remote=true means the bytes came from an external URL and must not be
     // re-encoded — proxy them as-is.
+    // Never fetch an arbitrary `tag` URL directly (SSRF / XSS risk): only allow
+    // a URL-in-`tag` if it matches an image already recorded on this item in DB or store.
+    let verified_tag_url: Option<String> = if let Some(url) = q
+        .tag
+        .as_ref()
+        .filter(|t| t.contains("://"))
+    {
+        let key = id.to_string();
+        let in_store = state
+            .ctx
+            .store
+            .get::<db::Media>(&key)
+            .is_some_and(|m| m.images.iter().any(|img| img.path == *url));
+        if in_store {
+            Some(url.clone())
+        } else {
+            db::Media::get_by_id(&state.ctx.db, &id)
+                .await
+                .ok()
+                .flatten()
+                .filter(|m| m.images.iter().any(|img| img.path == *url))
+                .map(|_| url.clone())
+        }
+    } else {
+        None
+    };
     let (bytes, raw_ct, source_key, is_remote): (Vec<u8>, String, String, bool) =
-        if let Some(url) = q
-            .tag
-            .as_ref()
-            .filter(|t| t.contains("://"))
-        {
-            let (b, ct) = fetch_upstream(url)
+        if let Some(url) = verified_tag_url {
+            let (b, ct) = fetch_upstream(&url)
                 .await
                 .context_not_found("image fetch failed")?;
-            (b, ct, url.clone(), true)
+            (b, ct, url, true)
         } else {
             let key = id.to_string();
             if let Some(media) = db::Media::get_by_id(
@@ -314,6 +393,11 @@ async fn items_images_inner(
         [
             (header::CONTENT_TYPE, content_type.to_string()),
             (header::CACHE_CONTROL, "max-age=86400".to_string()),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_string()),
+            (
+                header::CONTENT_SECURITY_POLICY,
+                "default-src 'none'; sandbox".to_string(),
+            ),
         ],
         final_bytes,
     )
@@ -567,23 +651,42 @@ async fn upload_item_image_inner(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn require_item_image_write(
+    state: &AppState,
+    session: &auth::AuthSession,
+    id: Uuid,
+) -> Result<()> {
+    if session.user.is_admin {
+        return Ok(());
+    }
+    let is_own_playlist = db::Media::get_by_id(&state.ctx.db, &id)
+        .await?
+        .is_some_and(|m| m.kind == db::MediaKind::Playlist && m.user_id == Some(session.user.id));
+    if !is_own_playlist {
+        return Err(anyhow::anyhow!("admin privileges required").context_forbidden("forbidden"));
+    }
+    Ok(())
+}
+
 #[post("/items/{id}/images/{image_type}")]
 pub async fn upload_item_image(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path((id, image_type)): Path<(Uuid, String)>,
     image: api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
+    require_item_image_write(&state, &session, id).await?;
     upload_item_image_inner(state, id, parse_image_kind(&image_type), image).await
 }
 
 #[post("/items/{id}/images/{image_type}/{index}")]
 pub async fn upload_item_image_indexed(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path((id, image_type, _index)): Path<(Uuid, String, usize)>,
     image: api::image::JellyfinImage,
 ) -> Result<impl IntoResponse> {
+    require_item_image_write(&state, &session, id).await?;
     upload_item_image_inner(state, id, parse_image_kind(&image_type), image).await
 }
 
@@ -648,18 +751,20 @@ async fn delete_item_image_inner(
 #[delete("/items/{id}/images/{image_type}")]
 pub async fn delete_item_image(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path((id, image_type)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse> {
+    require_item_image_write(&state, &session, id).await?;
     delete_item_image_inner(state, id, parse_image_kind(&image_type)).await
 }
 
 #[delete("/items/{id}/images/{image_type}/{index}")]
 pub async fn delete_item_image_indexed(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path((id, image_type, _index)): Path<(Uuid, String, usize)>,
 ) -> Result<impl IntoResponse> {
+    require_item_image_write(&state, &session, id).await?;
     delete_item_image_inner(state, id, parse_image_kind(&image_type)).await
 }
 

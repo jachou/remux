@@ -169,20 +169,36 @@ impl Task for CleanTranscodeFolderTask {
         // Never touch `stream_group` rows (permanent admin-configured Stream Group definitions),
         // exclude streams referenced by active playback sessions, and clear `streams_refreshed_at`
         // on affected parents so they re-discover streams cleanly instead of serving `no-streams.mp4`.
-        let active_source_ids: HashSet<String> = ctx
-            .sessions
-            .get_all()
-            .into_iter()
-            .filter_map(|s| s.media_source_id)
-            .collect();
+        let mut active_source_ids: HashSet<String> = HashSet::new();
+        for s in ctx.sessions.get_all() {
+            if let Some(ref msid) = s.media_source_id {
+                active_source_ids.insert(msid.clone());
+            }
+            let parsed_msid = s.media_source_id.as_deref().and_then(|m| uuid::Uuid::parse_str(m).ok());
+            if let Some(resolved) = crate::services::stream_service::StreamService::selected_stream_id(
+                &ctx,
+                Some(&s.device_id),
+                s.item_id,
+                parsed_msid,
+                Some(&s.play_session_id),
+            ) {
+                active_source_ids.insert(resolved.to_string());
+                active_source_ids.insert(resolved.simple().to_string());
+            }
+            if let Some(ref tc) = s.transcode {
+                if let Ok(guard) = tc.try_read() {
+                    active_source_ids.insert(guard.media_source_id.to_string());
+                    active_source_ids.insert(guard.media_source_id.simple().to_string());
+                }
+            }
+        }
         let sweep_res: Result<u64> = async {
-            let mut tx = ctx.db.begin().await?;
             let stale: Vec<(uuid::Uuid, Option<uuid::Uuid>)> = sqlx::query_as(
                 "SELECT id, parent_id FROM media \
                  WHERE kind = 'stream' \
                    AND datetime(updated_at) < datetime('now', '-2 days')",
             )
-            .fetch_all(&mut *tx)
+            .fetch_all(&ctx.db)
             .await?;
 
             let mut delete_ids: Vec<uuid::Uuid> = Vec::new();
@@ -198,33 +214,52 @@ impl Task for CleanTranscodeFolderTask {
                     affected_parents.insert(p);
                 }
             }
-
-            let mut total_deleted = 0u64;
-            for chunk in delete_ids.chunks(500) {
-                let mut qb = sqlx::QueryBuilder::new("DELETE FROM media WHERE id IN (");
-                let mut sep = qb.separated(", ");
-                for id in chunk {
-                    sep.push_bind(*id);
-                }
-                qb.push(")");
-                total_deleted += qb.build().execute(&mut *tx).await?.rows_affected();
+            if delete_ids.is_empty() {
+                return Ok(0);
             }
 
-            let parent_vec: Vec<uuid::Uuid> = affected_parents.into_iter().collect();
-            for chunk in parent_vec.chunks(500) {
-                let mut qb = sqlx::QueryBuilder::new(
-                    "UPDATE media SET streams_refreshed_at = NULL WHERE id IN (",
-                );
-                let mut sep = qb.separated(", ");
-                for pid in chunk {
-                    sep.push_bind(*pid);
-                }
-                qb.push(")");
-                qb.build().execute(&mut *tx).await?;
-            }
+            let _write_permit = crate::db::DB_WRITE_SEMAPHORE.acquire().await?;
+            let mut conn = ctx.db.acquire().await?;
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
 
-            tx.commit().await?;
-            Ok(total_deleted)
+            let exec_res: Result<u64> = async {
+                let mut total_deleted = 0u64;
+                for chunk in delete_ids.chunks(500) {
+                    let mut qb = sqlx::QueryBuilder::new("DELETE FROM media WHERE id IN (");
+                    let mut sep = qb.separated(", ");
+                    for id in chunk {
+                        sep.push_bind(*id);
+                    }
+                    qb.push(")");
+                    total_deleted += qb.build().execute(&mut *conn).await?.rows_affected();
+                }
+
+                let parent_vec: Vec<uuid::Uuid> = affected_parents.into_iter().collect();
+                for chunk in parent_vec.chunks(500) {
+                    let mut qb = sqlx::QueryBuilder::new(
+                        "UPDATE media SET streams_refreshed_at = NULL WHERE id IN (",
+                    );
+                    let mut sep = qb.separated(", ");
+                    for pid in chunk {
+                        sep.push_bind(*pid);
+                    }
+                    qb.push(")");
+                    qb.build().execute(&mut *conn).await?;
+                }
+                Ok(total_deleted)
+            }
+            .await;
+
+            match exec_res {
+                Ok(n) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                    Ok(n)
+                }
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    Err(e)
+                }
+            }
         }
         .await;
         match sweep_res {

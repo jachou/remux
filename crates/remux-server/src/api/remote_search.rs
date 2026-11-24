@@ -187,7 +187,7 @@ stub_search!(remote_search_book, "/items/remotesearch/book");
 #[post("/items/remotesearch/apply/{itemid}")]
 pub async fn remote_search_apply(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    _session: auth::AdminSession,
     Path(item_id): Path<Uuid>,
     Json(body): Json<api::ApplySearchResultRequest>,
 ) -> Result<impl IntoResponse> {

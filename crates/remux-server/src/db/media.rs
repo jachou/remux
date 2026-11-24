@@ -9,7 +9,7 @@ pub(crate) const SQLITE_VAR_LIMIT: usize = 999;
 /// to scanning and sorting the whole media table.
 pub(crate) const DATE_CREATED_ORDER_EXPR: &str = "datetime(created_at)";
 
-static DB_WRITE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+pub(crate) static DB_WRITE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
 use crate::{
     OptionExt, ResultExt, api,
@@ -739,17 +739,45 @@ impl MediaRelation {
         if relation_ids.is_empty() {
             return Ok(());
         }
-        let mut qb = sqlx::QueryBuilder::new(
-            "DELETE FROM media_relations WHERE relation_id IN (",
-        );
-        let mut sep = qb.separated(", ");
-        for id in relation_ids {
-            sep.push_bind(id);
+        for chunk in relation_ids.chunks(500) {
+            let mut qb = sqlx::QueryBuilder::new(
+                "DELETE FROM media_relations WHERE relation_id IN (",
+            );
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            qb.push(")");
+            qb.build()
+                .execute(db)
+                .await?;
         }
-        qb.push(")");
-        qb.build()
-            .execute(db)
-            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_playlist_entries(
+        db: &SqlitePool,
+        playlist_id: &Uuid,
+        relation_ids: &[Uuid],
+    ) -> Result<()> {
+        if relation_ids.is_empty() {
+            return Ok(());
+        }
+        for chunk in relation_ids.chunks(500) {
+            let mut qb = sqlx::QueryBuilder::new(
+                "DELETE FROM media_relations WHERE left_media_id = ",
+            );
+            qb.push_bind(playlist_id);
+            qb.push(" AND role = 'playlist' AND relation_id IN (");
+            let mut sep = qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(id);
+            }
+            qb.push(")");
+            qb.build()
+                .execute(db)
+                .await?;
+        }
         Ok(())
     }
 

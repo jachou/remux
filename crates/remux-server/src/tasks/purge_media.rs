@@ -48,6 +48,7 @@ impl Task for PurgeMediaTask {
         // transaction. PRAGMA foreign_keys cannot be changed inside a transaction,
         // and the truncate optimization (O(1) DELETE FROM table with no WHERE) is
         // disabled when foreign_keys = ON.
+        let _write_permit = crate::db::DB_WRITE_SEMAPHORE.acquire().await?;
         let mut conn = ctx
             .db
             .acquire()

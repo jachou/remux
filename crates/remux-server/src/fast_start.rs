@@ -506,6 +506,12 @@ async fn refresh_cached_resume_and_head(
                                 match fallback_req.send().await {
                                     Ok(r) if r.status() == StatusCode::PARTIAL_CONTENT => {
                                         let fresh_cdn = r.url().as_str().to_string();
+                                        crate::stream::STREAM_LIVENESS_CACHE.insert(
+                                            original_url.to_string(),
+                                            crate::stream::LivenessEntry::new_alive_with_direct_url(
+                                                fresh_cdn.clone(),
+                                            ),
+                                        );
                                         if let Some(mut updated) = FAST_START_CACHE.get(original_url) {
                                             updated.direct_cdn_url = fresh_cdn;
                                             FAST_START_CACHE.insert(original_url.to_string(), updated);
@@ -665,7 +671,7 @@ pub async fn prewarm_fast_start(
 
         crate::stream::STREAM_LIVENESS_CACHE.insert(
             original_url.to_string(),
-            crate::stream::LivenessEntry::new(true),
+            crate::stream::LivenessEntry::new_alive_with_direct_url(direct_cdn_url.clone()),
         );
         let content_type = detect_content_type(original_url).to_string();
 
@@ -949,10 +955,11 @@ pub async fn prewarm_fast_start(
 
     crate::stream::record_upstream_success();
 
-    // Stream responded with 200/206 and valid size: populate STREAM_LIVENESS_CACHE immediately so liveness checks are instant
+    // Stream responded with 200/206 and valid size: populate STREAM_LIVENESS_CACHE with direct_cdn_url
+    // so both LAN and remote 307 handoffs stay warm even if FAST_START_CACHE later evicts this entry.
     crate::stream::STREAM_LIVENESS_CACHE.insert(
         original_url.to_string(),
-        crate::stream::LivenessEntry::new(true),
+        crate::stream::LivenessEntry::new_alive_with_direct_url(direct_cdn_url.clone()),
     );
     notify_guard.notify_waiters();
 
@@ -1611,16 +1618,23 @@ pub fn is_remote_client(headers: &HeaderMap) -> bool {
         return true;
     }
 
-    // 2. Check X-Forwarded-For or X-Real-IP if present: if it parses to a valid client IP,
-    //    decide immediately (so LAN clients behind a local reverse proxy with a domain Host
-    //    are NOT falsely classified as remote).
+    // 2. Check X-Forwarded-For or X-Real-IP if present: inspect every IP in the chain so a
+    //    client-spoofed or corporate-proxy private IP on the left cannot mask a public WAN hop
+    //    appended by the home reverse proxy.
     for hdr in ["x-forwarded-for", "x-real-ip"] {
         if let Some(val) = headers.get(hdr).and_then(|h| h.to_str().ok()) {
-            if let Some(first_ip) = val.split(',').next().map(str::trim) {
-                if let Ok(ip) = first_ip.parse::<std::net::IpAddr>() {
+            let mut parsed_any = false;
+            for part in val.split(',').map(str::trim) {
+                if let Ok(ip) = part.parse::<std::net::IpAddr>() {
+                    parsed_any = true;
                     let canon = ip.to_canonical();
-                    return !canon.is_loopback() && !is_private_ip(&canon);
+                    if !canon.is_loopback() && !is_private_ip(&canon) {
+                        return true;
+                    }
                 }
+            }
+            if parsed_any {
+                return false;
             }
         }
     }
@@ -1656,9 +1670,14 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
     match ip.to_canonical() {
         std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_link_local(),
         std::net::IpAddr::V6(v6) => {
-            let seg0 = v6.segments()[0];
+            let segs = v6.segments();
+            // Exclude Tailscale IPv6 CGNAT/ULA range (fd7a:115c:a1e0::/48) so it matches
+            // Tailscale IPv4 (100.64.0.0/10) as remote rather than LAN.
+            if segs[0] == 0xfd7a && segs[1] == 0x115c && segs[2] == 0xa1e0 {
+                return false;
+            }
             // ULA (fc00::/7) or link-local (fe80::/10)
-            (seg0 & 0xfe00) == 0xfc00 || (seg0 & 0xffc0) == 0xfe80
+            (segs[0] & 0xfe00) == 0xfc00 || (segs[0] & 0xffc0) == 0xfe80
         }
     }
 }
@@ -2636,6 +2655,33 @@ pub async fn lookup_resume_position(
     .map(|pos| pos as f64)
 }
 
+/// Purges any cached resume buffer from RAM for a specific media item when `completed_by_user`
+/// finishes it, unless another user still has an active in-progress resume position on the item.
+pub async fn purge_resume_buffer_for_user(
+    db: &sqlx::SqlitePool,
+    item_id: Uuid,
+    completed_by_user: Uuid,
+) {
+    let other_user_resuming: bool = sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM user_media_state \
+         WHERE media_id = ?1 AND user_id != ?2 \
+           AND COALESCE(play_count, 0) = 0 AND COALESCE(playback_position, 0) > 0 \
+         LIMIT 1",
+    )
+    .bind(item_id)
+    .bind(completed_by_user)
+    .fetch_optional(db)
+    .await
+    .ok()
+    .flatten()
+    .is_some();
+    if other_user_resuming {
+        tracing::debug!(%item_id, %completed_by_user, "[FAST-START] Keeping resume buffer in RAM because another user is still mid-episode");
+        return;
+    }
+    purge_resume_buffer_for_item(item_id);
+}
+
 /// Purges any cached resume buffer from RAM for a specific media item (e.g. when marked played or finished).
 /// Head bytes (32MB) and tail cues are retained so subsequent replays or probes remain 0ms.
 pub fn purge_resume_buffer_for_item(item_id: Uuid) {
@@ -2692,7 +2738,7 @@ pub fn stats_json() -> serde_json::Value {
 
         cached_items.push(json!({
             "item_id": entry.item_id,
-            "original_url": entry.original_url,
+            "original_host": head_resp_host(&entry.original_url),
             "direct_cdn_host": head_resp_host(&entry.direct_cdn_url),
             "total_file_size_bytes": entry.total_size,
             "head_buffer_bytes": head_len,
@@ -3593,6 +3639,22 @@ mod tests {
         );
         h_wan.insert(header::HOST, HeaderValue::from_static("192.168.1.50:8096"));
         assert!(is_remote_client(&h_wan));
+
+        // Multi-hop / spoofed left-side private IP must not mask a public WAN hop
+        let mut h_spoof = HeaderMap::new();
+        h_spoof.insert(
+            header::HeaderName::from_static("x-forwarded-for"),
+            HeaderValue::from_static("192.168.1.50, 98.45.12.34"),
+        );
+        assert!(is_remote_client(&h_spoof));
+
+        // Tailscale IPv6 (fd7a:115c:a1e0::/48) must classify as remote, matching Tailscale IPv4
+        let mut h_ts6 = HeaderMap::new();
+        h_ts6.insert(
+            header::HeaderName::from_static("x-real-ip"),
+            HeaderValue::from_static("fd7a:115c:a1e0::1234"),
+        );
+        assert!(is_remote_client(&h_ts6));
     }
 
     #[test]

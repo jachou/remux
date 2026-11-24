@@ -87,7 +87,7 @@ pub struct InsertTrackBody {
 #[post("/music/tracks")]
 pub async fn insert_track(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    _session: auth::AdminSession,
     Json(body): Json<InsertTrackBody>,
 ) -> Result<impl IntoResponse> {
     let media_id = body

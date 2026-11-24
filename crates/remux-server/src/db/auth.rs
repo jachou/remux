@@ -586,6 +586,9 @@ impl FromRequestParts<AppState> for AuthSession {
             )
             .await?
             .context_unauthorized("forbidden")?;
+            if user.is_disabled() {
+                return Err(anyhow::anyhow!("user account is disabled").context_unauthorized("account disabled"));
+            }
             tracing::Span::current().record(
                 "user",
                 user.username
