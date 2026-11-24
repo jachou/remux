@@ -60,6 +60,7 @@ pub async fn shows_seasons(
 
 #[get("/shows/{id}/episodes")]
 pub async fn shows_episodes(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     ResolvedItem(item): ResolvedItem,
@@ -129,12 +130,18 @@ pub async fn shows_episodes(
         .build();
 
     if q.start_index.unwrap_or(0) == 0 {
+        let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
         let targets = select_preemptive_probe_targets(&result.items);
         for target in targets {
-            crate::services::stream_service::spawn_preemptive_probe(
+            crate::services::stream_service::spawn_preemptive_probe_with_opts(
                 &state.ctx,
                 target.id,
                 Some(session.user.id),
+                crate::services::stream_service::PreemptiveProbeOpts {
+                    foreground: true,
+                    allow_ram_prewarm,
+                    ..Default::default()
+                },
             );
         }
     }
@@ -243,10 +250,12 @@ fn is_unreleased_episode(ep: &db::Media, threshold: chrono::NaiveDateTime) -> bo
 
 #[get("/shows/nextup")]
 pub async fn shows_nextup(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
     // Home-screen call: no seriesId — return one next-up episode per in-progress series.
     // When the unified setting is on, this feed is folded into Continue
     // Watching instead — but only for this seriesId-less aggregate call; a
@@ -272,7 +281,7 @@ pub async fn shows_nextup(
             })
             .into_response());
         }
-        return shows_nextup_all(state, session, q)
+        return shows_nextup_all(state, session, q, allow_ram_prewarm)
             .await
             .map(IntoResponse::into_response);
     }
@@ -391,10 +400,15 @@ pub async fn shows_nextup(
         return Ok(Json(api::BaseItemDtoQueryResult::default()).into_response());
     };
 
-    crate::services::stream_service::spawn_preemptive_probe(
+    crate::services::stream_service::spawn_preemptive_probe_with_opts(
         &state.ctx,
         ep.id,
         Some(user_id),
+        crate::services::stream_service::PreemptiveProbeOpts {
+            foreground: true,
+            allow_ram_prewarm,
+            ..Default::default()
+        },
     );
 
     let mut enriched = vec![ep.clone()];
@@ -653,6 +667,7 @@ async fn shows_nextup_all(
     state: AppState,
     session: auth::AuthSession,
     q: api::GetItemsQuery,
+    allow_ram_prewarm: bool,
 ) -> Result<impl IntoResponse> {
     let candidates = next_up_candidates(&state, &session, &q).await?;
     if candidates.is_empty() {
@@ -664,10 +679,15 @@ async fn shows_nextup_all(
     }
 
     for (media, _) in candidates.iter().take(8) {
-        crate::services::stream_service::spawn_preemptive_probe(
+        crate::services::stream_service::spawn_preemptive_probe_with_opts(
             &state.ctx,
             media.id,
             Some(session.user.id),
+            crate::services::stream_service::PreemptiveProbeOpts {
+                foreground: false,
+                allow_ram_prewarm,
+                ..Default::default()
+            },
         );
     }
 

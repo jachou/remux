@@ -1819,7 +1819,17 @@ pub async fn item(
     id: Uuid,
     fields: Option<&[api::ItemFields]>,
 ) -> Result<Option<api::BaseItemDto>> {
-    item_for_user(state, session, id, fields, None).await
+    item_for_user(state, session, id, fields, None, true).await
+}
+
+pub async fn item_with_prewarm(
+    state: AppState,
+    session: auth::AuthSession,
+    id: Uuid,
+    fields: Option<&[api::ItemFields]>,
+    allow_ram_prewarm: bool,
+) -> Result<Option<api::BaseItemDto>> {
+    item_for_user(state, session, id, fields, None, allow_ram_prewarm).await
 }
 
 async fn rank_item_sources(
@@ -1859,6 +1869,7 @@ async fn item_for_user(
     id: Uuid,
     fields: Option<&[api::ItemFields]>,
     target_user_id: Option<Uuid>,
+    allow_ram_prewarm: bool,
 ) -> Result<Option<api::BaseItemDto>> {
     let want_streams = fields
         .map(|f| f.contains(&api::ItemFields::MediaSources))
@@ -2066,10 +2077,15 @@ async fn item_for_user(
             .log_err("failed to refresh sources");
 
         if matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Episode) {
-            crate::services::stream_service::spawn_preemptive_probe(
+            crate::services::stream_service::spawn_preemptive_probe_with_opts(
                 &state.ctx,
                 media.id,
                 Some(session.user.id),
+                crate::services::stream_service::PreemptiveProbeOpts {
+                    foreground: true,
+                    allow_ram_prewarm,
+                    ..Default::default()
+                },
             );
         }
     }
@@ -2098,7 +2114,16 @@ async fn item_for_user(
             .fetch_optional(&ctx.db)
             .await
             {
-                crate::services::stream_service::spawn_preemptive_probe(&ctx, next_ep_id, Some(user_id));
+                crate::services::stream_service::spawn_preemptive_probe_with_opts(
+                    &ctx,
+                    next_ep_id,
+                    Some(user_id),
+                    crate::services::stream_service::PreemptiveProbeOpts {
+                        foreground: false,
+                        allow_ram_prewarm,
+                        ..Default::default()
+                    },
+                );
             }
         });
     }
@@ -2721,12 +2746,14 @@ pub async fn items_livetv(_session: auth::AuthSession) -> Result<impl IntoRespon
 
 #[get("/items/{id}")]
 pub async fn items_get(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     auth::TargetUser(target): auth::TargetUser,
     Path(id): Path<Uuid>,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
     return Ok(Json(
         item_for_user(
             state,
@@ -2735,6 +2762,7 @@ pub async fn items_get(
             q.fields
                 .as_deref(),
             Some(target.id),
+            allow_ram_prewarm,
         )
         .await?
         .context_not_found("item not found")?,

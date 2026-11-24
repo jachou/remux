@@ -1721,6 +1721,13 @@ pub(crate) fn allow_fast_start_prewarm() -> bool {
     ALLOW_FAST_START_PREWARM.try_with(|v| *v).unwrap_or(true)
 }
 
+/// Returns `true` when the request originates from a local LAN native client that benefits
+/// from pre-warming initial bytes into local RAM; returns `false` for remote WAN or browser
+/// clients (which bypass local RAM and 307-redirect straight to CDN).
+pub fn allow_ram_prewarm_for_headers(headers: &HeaderMap) -> bool {
+    !(is_remote_client(headers) || is_browser_video_request(headers))
+}
+
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///

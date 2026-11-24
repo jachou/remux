@@ -1799,52 +1799,65 @@ impl StreamService {
     /// Pre-emptively probe only the primary candidate (Candidate #1).
     /// Skips probing if Candidate #1 is already cached with reusable probe data.
     /// Does not probe or rewrite any other candidates.
-    pub async fn probe_primary_candidate(&self) -> anyhow::Result<Option<Uuid>> {
+    pub async fn probe_primary_candidate(&self, foreground: bool) -> anyhow::Result<Option<Uuid>> {
         let (Some(stream), sel) = self.resolve_primary_candidate().await? else {
             return Ok(None);
         };
 
+        let prewarm_priority = if foreground {
+            crate::fast_start::PrewarmPriority::High
+        } else {
+            crate::fast_start::PrewarmPriority::Low
+        };
+
         if let Some(cached) = &stream.probe_data {
             if is_reusable_probe_cache(cached) {
-                tracing::info!(item = %self.item_id, stream = %stream.id, "Candidate #1 already has reusable probe data; pre-warming liveness & fast-start in parallel");
-                if let Some(si) = &stream.stream_info {
-                    if !si.descriptor.is_known_dead() {
-                        if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                            let url_clone = url.clone();
-                            let headers_clone = request_headers.clone();
-                            let item_id = self.item_id;
-                            let user_id = self.user_id;
-                            let db_pool = self.ctx.db.clone();
-                            let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
-                            let stream_size = si.size.map(|s| s as u64);
-                            let prewarm_notify_guard =
-                                crate::fast_start::register_active_prewarm_notify(url);
-                            tokio::spawn(async move {
-                                let _prewarm_notify_guard = prewarm_notify_guard;
-                                let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
-                                let head_size = if resume_pos.is_some() {
-                                    crate::fast_start::calculate_fast_start_resume_head_size(
+                tracing::info!(
+                    item = %self.item_id,
+                    stream = %stream.id,
+                    allow_ram_prewarm = crate::fast_start::allow_fast_start_prewarm(),
+                    "Candidate #1 already has reusable probe data; pre-warming liveness & fast-start in parallel"
+                );
+                if crate::fast_start::allow_fast_start_prewarm() {
+                    if let Some(si) = &stream.stream_info {
+                        if !si.descriptor.is_known_dead() {
+                            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                                let url_clone = url.clone();
+                                let headers_clone = request_headers.clone();
+                                let item_id = self.item_id;
+                                let user_id = self.user_id;
+                                let db_pool = self.ctx.db.clone();
+                                let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
+                                let stream_size = si.size.map(|s| s as u64);
+                                let prewarm_notify_guard =
+                                    crate::fast_start::register_active_prewarm_notify(url);
+                                tokio::spawn(async move {
+                                    let _prewarm_notify_guard = prewarm_notify_guard;
+                                    let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
+                                    let head_size = if resume_pos.is_some() {
+                                        crate::fast_start::calculate_fast_start_resume_head_size(
+                                            &url_clone,
+                                            stream_size,
+                                            Some(is_4k),
+                                        )
+                                    } else {
+                                        crate::fast_start::calculate_fast_start_head_size(
+                                            &url_clone,
+                                            stream_size,
+                                            Some(is_4k),
+                                        )
+                                    };
+                                    crate::fast_start::prewarm_fast_start(
+                                        Some(item_id),
                                         &url_clone,
-                                        stream_size,
-                                        Some(is_4k),
+                                        &headers_clone,
+                                        prewarm_priority,
+                                        Some(head_size),
+                                        resume_pos,
                                     )
-                                } else {
-                                    crate::fast_start::calculate_fast_start_head_size(
-                                        &url_clone,
-                                        stream_size,
-                                        Some(is_4k),
-                                    )
-                                };
-                                crate::fast_start::prewarm_fast_start(
-                                    Some(item_id),
-                                    &url_clone,
-                                    &headers_clone,
-                                    crate::fast_start::PrewarmPriority::Low,
-                                    Some(head_size),
-                                    resume_pos,
-                                )
-                                .await;
-                            });
+                                    .await;
+                                });
+                            }
                         }
                     }
                 }
@@ -1884,32 +1897,40 @@ impl StreamService {
             timeout
         };
 
-        // Start Low-priority Fast-Start pre-warm for Candidate #1 in parallel with ffprobe
-        if let Some(si) = &stream.stream_info {
-            if !si.descriptor.is_known_dead() {
-                if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                    let url_clone = url.clone();
-                    let headers_clone = request_headers.clone();
-                    let item_id = self.item_id;
-                    let user_id = self.user_id;
-                    let db_pool = self.ctx.db.clone();
-                    let head_size = crate::fast_start::calculate_fast_start_head_size(
-                        url,
-                        si.size.map(|s| s as u64),
-                        None,
-                    );
-                    tokio::spawn(async move {
-                        let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
-                        crate::fast_start::prewarm_fast_start(
-                            Some(item_id),
-                            &url_clone,
-                            &headers_clone,
-                            crate::fast_start::PrewarmPriority::Low,
-                            Some(head_size),
-                            resume_pos,
-                        )
-                        .await;
-                    });
+        let prewarm_priority = if foreground {
+            crate::fast_start::PrewarmPriority::High
+        } else {
+            crate::fast_start::PrewarmPriority::Low
+        };
+
+        // Start Fast-Start RAM pre-warm for Candidate #1 in parallel with ffprobe (LAN only).
+        if crate::fast_start::allow_fast_start_prewarm() {
+            if let Some(si) = &stream.stream_info {
+                if !si.descriptor.is_known_dead() {
+                    if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                        let url_clone = url.clone();
+                        let headers_clone = request_headers.clone();
+                        let item_id = self.item_id;
+                        let user_id = self.user_id;
+                        let db_pool = self.ctx.db.clone();
+                        let head_size = crate::fast_start::calculate_fast_start_head_size(
+                            url,
+                            si.size.map(|s| s as u64),
+                            None,
+                        );
+                        tokio::spawn(async move {
+                            let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
+                            crate::fast_start::prewarm_fast_start(
+                                Some(item_id),
+                                &url_clone,
+                                &headers_clone,
+                                prewarm_priority,
+                                Some(head_size),
+                                resume_pos,
+                            )
+                            .await;
+                        });
+                    }
                 }
             }
         }
@@ -1932,7 +1953,7 @@ impl StreamService {
         .map_err(|e| anyhow::anyhow!("{e:?}"))?;
 
         tracing::info!(item = %self.item_id, effective = %effective.id, "preemptive probe of Candidate #1 completed");
-        if effective.id != stream.id {
+        if effective.id != stream.id && crate::fast_start::allow_fast_start_prewarm() {
             if let Some(si) = &effective.stream_info {
                 if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
                     let url_clone = url.clone();
@@ -1951,7 +1972,7 @@ impl StreamService {
                             Some(item_id),
                             &url_clone,
                             &headers_clone,
-                            crate::fast_start::PrewarmPriority::Low,
+                            prewarm_priority,
                             Some(head_size),
                             resume_pos,
                         )
@@ -1973,6 +1994,8 @@ pub(crate) static ACTIVE_PROBES: std::sync::LazyLock<
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 static PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
     std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(3));
+static FOREGROUND_PREEMPTIVE_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
 static RECENT_PREEMPTIVE_PROBES: std::sync::LazyLock<
     dashmap::DashMap<Uuid, std::time::Instant>,
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
@@ -2019,6 +2042,32 @@ pub async fn await_in_flight_probe(item_id: Uuid) -> bool {
     }
 }
 
+/// Options controlling how a preemptive probe executes.
+#[derive(Debug, Clone, Copy)]
+pub struct PreemptiveProbeOpts {
+    /// Bypass liveness cache TTL and unconditionally refresh upstream CDN redirect tokens.
+    pub force_refresh_liveness: bool,
+    /// User-initiated detail-page open (`GET /Items/{id}`, `GET /Shows/{id}/Episodes`,
+    /// single-series `GET /Shows/NextUp?seriesId=...`): runs on the dedicated foreground
+    /// semaphore lane so it never queues behind background Home-Screen pre-warms, and uses
+    /// `PrewarmPriority::High` for LAN RAM buffering.
+    pub foreground: bool,
+    /// Whether to download initial head/tail/resume bytes into local RAM.
+    /// `true` for LAN clients; `false` for remote WAN / browser clients (which bypass local RAM
+    /// and 307-redirect straight to CDN, so they only need stream discovery + 8-byte CDN liveness).
+    pub allow_ram_prewarm: bool,
+}
+
+impl Default for PreemptiveProbeOpts {
+    fn default() -> Self {
+        Self {
+            force_refresh_liveness: false,
+            foreground: false,
+            allow_ram_prewarm: true,
+        }
+    }
+}
+
 /// Spawns a background task to pre-emptively probe the primary stream candidate
 /// for the given Movie or Episode item.
 pub fn spawn_preemptive_probe(
@@ -2026,7 +2075,7 @@ pub fn spawn_preemptive_probe(
     item_id: Uuid,
     user_id: Option<Uuid>,
 ) {
-    spawn_preemptive_probe_opts(ctx, item_id, user_id, false);
+    spawn_preemptive_probe_with_opts(ctx, item_id, user_id, PreemptiveProbeOpts::default());
 }
 
 /// Spawns a background task to pre-emptively probe the primary stream candidate,
@@ -2037,6 +2086,25 @@ pub fn spawn_preemptive_probe_opts(
     user_id: Option<Uuid>,
     force_refresh_liveness: bool,
 ) {
+    spawn_preemptive_probe_with_opts(
+        ctx,
+        item_id,
+        user_id,
+        PreemptiveProbeOpts {
+            force_refresh_liveness,
+            ..Default::default()
+        },
+    );
+}
+
+/// Spawns a preemptive probe task with explicit priority lane and RAM pre-warm controls.
+pub fn spawn_preemptive_probe_with_opts(
+    ctx: &crate::AppContext,
+    item_id: Uuid,
+    user_id: Option<Uuid>,
+    opts: PreemptiveProbeOpts,
+) {
+    let force_refresh_liveness = opts.force_refresh_liveness;
     if crate::stream::is_preemptive_probe_circuit_broken() {
         tracing::debug!(%item_id, "preemptive probe skipped: circuit breaker active due to upstream rate limit or outage");
         return;
@@ -2054,7 +2122,13 @@ pub fn spawn_preemptive_probe_opts(
         tracing::debug!(%item_id, "preemptive probe already in flight or queued, skipping duplicate spawn");
         return;
     }
-    tracing::info!(%item_id, force_refresh_liveness, "spawning preemptive probe task");
+    tracing::info!(
+        %item_id,
+        force_refresh_liveness,
+        foreground = opts.foreground,
+        allow_ram_prewarm = opts.allow_ram_prewarm,
+        "spawning preemptive probe task"
+    );
     let ctx = ctx.clone();
     tokio::spawn(async move {
         struct QueuedGuard(Uuid);
@@ -2078,9 +2152,14 @@ pub fn spawn_preemptive_probe_opts(
             return;
         }
 
+        let semaphore = if opts.foreground {
+            &*FOREGROUND_PREEMPTIVE_SEMAPHORE
+        } else {
+            &*PREEMPTIVE_SEMAPHORE
+        };
         let _permit = match tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            PREEMPTIVE_SEMAPHORE.acquire(),
+            semaphore.acquire(),
         )
         .await
         {
@@ -2145,68 +2224,80 @@ pub fn spawn_preemptive_probe_opts(
             return;
         }
 
-        // Fast path: if Candidate #1 already has reusable probe data, pre-warm immediately in parallel without waiting
+        // Fast path: if Candidate #1 already has reusable probe data, pre-warm liveness (and RAM on LAN) in parallel without waiting.
         if let Ok((Some(primary), _)) = service.resolve_primary_candidate().await {
             if let Some(cached) = &primary.probe_data {
                 if is_reusable_probe_cache(cached) {
-                    tracing::info!(%item_id, stream_id = %primary.id, "Candidate #1 already probed in DB; pre-warming liveness & fast-start in parallel");
-                    let prewarm_notify_guard = primary
-                        .stream_info
-                        .as_ref()
-                        .and_then(|si| {
-                            if !si.descriptor.is_known_dead() {
-                                if let crate::stream::StreamDescriptor::Http { url, .. } =
-                                    &si.descriptor
-                                {
-                                    return Some(
-                                        crate::fast_start::register_active_prewarm_notify(url),
-                                    );
+                    tracing::info!(
+                        %item_id,
+                        stream_id = %primary.id,
+                        allow_ram_prewarm = opts.allow_ram_prewarm,
+                        "Candidate #1 already probed in DB; pre-warming liveness & fast-start in parallel"
+                    );
+                    if opts.allow_ram_prewarm {
+                        let prewarm_notify_guard = primary
+                            .stream_info
+                            .as_ref()
+                            .and_then(|si| {
+                                if !si.descriptor.is_known_dead() {
+                                    if let crate::stream::StreamDescriptor::Http { url, .. } =
+                                        &si.descriptor
+                                    {
+                                        return Some(
+                                            crate::fast_start::register_active_prewarm_notify(url),
+                                        );
+                                    }
                                 }
-                            }
-                            None
-                        });
-                    if let Some(si) = &primary.stream_info {
-                        if !si.descriptor.is_known_dead() {
-                            if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
-                                let url_clone = url.clone();
-                                let headers_clone = request_headers.clone();
-                                let db_pool = ctx.db.clone();
-                                let size_opt = si.size.map(|s| s as u64);
-                                let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
-                                tokio::spawn(async move {
-                                    let _prewarm_notify_guard = prewarm_notify_guard;
-                                    let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
-                                    let head_size = if resume_pos.is_some() {
-                                        crate::fast_start::calculate_fast_start_resume_head_size(
-                                            &url_clone,
-                                            size_opt,
-                                            Some(is_4k),
-                                        )
+                                None
+                            });
+                        if let Some(si) = &primary.stream_info {
+                            if !si.descriptor.is_known_dead() {
+                                if let crate::stream::StreamDescriptor::Http { url, request_headers, .. } = &si.descriptor {
+                                    let url_clone = url.clone();
+                                    let headers_clone = request_headers.clone();
+                                    let db_pool = ctx.db.clone();
+                                    let size_opt = si.size.map(|s| s as u64);
+                                    let is_4k = cached.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160);
+                                    let prewarm_priority = if opts.foreground {
+                                        crate::fast_start::PrewarmPriority::High
                                     } else {
-                                        crate::fast_start::calculate_fast_start_head_size(
-                                            &url_clone,
-                                            size_opt,
-                                            Some(is_4k),
-                                        )
+                                        crate::fast_start::PrewarmPriority::Low
                                     };
-                                    crate::fast_start::prewarm_fast_start(
-                                        Some(item_id),
-                                        &url_clone,
-                                        &headers_clone,
-                                        crate::fast_start::PrewarmPriority::Low,
-                                        Some(head_size),
-                                        resume_pos,
-                                    )
-                                    .await;
-                                });
+                                    tokio::spawn(async move {
+                                        let _prewarm_notify_guard = prewarm_notify_guard;
+                                        let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
+                                        let head_size = if resume_pos.is_some() {
+                                            crate::fast_start::calculate_fast_start_resume_head_size(
+                                                &url_clone,
+                                                size_opt,
+                                                Some(is_4k),
+                                            )
+                                        } else {
+                                            crate::fast_start::calculate_fast_start_head_size(
+                                                &url_clone,
+                                                size_opt,
+                                                Some(is_4k),
+                                            )
+                                        };
+                                        crate::fast_start::prewarm_fast_start(
+                                            Some(item_id),
+                                            &url_clone,
+                                            &headers_clone,
+                                            prewarm_priority,
+                                            Some(head_size),
+                                            resume_pos,
+                                        )
+                                        .await;
+                                    });
+                                } else {
+                                    drop(prewarm_notify_guard);
+                                }
                             } else {
                                 drop(prewarm_notify_guard);
                             }
                         } else {
                             drop(prewarm_notify_guard);
                         }
-                    } else {
-                        drop(prewarm_notify_guard);
                     }
                     let is_alive = if let Some(si) = &primary.stream_info {
                         if force_refresh_liveness || si.descriptor.is_liveness_expiring_soon() {
@@ -2233,7 +2324,12 @@ pub fn spawn_preemptive_probe_opts(
             }
         }
 
-        let probe_result = service.probe_primary_candidate().await;
+        let probe_result = crate::fast_start::ALLOW_FAST_START_PREWARM
+            .scope(
+                opts.allow_ram_prewarm,
+                service.probe_primary_candidate(opts.foreground),
+            )
+            .await;
         // Drop active guard and semaphore permit immediately so foreground PlaybackInfo and queued probes unblock
         drop(active_guard);
         drop(_permit);
@@ -2378,6 +2474,24 @@ pub fn spawn_next_episode_probe_opts(
     trigger: &'static str,
     skip_if_cached_and_fresh: bool,
 ) {
+    spawn_next_episode_probe_with_prewarm(
+        ctx,
+        current_item_id,
+        user_id,
+        trigger,
+        skip_if_cached_and_fresh,
+        true,
+    );
+}
+
+pub fn spawn_next_episode_probe_with_prewarm(
+    ctx: &crate::AppContext,
+    current_item_id: Uuid,
+    user_id: Uuid,
+    trigger: &'static str,
+    skip_if_cached_and_fresh: bool,
+    allow_ram_prewarm: bool,
+) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
         let Ok(Some(current)) = db::Media::get_by_id(&ctx.db, &current_item_id).await else {
@@ -2416,7 +2530,7 @@ pub fn spawn_next_episode_probe_opts(
         };
 
         if let Some(next_id) = target_id {
-            if skip_if_cached_and_fresh {
+            if skip_if_cached_and_fresh && allow_ram_prewarm {
                 let fresh_threshold = std::time::Duration::from_secs(30 * 60);
                 if crate::fast_start::is_item_cached_and_fresh(next_id, fresh_threshold) {
                     tracing::info!(%next_id, trigger, "next episode stream already cached and fresh in RAM (<30m); skipping redundant stop probe");
@@ -2426,9 +2540,18 @@ pub fn spawn_next_episode_probe_opts(
                 }
             }
 
-            tracing::info!(%next_id, trigger, "{}: auto-probing next episode in background", trigger);
+            tracing::info!(%next_id, trigger, allow_ram_prewarm, "{}: auto-probing next episode in background", trigger);
             let force_refresh = trigger.contains("80%") || trigger.contains("5m");
-            spawn_preemptive_probe_opts(&ctx, next_id, Some(user_id), force_refresh);
+            spawn_preemptive_probe_with_opts(
+                &ctx,
+                next_id,
+                Some(user_id),
+                PreemptiveProbeOpts {
+                    force_refresh_liveness: force_refresh,
+                    foreground: false,
+                    allow_ram_prewarm,
+                },
+            );
         }
     });
 }
@@ -3502,7 +3625,7 @@ mod tests {
         });
         service.streams = vec![stream.clone()];
 
-        let probed_id = service.probe_primary_candidate().await.unwrap();
+        let probed_id = service.probe_primary_candidate(false).await.unwrap();
         assert_eq!(
             probed_id,
             Some(stream.id),
@@ -3697,5 +3820,62 @@ mod tests {
             ..Default::default()
         }];
         assert!(!has_matching_embedded_subtitles(&ext_source, &eng_prefs));
+    }
+
+    #[tokio::test]
+    async fn foreground_preemptive_probe_bypasses_saturated_background_semaphore() {
+        use crate::integration_test::{authenticated_server, seed_movie};
+
+        let (_server, guard, _token) = authenticated_server().await;
+        let ctx = &guard.0;
+        let owner = seed_movie(ctx).await;
+
+        // Saturate all background permits so a background probe would block.
+        let bg_permits = super::PREEMPTIVE_SEMAPHORE
+            .acquire_many(3)
+            .await
+            .expect("acquire background permits");
+
+        super::spawn_preemptive_probe_with_opts(
+            ctx,
+            owner.id,
+            None,
+            super::PreemptiveProbeOpts {
+                foreground: true,
+                allow_ram_prewarm: false,
+                ..Default::default()
+            },
+        );
+
+        // Foreground probe must finish promptly without waiting for bg_permits.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while super::QUEUED_PROBES.contains(&owner.id) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "foreground probe stalled behind saturated background PREEMPTIVE_SEMAPHORE"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(bg_permits);
+    }
+
+    #[test]
+    fn allow_ram_prewarm_for_headers_distinguishes_lan_and_remote() {
+        let lan_headers = axum::http::HeaderMap::new();
+        assert!(crate::fast_start::allow_ram_prewarm_for_headers(&lan_headers));
+
+        let mut remote_headers = axum::http::HeaderMap::new();
+        remote_headers.insert(
+            "cf-connecting-ip",
+            axum::http::HeaderValue::from_static("203.0.113.42"),
+        );
+        assert!(!crate::fast_start::allow_ram_prewarm_for_headers(&remote_headers));
+
+        let mut browser_headers = axum::http::HeaderMap::new();
+        browser_headers.insert(
+            axum::http::header::USER_AGENT,
+            axum::http::HeaderValue::from_static("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"),
+        );
+        assert!(!crate::fast_start::allow_ram_prewarm_for_headers(&browser_headers));
     }
 }

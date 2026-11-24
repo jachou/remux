@@ -161,6 +161,7 @@ pub async fn sessions_capabilities_by_id(
 
 #[post("/sessions/playing")]
 pub async fn report_playback_start(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Json(data): Json<api::PlaybackInfo>,
@@ -213,11 +214,14 @@ pub async fn report_playback_start(
         }));
 
     if !data.item_id.is_nil() {
-        crate::services::stream_service::spawn_next_episode_probe(
+        let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
+        crate::services::stream_service::spawn_next_episode_probe_with_prewarm(
             &state.ctx,
             data.item_id,
             session.user.id,
             "Trigger 1 (on playback start)",
+            false,
+            allow_ram_prewarm,
         );
     }
 
@@ -226,6 +230,7 @@ pub async fn report_playback_start(
 
 #[post("/sessions/playing/progress")]
 pub async fn report_playback_progress(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Json(data): Json<api::PlaybackInfo>,
@@ -300,20 +305,25 @@ pub async fn report_playback_progress(
                     .filter(|id| !id.is_nil())
             };
             if let Some(item_id) = item_id {
+                let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
                 if milestones.crossed_80 {
-                    crate::services::stream_service::spawn_next_episode_probe(
+                    crate::services::stream_service::spawn_next_episode_probe_with_prewarm(
                         &state.ctx,
                         item_id,
                         session.user.id,
                         "Trigger 3 (on 80% progress)",
+                        false,
+                        allow_ram_prewarm,
                     );
                 }
                 if milestones.near_end {
-                    crate::services::stream_service::spawn_next_episode_probe(
+                    crate::services::stream_service::spawn_next_episode_probe_with_prewarm(
                         &state.ctx,
                         item_id,
                         session.user.id,
                         "Trigger 4 (within 5m of end)",
+                        false,
+                        allow_ram_prewarm,
                     );
                 }
             }
@@ -502,14 +512,16 @@ pub async fn report_playback_stopped(
 
             if played {
                 crate::fast_start::purge_resume_buffer_for_item(item_id);
-                crate::services::stream_service::spawn_next_episode_probe_opts(
+                let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
+                crate::services::stream_service::spawn_next_episode_probe_with_prewarm(
                     &state.ctx,
                     item_id,
                     session.user.id,
                     "Trigger 2 (on playback stopped)",
                     already_probed_next,
+                    allow_ram_prewarm,
                 );
-            } else if !crate::fast_start::is_remote_client(&headers) {
+            } else if crate::fast_start::allow_ram_prewarm_for_headers(&headers) {
                 // Stopped mid-way on LAN: bypass 30s probe cooldown and immediately refresh the resume buffer at the new stop position!
                 crate::services::stream_service::clear_recent_preemptive_probe(item_id);
                 crate::services::stream_service::spawn_preemptive_probe(
@@ -555,13 +567,16 @@ pub async fn report_playback_stopped(
 
         if played {
             crate::fast_start::purge_resume_buffer_for_item(data.item_id);
-            crate::services::stream_service::spawn_next_episode_probe(
+            let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
+            crate::services::stream_service::spawn_next_episode_probe_with_prewarm(
                 &state.ctx,
                 data.item_id,
                 session.user.id,
                 "Trigger 2 (on playback stopped)",
+                false,
+                allow_ram_prewarm,
             );
-        } else if !crate::fast_start::is_remote_client(&headers) {
+        } else if crate::fast_start::allow_ram_prewarm_for_headers(&headers) {
             crate::services::stream_service::clear_recent_preemptive_probe(data.item_id);
             crate::services::stream_service::spawn_preemptive_probe(
                 &state.ctx,

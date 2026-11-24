@@ -506,9 +506,7 @@ async fn items_playbackinfo_inner(
         .then(|| media.clone());
     // Addon subtitles are fetched per source inside `probe_candidates`,
     // alongside that source's probe, so only the item itself is loaded here.
-    let is_remote_req = crate::fast_start::is_remote_client(&headers);
-    let is_browser_req = crate::fast_start::is_browser_video_request(&headers);
-    let allow_prewarm = !(is_remote_req || is_browser_req);
+    let allow_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
     let pbi_start = std::time::Instant::now();
     let (probed_result, subtitle_media) = tokio::join!(
         async {
@@ -596,7 +594,7 @@ async fn items_playbackinfo_inner(
                 ..
             } = &si.descriptor
             {
-                if is_remote_req || is_browser_req {
+                if !allow_prewarm {
                     if !crate::fast_start::is_ip_locked_cdn_url(url) {
                         let desc = si.descriptor.clone();
                         tokio::spawn(async move {

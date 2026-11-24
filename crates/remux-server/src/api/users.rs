@@ -1417,18 +1417,21 @@ pub async fn users_get_by_id(
 
 #[get("/users/{user_id}/items/{id}")]
 pub async fn users_items_get(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Path((user_id, id)): Path<(Uuid, Uuid)>,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
+    let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
     return Ok(Json(
-        item(
+        super::items::item_with_prewarm(
             state,
             session,
             id,
             q.fields
                 .as_deref(),
+            allow_ram_prewarm,
         )
         .await?
         .context_not_found("item not found")?,
@@ -1844,6 +1847,7 @@ async fn resume_items(
     state: AppState,
     session: auth::AuthSession,
     mut q: api::GetItemsQuery,
+    allow_ram_prewarm: bool,
 ) -> Result<impl IntoResponse> {
     let user_id = session.user.id;
     let ctx = state.ctx.clone();
@@ -2009,10 +2013,15 @@ async fn resume_items(
     }
     if start == 0 {
         for target in items.iter().take(8) {
-            crate::services::stream_service::spawn_preemptive_probe(
+            crate::services::stream_service::spawn_preemptive_probe_with_opts(
                 &ctx,
                 target.id,
                 Some(user_id),
+                crate::services::stream_service::PreemptiveProbeOpts {
+                    foreground: false,
+                    allow_ram_prewarm,
+                    ..Default::default()
+                },
             );
         }
     }
@@ -2026,11 +2035,13 @@ async fn resume_items(
 
 #[get("/users/{user_id}/items/resume")]
 pub async fn users_items_resume(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
-    resume_items(state, session, q).await
+    let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
+    resume_items(state, session, q, allow_ram_prewarm).await
 }
 
 #[get("/users/{user_id}/items/similar")]
@@ -2060,11 +2071,13 @@ pub async fn users_items_intros(
 
 #[get("/useritems/resume")]
 pub async fn useritems_resume(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Query(q): Query<api::GetItemsQuery>,
 ) -> Result<impl IntoResponse> {
-    resume_items(state, session, q).await
+    let allow_ram_prewarm = crate::fast_start::allow_ram_prewarm_for_headers(&headers);
+    resume_items(state, session, q, allow_ram_prewarm).await
 }
 
 #[post("/users/forgotpassword")]
