@@ -48,7 +48,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
             entry_ref.clone()
         };
 
-        let waiter_guard = WaiterGuard {
+        let mut waiter_guard = WaiterGuard {
             map: map.clone(),
             key: key.clone(),
             entry: entry.clone(),
@@ -56,8 +56,8 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
         };
 
         let _guard = entry.mutex.clone().lock_owned().await;
-        let mut waiter_guard = std::mem::ManuallyDrop::new(waiter_guard);
         waiter_guard.acquired = true;
+        drop(waiter_guard);
 
         KeyedLockGuard {
             map,
@@ -83,7 +83,7 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
             Arc::clone(&entry_ref)
         };
 
-        let waiter_guard = WaiterGuard {
+        let mut waiter_guard = WaiterGuard {
             map: map.clone(),
             key: key.clone(),
             entry: entry.clone(),
@@ -91,8 +91,8 @@ impl<K: Eq + Hash + Clone + Send + Sync + 'static> KeyedLock<K> {
         };
 
         let _guard = entry.mutex.clone().lock_owned().await;
-        let mut waiter_guard = std::mem::ManuallyDrop::new(waiter_guard);
         waiter_guard.acquired = true;
+        drop(waiter_guard);
 
         Some(KeyedLockGuard {
             map,

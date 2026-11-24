@@ -3063,7 +3063,7 @@ impl AddonService {
                             || force_refresh
                             || root_was_remapped
                             || fields_changed
-                            || (was_refreshed && existing_refreshed_at_val.is_none());
+                            || was_refreshed;
                         if needs_upsert {
                             level2.push(gc);
                         }
@@ -3363,7 +3363,7 @@ impl AddonService {
 
     pub fn has_subtitle_addons(&self) -> bool {
         self.inner.load().iter().any(|r| {
-            r.subtitle.is_some()
+            (r.subtitle.is_some() || r.caps.manifest_unreachable)
                 && r.row
                     .resources
                     .contains(&ResourceType::Subtitles)

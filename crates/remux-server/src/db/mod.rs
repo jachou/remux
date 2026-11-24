@@ -38,7 +38,7 @@ pub async fn connect(url: &str, slow_query_threshold_ms: u64) -> Result<SqlitePo
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .pragma("wal_autocheckpoint", "1000")
-        .pragma("cache_size", "-65536")
+        .pragma("cache_size", "-16384")
         .pragma("mmap_size", "536870912")
         .pragma("temp_store", "memory")
         // Allow up to 10s of retrying when blocked by another connection's

@@ -609,7 +609,7 @@ impl UserMediaState {
         new_media_id: Uuid,
     ) -> Result<Self> {
         let mut tx = db
-            .begin()
+            .begin_with("BEGIN IMMEDIATE")
             .await?;
 
         let existing: Option<Self> = sqlx::query_as(

@@ -69,27 +69,34 @@ impl Task for RefreshAllMetaTask {
             })
         };
 
-        // Cursor-based pagination: WHERE id > last_id guarantees forward progress even
-        // when refresh fails and refreshed_at is not updated for an item.
-        let mut last_id: Option<uuid::Uuid> = None;
+        // Composite (kind, id) cursor pagination walks `idx_media_kind_id` in native
+        // index order with zero temp B-tree sort across all media kinds.
+        let mut last_cursor: Option<(db::MediaKind, uuid::Uuid)> = None;
         let mut batches = 0usize;
         loop {
             let fetch_started = std::time::Instant::now();
-            let batch = if let Some(cursor) = last_id {
+            let batch = if let Some((ref cursor_kind, cursor_id)) = last_cursor {
                 sqlx::query_as::<_, db::Media>(
-                    "SELECT * FROM media WHERE kind IN (?, ?, ?, ?) AND id > ? ORDER BY id LIMIT ?",
+                    "SELECT * FROM media \
+                     WHERE kind IN (?, ?, ?, ?) \
+                       AND (kind > ? OR (kind = ? AND id > ?)) \
+                     ORDER BY kind, id LIMIT ?",
                 )
                 .bind(db::MediaKind::Movie)
                 .bind(db::MediaKind::Series)
                 .bind(db::MediaKind::Artist)
                 .bind(db::MediaKind::Album)
-                .bind(cursor)
+                .bind(cursor_kind)
+                .bind(cursor_kind)
+                .bind(cursor_id)
                 .bind(CHUNK_SIZE)
                 .fetch_all(&ctx.db)
                 .await?
             } else {
                 sqlx::query_as::<_, db::Media>(
-                    "SELECT * FROM media WHERE kind IN (?, ?, ?, ?) ORDER BY id LIMIT ?",
+                    "SELECT * FROM media \
+                     WHERE kind IN (?, ?, ?, ?) \
+                     ORDER BY kind, id LIMIT ?",
                 )
                 .bind(db::MediaKind::Movie)
                 .bind(db::MediaKind::Series)
@@ -114,9 +121,9 @@ impl Task for RefreshAllMetaTask {
                 fetch_elapsed = ?fetch_elapsed,
                 "full metadata refresh batch starting"
             );
-            last_id = batch
+            last_cursor = batch
                 .last()
-                .map(|m| m.id);
+                .map(|m| (m.kind.clone(), m.id));
             let process_started = std::time::Instant::now();
             ctx.addons
                 .process_meta_batch(batch, &ctx, true, Some(Arc::clone(&on_item_done)))

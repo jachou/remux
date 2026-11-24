@@ -95,8 +95,8 @@ impl AddonPreset for StremioPreset {
             manifest_url,
             client,
             medias_cache: moka::sync::Cache::builder()
-                .max_capacity(256)
-                .time_to_live(std::time::Duration::from_secs(5 * 60))
+                .max_capacity(1024)
+                .time_to_idle(std::time::Duration::from_secs(15 * 60))
                 .build(),
             failed: moka::sync::Cache::builder()
                 .max_capacity(2048)
@@ -544,11 +544,23 @@ impl TreeAddon for StremioAddon {
                     .ok_or_else(|| {
                         anyhow!("season {} has no resolvable meta id", root.id)
                     })?;
-                let meta_arc = self
-                    .medias_cache
-                    .get(&meta_id);
-                let Some(meta_arc) = meta_arc else {
-                    return Ok(None);
+                let meta_arc = match self.medias_cache.get(&meta_id) {
+                    Some(arc) => arc,
+                    None => {
+                        let svc = self.service()?;
+                        match fetch_and_cache_meta(
+                            &svc,
+                            root,
+                            &self.medias_cache,
+                            &self.failed,
+                            ctx,
+                        )
+                        .await?
+                        {
+                            Some(arc) => arc,
+                            None => return Ok(None),
+                        }
+                    }
                 };
                 let season_idx = match root.idx {
                     Some(i) => i,

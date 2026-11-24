@@ -234,6 +234,7 @@ fn spawn_buffer_monitor(
     segment_length: u32,
     start_index: u32,
     playback_offset_secs: Arc<AtomicU32>,
+    last_segment_index: Arc<AtomicU32>,
     ffmpeg_pid: Arc<AtomicU32>,
     mut stop_rx: tokio::sync::oneshot::Receiver<()>,
     play_session_id: String,
@@ -254,9 +255,15 @@ fn spawn_buffer_monitor(
                 start_index,
                 segment_length,
             );
-            // playback_offset_secs is how far the client has actually played
-            // relative to the start of this transcode session (from progress reports).
-            let playback_secs = playback_offset_secs.load(Ordering::Relaxed);
+            // Combine client progress reports with the highest HLS segment actually
+            // requested so Live TV and clients without PlaySessionId progress ticks
+            // never freeze at MAX_BUFFER_SECS (300s).
+            let report_secs = playback_offset_secs.load(Ordering::Relaxed);
+            let seg_idx = last_segment_index.load(Ordering::Relaxed);
+            let seg_secs = seg_idx
+                .saturating_sub(start_index)
+                .saturating_mul(segment_length);
+            let playback_secs = report_secs.max(seg_secs);
 
             let ahead = buffered_secs.saturating_sub(playback_secs);
 
@@ -279,9 +286,9 @@ fn spawn_buffer_monitor(
             }
 
             // Every 30 seconds, delete segments that are more than SEGMENT_KEEP_SECS
-            // behind the current playback position.
+            // behind the current playback position (offset by start_index after seeks).
             if ticks % 30 == 0 && playback_secs > SEGMENT_KEEP_SECS {
-                let cutoff_idx = (playback_secs - SEGMENT_KEEP_SECS) / segment_length;
+                let cutoff_idx = start_index + (playback_secs - SEGMENT_KEEP_SECS) / segment_length;
                 delete_old_segments(&output_dir, cutoff_idx);
             }
         }
@@ -348,7 +355,7 @@ fn highest_segment_index(dir: &PathBuf) -> Option<u32> {
 /// `-start_number` / `#EXT-X-MEDIA-SEQUENCE` base. Segment files are named
 /// from this index, not from 0, so anything comparing segment indexes across
 /// a seek (the buffer monitor, the playlist) must account for it.
-fn segment_start_index(start_time_ticks: Option<i64>, segment_length: u32) -> u32 {
+pub(crate) fn segment_start_index(start_time_ticks: Option<i64>, segment_length: u32) -> u32 {
     start_time_ticks
         .map(|t| (t as f64 / 10_000_000.0 / segment_length as f64).floor() as u32)
         .unwrap_or(0)
@@ -1304,6 +1311,7 @@ async fn run_ffmpeg(
 ) {
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.hide_console();
+    cmd.kill_on_drop(true);
     cmd.args(&args)
         .stderr(Stdio::piped());
     for (k, v) in env_overrides {
@@ -1412,6 +1420,10 @@ pub async fn start_transcode(
                 let mut s = session_clone
                     .write()
                     .await;
+                if s.cancelled.load(Ordering::SeqCst) {
+                    s.wait_done.notify_one();
+                    break;
+                }
                 s.start_time_secs = params
                     .start_time_ticks
                     .map(|t| (t / 10_000_000) as u32)
@@ -1423,6 +1435,8 @@ pub async fn start_transcode(
                     s.segment_length,
                     segment_start_index(params.start_time_ticks, s.segment_length),
                     s.playback_offset_secs
+                        .clone(),
+                    s.last_segment_index
                         .clone(),
                     ffmpeg_pid.clone(),
                     monitor_stop_rx,
@@ -2061,6 +2075,7 @@ pub fn start_progressive_transcode(
         .env_overrides();
     let mut cmd = tokio::process::Command::new(ffmpeg_bin());
     cmd.hide_console();
+    cmd.kill_on_drop(true);
     cmd.args(&args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -3072,6 +3087,7 @@ mod tests {
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
@@ -3300,6 +3316,7 @@ mod tests {
             transcode_reasons: TranscodeReasons::default(),
             kill_tx: None,
             wait_done: Arc::new(tokio::sync::Notify::new()),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),

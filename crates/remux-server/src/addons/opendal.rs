@@ -2694,6 +2694,10 @@ async fn prune_stale_paths(
     .execute(&mut *tx)
     .await?;
 
+    sqlx::query("DROP TABLE IF EXISTS _opendal_seen")
+        .execute(&mut *tx)
+        .await?;
+
     tx.commit()
         .await?;
     Ok(result.rows_affected() as usize)

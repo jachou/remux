@@ -931,12 +931,31 @@ pub fn is_rate_limited_or_timed_out(url: &str) -> bool {
     STREAM_LIVENESS_CACHE.get(url).is_some_and(|e| e.rate_limited_or_timeout)
 }
 
+struct LivenessExpiry;
+
+impl moka::Expiry<String, LivenessEntry> for LivenessExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &LivenessEntry,
+        _created_at: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        if value.rate_limited_or_timeout {
+            // Short cooldown for transient 429/5xx/timeouts so a brief upstream hiccup
+            // doesn't poison the top stream as dead for a full hour.
+            Some(std::time::Duration::from_secs(60))
+        } else {
+            Some(std::time::Duration::from_secs(60 * 60))
+        }
+    }
+}
+
 pub(crate) static STREAM_LIVENESS_CACHE: std::sync::LazyLock<
     moka::sync::Cache<String, LivenessEntry>,
 > = std::sync::LazyLock::new(|| {
     moka::sync::Cache::builder()
         .max_capacity(1_000)
-        .time_to_live(std::time::Duration::from_secs(60 * 60))
+        .expire_after(LivenessExpiry)
         .build()
 });
 

@@ -2687,9 +2687,9 @@ impl Media {
             rating_critic = COALESCE(excluded.rating_critic, media.rating_critic),
             rating_audience = COALESCE(excluded.rating_audience, media.rating_audience),
             description = COALESCE(excluded.description, media.description),
-            trailers = COALESCE(excluded.trailers, media.trailers),
-            stream_info = COALESCE(excluded.stream_info, media.stream_info),
-            probe_data = COALESCE(excluded.probe_data, media.probe_data),
+            trailers = COALESCE(excluded.trailers, NULLIF(media.trailers, 'null')),
+            stream_info = COALESCE(excluded.stream_info, NULLIF(media.stream_info, 'null')),
+            probe_data = COALESCE(excluded.probe_data, NULLIF(media.probe_data, 'null')),
             grandparent_id = excluded.grandparent_id,
             -- Widened, not replaced: a write that resolved no ids of its own
             -- omits them (`skip_serializing_none`), and must not drop ids
@@ -2699,7 +2699,7 @@ impl Media {
                      THEN media.external_ids ELSE '{}' END,
                 excluded.external_ids
             ),
-            external_ratings = COALESCE(excluded.external_ratings, media.external_ratings),
+            external_ratings = COALESCE(excluded.external_ratings, NULLIF(media.external_ratings, 'null')),
             promoted = excluded.promoted,
             collection_kind = excluded.collection_kind,
             collection_media_kind = excluded.collection_media_kind,
@@ -2709,7 +2709,7 @@ impl Media {
             collection_latest_sort_digital = excluded.collection_latest_sort_digital,
             collection_default_sort = excluded.collection_default_sort,
             collection_default_sort_order = excluded.collection_default_sort_order,
-            collection_image_config = COALESCE(excluded.collection_image_config, media.collection_image_config),
+            collection_image_config = COALESCE(excluded.collection_image_config, NULLIF(media.collection_image_config, 'null')),
             country = COALESCE(excluded.country, media.country),
             updated_at = excluded.updated_at,
             certification = excluded.certification,
@@ -5020,7 +5020,7 @@ impl Media {
                 qb.push(" AND json_array_length(trailers) > 0");
             }
             if let Some(false) = &filter.has_trailer {
-                qb.push(" AND (trailers IS NULL OR json_array_length(trailers) = 0)");
+                qb.push(" AND (trailers IS NULL OR trailers = 'null' OR json_array_length(trailers) = 0)");
             }
 
             if let Some(studio_ids) = &filter.studio_ids {
@@ -7209,10 +7209,16 @@ impl Media {
     }
 
     pub async fn delete(db: &SqlitePool, id: &Uuid) -> Result<()> {
+        let mut tx = db.begin().await?;
+        sqlx::query("DELETE FROM media_relations WHERE left_media_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         sqlx::query("DELETE FROM media WHERE id = ?1")
             .bind(id)
-            .execute(db)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(())
     }
 

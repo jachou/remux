@@ -90,6 +90,9 @@ pub struct TranscodeSession {
     /// Kill channel and done notifier for the ffmpeg subprocess.
     pub kill_tx: Option<tokio::sync::oneshot::Sender<()>>,
     pub wait_done: Arc<Notify>,
+    /// Set to true when the session is stopped/killed so in-flight spawn or retry loops
+    /// abort immediately instead of spawning an orphaned ffmpeg process.
+    pub cancelled: Arc<std::sync::atomic::AtomicBool>,
     /// Index of the last segment the client has requested (0-based).
     pub last_segment_index: Arc<AtomicU32>,
     /// Start offset of this transcode in seconds (from start_time_ticks).
@@ -178,6 +181,7 @@ impl TranscodeSession {
             transcode_reasons,
             kill_tx: None,
             wait_done: Arc::new(Notify::new()),
+            cancelled: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),

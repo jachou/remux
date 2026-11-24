@@ -1248,6 +1248,8 @@ async fn kill_transcode(ts: Arc<tokio::sync::RwLock<TranscodeSession>>) {
         let mut s = ts
             .write()
             .await;
+        s.cancelled
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         (
             s.kill_tx
                 .take(),

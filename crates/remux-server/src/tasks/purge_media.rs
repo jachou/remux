@@ -122,6 +122,9 @@ impl Task for PurgeMediaTask {
             sqlx::query("DELETE FROM media_relations")
                 .execute(&mut *conn)
                 .await?;
+            sqlx::query("DELETE FROM media_metrics WHERE media_id NOT IN (SELECT id FROM _keep)")
+                .execute(&mut *conn)
+                .await?;
             sqlx::query("DELETE FROM media")
                 .execute(&mut *conn)
                 .await?;
@@ -166,6 +169,13 @@ impl Task for PurgeMediaTask {
             Ok(())
         }
         .await;
+
+        if result.is_err() {
+            sqlx::query("ROLLBACK")
+                .execute(&mut *conn)
+                .await
+                .ok();
+        }
 
         // Always restore FK before returning the connection to the pool.
         sqlx::query("PRAGMA foreign_keys = ON")

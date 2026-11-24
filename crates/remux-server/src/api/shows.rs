@@ -674,20 +674,34 @@ async fn shows_nextup_all(
     let total = candidates.len() as i64;
     let start = q.start_index.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(u32::MAX) as usize;
-    // Slice to the requested page before hydrating via get_items (unless parental policy rules
-    // might filter out some candidates, in which case keep the full candidate list).
-    let has_policy_filters = session
-        .user
-        .policy
-        .as_ref()
-        .is_some_and(|p| {
-            p.0.max_parental_rating.is_some()
-                || !p.0.blocked_tags.is_empty()
-                || !p.0.allowed_tags.is_empty()
-                || p.0.filter_rules.is_some()
-        });
+    // Slice to the requested page before hydrating via get_items only when no policy,
+    // folder, parent_id, or query filter can drop candidates after hydration.
+    let has_post_filters = q.parent_id.is_some()
+        || q.filters.is_some()
+        || q.is_favorite.is_some()
+        || q.tags.is_some()
+        || q.genres.is_some()
+        || q.genre_ids.is_some()
+        || q.ids.is_some()
+        || q.studio_ids.is_some()
+        || q.years.is_some()
+        || q.search_term
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+        || session
+            .user
+            .policy
+            .as_ref()
+            .is_some_and(|p| {
+                p.0.max_parental_rating.is_some()
+                    || !p.0.blocked_tags.is_empty()
+                    || !p.0.allowed_tags.is_empty()
+                    || p.0.filter_rules.is_some()
+                    || !p.0.enable_all_folders
+                    || !p.0.enabled_folders.is_empty()
+            });
 
-    let page_candidates: Vec<_> = if has_policy_filters {
+    let page_candidates: Vec<_> = if has_post_filters {
         candidates
     } else {
         candidates.into_iter().skip(start).take(limit).collect()
@@ -696,7 +710,7 @@ async fn shows_nextup_all(
     if page_candidates.is_empty() {
         return Ok(Json(serde_json::json!({
             "Items": [],
-            "TotalRecordCount": total,
+            "TotalRecordCount": if q.enable_total_record_count.unwrap_or(true) { total } else { 0 },
             "StartIndex": q.start_index.unwrap_or_default(),
         })));
     }
@@ -707,13 +721,35 @@ async fn shows_nextup_all(
         .map(|(index, (media, _))| (media.id, index))
         .collect();
     let mut query = q.clone();
-    query.ids = Some(
+    let candidate_ids: Vec<Uuid> = if let Some(req_ids) = &q.ids {
         page_candidates
             .into_iter()
             .map(|(media, _)| media.id)
-            .collect(),
-    );
+            .filter(|id| req_ids.contains(id))
+            .collect()
+    } else {
+        page_candidates
+            .into_iter()
+            .map(|(media, _)| media.id)
+            .collect()
+    };
+    if candidate_ids.is_empty() {
+        return Ok(Json(serde_json::json!({
+            "Items": [],
+            "TotalRecordCount": 0,
+            "StartIndex": q.start_index.unwrap_or_default(),
+        })));
+    }
+    query.ids = Some(candidate_ids);
     query.include_item_types = Some(vec![api::MediaType::Episode]);
+    if query.parent_id.is_some() {
+        query.recursive = true;
+    }
+    if let Some(ref term) = query.search_term {
+        if !term.is_empty() && !term.starts_with("local:") {
+            query.search_term = Some(format!("local:{term}"));
+        }
+    }
     query.strict_item_filters = true;
     query.start_index = None;
     query.limit = Some(order.len() as u32);
@@ -726,17 +762,22 @@ async fn shows_nextup_all(
         .with_client_patches()
         .build()
         .items;
-    items.sort_by_key(|item| order[&item.id]);
-    let (final_total, items) = if has_policy_filters {
+    items.sort_by_key(|item| order.get(&item.id).copied().unwrap_or(usize::MAX));
+    let (final_total, items) = if has_post_filters {
         let filtered_total = items.len() as i64;
         let paged: Vec<_> = items.into_iter().skip(start).take(limit).collect();
         (filtered_total, paged)
     } else {
         (total, items)
     };
+    let reported_total = if q.enable_total_record_count.unwrap_or(true) {
+        final_total
+    } else {
+        items.len() as i64
+    };
     Ok(Json(serde_json::json!({
         "Items": super::items::serialize_item_list(&items, q.fields.as_deref()),
-        "TotalRecordCount": final_total,
+        "TotalRecordCount": reported_total,
         "StartIndex": q.start_index.unwrap_or_default(),
     })))
 }

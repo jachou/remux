@@ -62,9 +62,16 @@ impl Task for CleanTranscodeFolderTask {
                         .parse::<libc::pid_t>()
                     {
                         if pid > 0 {
-                            unsafe {
-                                libc::kill(pid, libc::SIGCONT);
-                                libc::kill(pid, libc::SIGKILL);
+                            // Verify PID is actually an ffmpeg process before sending SIGKILL
+                            // to guard against PID reuse across container/host restarts.
+                            let is_ffmpeg = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+                                .map(|c| c.trim().contains("ffmpeg"))
+                                .unwrap_or(false);
+                            if is_ffmpeg {
+                                unsafe {
+                                    libc::kill(pid, libc::SIGCONT);
+                                    libc::kill(pid, libc::SIGKILL);
+                                }
                             }
                         }
                     }
@@ -158,21 +165,71 @@ impl Task for CleanTranscodeFolderTask {
             info!(pruned_subs, "pruned stale subtitle-cache files");
         }
 
-        // Sweep expired ephemeral stream / stream_group rows older than 2 days
-        // so the media table doesn't grow unbounded with stale debrid stream rows.
-        match sqlx::query(
-            "DELETE FROM media \
-             WHERE kind IN ('stream', 'stream_group') \
-               AND datetime(created_at) < datetime('now', '-2 days')",
-        )
-        .execute(&ctx.db)
-        .await
-        {
-            Ok(res) if res.rows_affected() > 0 => {
-                info!(
-                    deleted_streams = res.rows_affected(),
-                    "swept expired ephemeral stream rows"
+        // Sweep expired ephemeral `stream` rows whose `updated_at` is older than 2 days.
+        // Never touch `stream_group` rows (permanent admin-configured Stream Group definitions),
+        // exclude streams referenced by active playback sessions, and clear `streams_refreshed_at`
+        // on affected parents so they re-discover streams cleanly instead of serving `no-streams.mp4`.
+        let active_source_ids: HashSet<String> = ctx
+            .sessions
+            .get_all()
+            .into_iter()
+            .filter_map(|s| s.media_source_id)
+            .collect();
+        let sweep_res: Result<u64> = async {
+            let mut tx = ctx.db.begin().await?;
+            let stale: Vec<(uuid::Uuid, Option<uuid::Uuid>)> = sqlx::query_as(
+                "SELECT id, parent_id FROM media \
+                 WHERE kind = 'stream' \
+                   AND datetime(updated_at) < datetime('now', '-2 days')",
+            )
+            .fetch_all(&mut *tx)
+            .await?;
+
+            let mut delete_ids: Vec<uuid::Uuid> = Vec::new();
+            let mut affected_parents: HashSet<uuid::Uuid> = HashSet::new();
+            for (sid, pid) in stale {
+                if active_source_ids.contains(&sid.to_string())
+                    || active_source_ids.contains(&sid.simple().to_string())
+                {
+                    continue;
+                }
+                delete_ids.push(sid);
+                if let Some(p) = pid {
+                    affected_parents.insert(p);
+                }
+            }
+
+            let mut total_deleted = 0u64;
+            for chunk in delete_ids.chunks(500) {
+                let mut qb = sqlx::QueryBuilder::new("DELETE FROM media WHERE id IN (");
+                let mut sep = qb.separated(", ");
+                for id in chunk {
+                    sep.push_bind(*id);
+                }
+                qb.push(")");
+                total_deleted += qb.build().execute(&mut *tx).await?.rows_affected();
+            }
+
+            let parent_vec: Vec<uuid::Uuid> = affected_parents.into_iter().collect();
+            for chunk in parent_vec.chunks(500) {
+                let mut qb = sqlx::QueryBuilder::new(
+                    "UPDATE media SET streams_refreshed_at = NULL WHERE id IN (",
                 );
+                let mut sep = qb.separated(", ");
+                for pid in chunk {
+                    sep.push_bind(*pid);
+                }
+                qb.push(")");
+                qb.build().execute(&mut *tx).await?;
+            }
+
+            tx.commit().await?;
+            Ok(total_deleted)
+        }
+        .await;
+        match sweep_res {
+            Ok(deleted_streams) if deleted_streams > 0 => {
+                info!(deleted_streams, "swept expired ephemeral stream rows");
             }
             Ok(_) => {}
             Err(e) => {

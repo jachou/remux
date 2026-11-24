@@ -1186,13 +1186,22 @@ pub async fn items_ancestors(
     ))
 }
 
-/// Delete a media item
+/// Delete a media item (admins can delete any item; regular users can delete playlists)
 #[delete("/items/{id}")]
 pub async fn delete_item(
     State(state): State<AppState>,
-    _session: auth::AdminSession,
+    session: auth::AuthSession,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode> {
+    if !session.user.is_admin {
+        let item = db::Media::get_by_id(&state.ctx.db, &id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("item not found"))
+            .context_not_found("item not found")?;
+        if item.kind != db::MediaKind::Playlist {
+            return Err(anyhow::anyhow!("forbidden").context_forbidden("admin required"));
+        }
+    }
     db::Media::delete(
         &state
             .ctx
@@ -1379,7 +1388,7 @@ pub async fn items_certifications(
             let pattern = format!("%{}%", s.to_lowercase());
             sqlx::query(
                 "SELECT DISTINCT certification FROM media \
-                 WHERE certification IS NOT NULL AND lower(certification) LIKE ? \
+                 WHERE kind IN ('movie', 'series') AND certification IS NOT NULL AND lower(certification) LIKE ? \
                  ORDER BY certification LIMIT 25",
             )
             .bind(&pattern)
@@ -1398,7 +1407,7 @@ pub async fn items_certifications(
         }
         _ => sqlx::query(
             "SELECT DISTINCT certification FROM media \
-                 WHERE certification IS NOT NULL ORDER BY certification LIMIT 50",
+                 WHERE kind IN ('movie', 'series') AND certification IS NOT NULL ORDER BY certification LIMIT 50",
         )
         .fetch_all(
             &state
@@ -1474,7 +1483,7 @@ pub async fn items_languages(
             let pattern = format!("%{}%", s.to_lowercase());
             sqlx::query(
                 "SELECT DISTINCT original_language FROM media \
-                 WHERE original_language IS NOT NULL AND lower(original_language) LIKE ? \
+                 WHERE kind IN ('movie', 'series') AND original_language IS NOT NULL AND lower(original_language) LIKE ? \
                  ORDER BY original_language LIMIT 25",
             )
             .bind(&pattern)
@@ -1489,7 +1498,7 @@ pub async fn items_languages(
         }
         _ => sqlx::query(
             "SELECT DISTINCT original_language FROM media \
-             WHERE original_language IS NOT NULL \
+             WHERE kind IN ('movie', 'series') AND original_language IS NOT NULL \
              ORDER BY original_language LIMIT 50",
         )
         .fetch_all(
@@ -4224,7 +4233,7 @@ fn segments_to_dtos(
 
 #[get("/mediasegments/{id}")]
 pub async fn media_segments(
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Path(id): Path<Uuid>,
     Query(q): Query<SegmentQuery>,
     State(state): State<crate::AppState>,
@@ -4243,8 +4252,32 @@ pub async fn media_segments(
         Some(m) => {
             // If the caller passed a Stream or StreamGroup UUID (e.g. MediaSourceId),
             // unwrap to its parent Episode/Movie so segment addons see the actual item.
-            if matches!(m.kind, db::MediaKind::Stream | db::MediaKind::StreamGroup) {
+            if m.kind == db::MediaKind::Stream {
                 if let Some(pid) = m.parent_id {
+                    MediaResolveService::resolve_item(pid, &state.ctx)
+                        .await?
+                        .unwrap_or(m)
+                } else {
+                    m
+                }
+            } else if m.kind == db::MediaKind::StreamGroup {
+                // StreamGroup rows are global rule definitions (parent_id is NULL); resolve
+                // the actual playing item from the caller's active playback session.
+                let group_str = id.to_string();
+                let group_simple = id.simple().to_string();
+                let active_item_id = state
+                    .ctx
+                    .sessions
+                    .get_all()
+                    .into_iter()
+                    .find(|s| {
+                        s.user_id == session.user.id
+                            && s.media_source_id
+                                .as_deref()
+                                .is_some_and(|ms| ms == group_str || ms == group_simple)
+                    })
+                    .map(|s| s.item_id);
+                if let Some(pid) = active_item_id {
                     MediaResolveService::resolve_item(pid, &state.ctx)
                         .await?
                         .unwrap_or(m)

@@ -51,6 +51,10 @@ pub(super) async fn purge_by_kinds(ctx: &AppContext, kinds: &[&str]) -> Result<(
             .execute(&mut *conn)
             .await?;
 
+        sqlx::query("DELETE FROM media_metrics WHERE media_id IN (SELECT id FROM _purge_batch)")
+            .execute(&mut *conn)
+            .await?;
+
         sqlx::query(&format!("DELETE FROM media WHERE kind IN ({kinds_sql})"))
             .execute(&mut *conn)
             .await?;
@@ -66,6 +70,13 @@ pub(super) async fn purge_by_kinds(ctx: &AppContext, kinds: &[&str]) -> Result<(
         Ok(())
     }
     .await;
+
+    if result.is_err() {
+        sqlx::query("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .ok();
+    }
 
     sqlx::query("PRAGMA foreign_keys = ON")
         .execute(&mut *conn)

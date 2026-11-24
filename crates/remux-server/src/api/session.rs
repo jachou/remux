@@ -402,6 +402,7 @@ pub async fn report_playback_progress(
 
 #[post("/sessions/playing/stopped")]
 pub async fn report_playback_stopped(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Json(data): Json<api::PlaybackInfo>,
@@ -508,8 +509,8 @@ pub async fn report_playback_stopped(
                     "Trigger 2 (on playback stopped)",
                     already_probed_next,
                 );
-            } else {
-                // Stopped mid-way: bypass 30s probe cooldown and immediately refresh the resume buffer at the new stop position!
+            } else if !crate::fast_start::is_remote_client(&headers) {
+                // Stopped mid-way on LAN: bypass 30s probe cooldown and immediately refresh the resume buffer at the new stop position!
                 crate::services::stream_service::clear_recent_preemptive_probe(item_id);
                 crate::services::stream_service::spawn_preemptive_probe(
                     &state.ctx,
@@ -560,7 +561,8 @@ pub async fn report_playback_stopped(
                 session.user.id,
                 "Trigger 2 (on playback stopped)",
             );
-        } else {
+        } else if !crate::fast_start::is_remote_client(&headers) {
+            crate::services::stream_service::clear_recent_preemptive_probe(data.item_id);
             crate::services::stream_service::spawn_preemptive_probe(
                 &state.ctx,
                 data.item_id,

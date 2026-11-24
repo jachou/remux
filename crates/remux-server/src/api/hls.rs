@@ -1804,7 +1804,17 @@ async fn hls_segment_inner(
                         s.start_time_secs = (start_time_ticks / 10_000_000) as u32;
                         s.playback_offset_secs
                             .store(
-                                s.start_time_secs,
+                                0,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                        let seek_start_idx =
+                            crate::playback::engine::segment_start_index(
+                                Some(start_time_ticks),
+                                s.segment_length,
+                            );
+                        s.last_segment_index
+                            .store(
+                                seek_start_idx,
                                 std::sync::atomic::Ordering::Relaxed,
                             );
                     }

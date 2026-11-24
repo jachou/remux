@@ -444,46 +444,50 @@ async fn refresh_cached_resume_and_head(
 
             let entry = FAST_START_CACHE.get(original_url).unwrap_or_else(|| entry.clone());
 
-            if let Some(ref tail) = entry.tail_bytes {
-                if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail, pos_secs) {
-                    let preroll_bytes = if is_4k {
-                        FAST_START_RESUME_PREROLL_BYTES_4K as u64
-                    } else {
-                        FAST_START_RESUME_PREROLL_BYTES_1080P as u64
-                    };
-                    let resume_buffer_size = if is_4k {
-                        FAST_START_RESUME_BUFFER_SIZE_4K
-                    } else {
-                        FAST_START_RESUME_BUFFER_SIZE_1080P
-                    };
-                    let min_forward_bytes =
-                        (resume_buffer_size as u64).saturating_sub(preroll_bytes) / 2;
-                    let min_end = (target_offset + min_forward_bytes).min(entry.total_size);
-                    let already_covered = entry.resume_buffer.as_ref().map(|(start, bytes)| {
+            let tail_slice: &[u8] = entry.tail_bytes.as_deref().unwrap_or(&[]);
+            if let Some(target_offset) = find_mkv_cue_offset(&entry.head_bytes, tail_slice, pos_secs) {
+                let preroll_bytes = if is_4k {
+                    FAST_START_RESUME_PREROLL_BYTES_4K as u64
+                } else {
+                    FAST_START_RESUME_PREROLL_BYTES_1080P as u64
+                };
+                let resume_buffer_size = if is_4k {
+                    FAST_START_RESUME_BUFFER_SIZE_4K
+                } else {
+                    FAST_START_RESUME_BUFFER_SIZE_1080P
+                };
+                let head_end = entry.head_bytes.len() as u64;
+                let min_forward_bytes =
+                    (resume_buffer_size as u64).saturating_sub(preroll_bytes) / 2;
+                let min_end = (target_offset + min_forward_bytes).min(entry.total_size);
+                let min_start = target_offset.saturating_sub(preroll_bytes / 2).max(head_end);
+                let already_covered = (target_offset + min_forward_bytes <= head_end)
+                    || entry.resume_buffer.as_ref().map(|(start, bytes)| {
                         let end = *start + bytes.len() as u64;
-                        let min_start = target_offset.saturating_sub(preroll_bytes / 2);
                         target_offset >= *start && end >= min_end && *start <= min_start
                     }).unwrap_or(false);
 
-                    if !already_covered {
-                        let resume_lock_key = format!("resume:{}", original_url);
-                        let _guard = PREWARM_LOCKS.lock(resume_lock_key).await;
-                        // Re-check after acquiring lock in case a concurrent task already refreshed it
-                        if let Some(current_entry) = FAST_START_CACHE.get(original_url) {
-                            let covered_now = current_entry.resume_buffer.as_ref().map(|(start, bytes)| {
-                                let end = *start + bytes.len() as u64;
-                                let min_start = target_offset.saturating_sub(preroll_bytes / 2);
-                                target_offset >= *start && end >= min_end && *start <= min_start
-                            }).unwrap_or(false);
-                            if covered_now {
-                                return true;
-                            }
+                if !already_covered && entry.total_size > head_end {
+                    let resume_lock_key = format!("resume:{}", original_url);
+                    let _guard = PREWARM_LOCKS.lock(resume_lock_key).await;
+                    // Re-check after acquiring lock in case a concurrent task already refreshed it
+                    if let Some(current_entry) = FAST_START_CACHE.get(original_url) {
+                        let covered_now = current_entry.resume_buffer.as_ref().map(|(start, bytes)| {
+                            let end = *start + bytes.len() as u64;
+                            target_offset >= *start && end >= min_end && *start <= min_start
+                        }).unwrap_or(false);
+                        if covered_now {
+                            return true;
                         }
+                    }
 
-                        let current_entry = FAST_START_CACHE.get(original_url).unwrap_or(entry.clone());
-                        let start_byte = target_offset.saturating_sub(preroll_bytes).max(current_entry.head_bytes.len() as u64);
-                        let end_byte = (start_byte + resume_buffer_size as u64 - 1).min(current_entry.total_size - 1);
-                        let resume_range = format!("bytes={}-{}", start_byte, end_byte);
+                    let current_entry = FAST_START_CACHE.get(original_url).unwrap_or(entry.clone());
+                    let start_byte = target_offset.saturating_sub(preroll_bytes).max(current_entry.head_bytes.len() as u64);
+                    let end_byte = (start_byte + resume_buffer_size as u64 - 1).min(current_entry.total_size.saturating_sub(1));
+                    if end_byte < start_byte {
+                        return true;
+                    }
+                    let resume_range = format!("bytes={}-{}", start_byte, end_byte);
 
                         let mut res_req = PREWARM_CLIENT.get(&current_entry.direct_cdn_url);
                         for (k, v) in request_headers {
@@ -540,7 +544,6 @@ async fn refresh_cached_resume_and_head(
                 }
             }
         }
-    }
     debug!(
         %original_url,
         item = ?item_id,
@@ -1053,13 +1056,13 @@ pub async fn prewarm_fast_start(
                     in_flight_head.notify.notify_waiters();
                 }
                 Err(e) => {
-                    in_flight_head.has_error.store(true, Ordering::Relaxed);
+                    in_flight_head.has_error.store(true, Ordering::Release);
                     in_flight_head.notify.notify_waiters();
                     return Err(e);
                 }
             }
         }
-        in_flight_head.is_done.store(true, Ordering::Relaxed);
+        in_flight_head.is_done.store(true, Ordering::Release);
         in_flight_head.notify.notify_waiters();
         let final_bytes = {
             let buf = in_flight_head.buffer.read().unwrap();
@@ -1080,8 +1083,9 @@ pub async fn prewarm_fast_start(
     };
 
     // Step 3: If resuming, extract video cue offset and pre-warm resume buffer with backward headroom
-    let resume_buffer = if let (Some(pos_secs), Some(tb)) = (resume_position_secs, &tail_bytes) {
-        if pos_secs > 10.0 {
+    let resume_buffer = if let Some(pos_secs) = resume_position_secs {
+        let tb: &[u8] = tail_bytes.as_deref().unwrap_or(&[]);
+        if pos_secs > 10.0 && total_size > head_bytes.len() as u64 {
             if let Some(target_offset) = find_mkv_cue_offset(&head_bytes, tb, pos_secs) {
                 let is_4k = is_4k_stream(original_url, Some(total_size), is_4k_hint);
                 let preroll_bytes = if is_4k {
@@ -1380,7 +1384,7 @@ pub async fn upgrade_probe_data_from_fast_start(
 /// across byte-range requests: if `bytes=0-` is served as `206` from Remux (`Origin A`) and a
 /// subsequent seek/range returns `307` to the Debrid CDN (`Origin B`), the browser aborts playback.
 /// Native clients (`Infuse`, `Lavf`, `VLC`, `mpv`) have no browser CORS/single-origin restriction.
-fn is_browser_video_request(headers: &HeaderMap) -> bool {
+pub(crate) fn is_browser_video_request(headers: &HeaderMap) -> bool {
     if headers.contains_key("sec-fetch-dest") || headers.contains_key("sec-fetch-mode") {
         return true;
     }
@@ -1449,10 +1453,26 @@ async fn serve_from_in_flight(
                         // Register notified BEFORE checking is_done / has_error to prevent missing wakeups
                         let notified = in_flight_clone.notify.notified();
                         tokio::pin!(notified);
-                        if in_flight_clone.is_done.load(Ordering::Relaxed) {
+                        if in_flight_clone.is_done.load(Ordering::Acquire) {
+                            // Drain any final bytes written concurrently before is_done became true
+                            let final_slice = {
+                                let buf = in_flight_clone.buffer.read().unwrap();
+                                let available_end = buf.len().min(target_end);
+                                if available_end > cursor {
+                                    let s = Bytes::copy_from_slice(&buf[cursor..available_end]);
+                                    cursor = available_end;
+                                    Some(s)
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some(slice) = final_slice {
+                                METRICS.bytes_served_lan.fetch_add(slice.len() as u64, Ordering::Relaxed);
+                                yield Ok::<Bytes, std::io::Error>(slice);
+                            }
                             break;
                         }
-                        if in_flight_clone.has_error.load(Ordering::Relaxed) {
+                        if in_flight_clone.has_error.load(Ordering::Acquire) {
                             yield Err::<Bytes, std::io::Error>(std::io::Error::new(
                                 std::io::ErrorKind::ConnectionReset,
                                 "in-flight stream error",
@@ -1490,77 +1510,10 @@ async fn serve_from_in_flight(
             Some(resp)
         }
 
-        // Case 2: No range header specified (treat as head probe)
-        None => {
-            METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
-            let target_head_size = in_flight.target_head_size.min(FAST_START_HEAD_SERVE_CHUNK_SIZE);
-            let end_offset = (target_head_size as u64).min(in_flight.total_size).saturating_sub(1);
-            let content_len = end_offset + 1;
-
-            info!(
-                %item_id,
-                content_len,
-                total_size = in_flight.total_size,
-                "[FAST-START] Buffer hit (no range): serving {} bytes locally over LAN (in-flight stream)",
-                content_len
-            );
-
-            let in_flight_clone = in_flight.clone();
-            let body_stream = async_stream::stream! {
-                let mut cursor = 0usize;
-                let target_end = (end_offset as usize) + 1;
-
-                while cursor < target_end {
-                    let chunk = {
-                        let buf = in_flight_clone.buffer.read().unwrap();
-                        let available_end = buf.len().min(target_end);
-                        if available_end > cursor {
-                            let slice = Bytes::copy_from_slice(&buf[cursor..available_end]);
-                            cursor = available_end;
-                            Some(slice)
-                        } else {
-                            None
-                        }
-                    };
-
-                    if let Some(slice) = chunk {
-                        let slice_len = slice.len();
-                        METRICS.bytes_served_lan.fetch_add(slice_len as u64, Ordering::Relaxed);
-                        yield Ok::<Bytes, std::io::Error>(slice);
-                    } else {
-                        if in_flight_clone.is_done.load(Ordering::Relaxed) {
-                            break;
-                        }
-                        if in_flight_clone.has_error.load(Ordering::Relaxed) {
-                            yield Err::<Bytes, std::io::Error>(std::io::Error::new(
-                                std::io::ErrorKind::ConnectionReset,
-                                "in-flight stream error",
-                            ));
-                            break;
-                        }
-                        let _ = tokio::time::timeout(
-                            Duration::from_secs(5),
-                            in_flight_clone.notify.notified(),
-                        ).await;
-                    }
-                }
-            };
-
-            let resp = Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, &in_flight.content_type)
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes 0-{}/{}", end_offset, in_flight.total_size),
-                )
-                .header(header::CONTENT_LENGTH, content_len.to_string())
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header("X-Remux-FastStart", "hit-head-inflight")
-                .body(Body::from_stream(body_stream))
-                .unwrap();
-
-            Some(resp)
-        }
+        // Case 2: No Range header specified at all — do NOT return an unsolicited 206
+        // Partial Content (violates RFC 9110 §15.3.7 and truncates /Items/{id}/Download
+        // and HEAD probes to 16 MB). Fall back to full-stream proxy (200 OK).
+        None => None,
 
         // Case 3: Tail / MKV Cues index probe
         Some(rng) if is_tail_range(rng, in_flight.total_size) => {
@@ -1714,7 +1667,7 @@ fn is_private_ip(ip: &std::net::IpAddr) -> bool {
 /// (e.g. Real-Debrid / AllDebrid), requiring remote WAN clients to hit the upstream resolver
 /// URL so a token is minted for their IP. Token-authenticated CDNs like TorBox (`tb-cdn.earth`)
 /// are not IP-locked and can use the cached `direct_cdn_url` directly.
-fn is_ip_locked_cdn_url(cdn_url: &str) -> bool {
+pub(crate) fn is_ip_locked_cdn_url(cdn_url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(cdn_url) else {
         return false;
     };
@@ -1769,6 +1722,13 @@ pub async fn handle_playback_request(
 ) -> Option<Response> {
     let is_remote = is_remote_client(headers);
     let range_header = headers.get(header::RANGE).and_then(|v| v.to_str().ok());
+    // Streams requiring custom upstream request headers (Authorization, Cookie, Referer, etc.)
+    // cannot be 307-redirected without dropping those headers — proxy via HttpSource instead.
+    if upstream_headers.is_some_and(|h| !h.is_empty())
+        && (is_remote || is_force_direct_307() || is_browser_video_request(headers))
+    {
+        return None;
+    }
 
     if is_force_direct_307() {
         if let Some(entry) = FAST_START_CACHE.get(url) {
@@ -1840,6 +1800,23 @@ pub async fn handle_playback_request(
                 redirect.headers_mut().insert(
                     "X-Remux-FastStart",
                     HeaderValue::from_static("browser-direct-cdn"),
+                );
+                return Some(redirect);
+            }
+        }
+        if let Some(in_flight) = IN_FLIGHT_PREWARMS.get(url) {
+            let must_use_resolver = is_remote && is_ip_locked_cdn_url(&in_flight.direct_cdn_url);
+            if !must_use_resolver && !crate::stream::is_error_video_url(&in_flight.direct_cdn_url) {
+                info!(
+                    %item_id,
+                    direct_cdn = %in_flight.direct_cdn_url,
+                    is_remote,
+                    "[FAST-START] Browser <video> request matched in-flight prewarm; issuing 307 to direct CDN"
+                );
+                let mut redirect = Redirect::temporary(&in_flight.direct_cdn_url).into_response();
+                redirect.headers_mut().insert(
+                    "X-Remux-FastStart",
+                    HeaderValue::from_static("browser-direct-cdn-inflight"),
                 );
                 return Some(redirect);
             }
@@ -2067,42 +2044,10 @@ pub async fn handle_playback_request(
             Some(resp)
         }
 
-        // Case 2: No Range header specified at all (treat as head probe)
-        None => {
-            let head_len = entry.head_bytes.len();
-            if head_len == 0 {
-                return None;
-            }
-            METRICS.hits_head.fetch_add(1, Ordering::Relaxed);
-            let chunk_len = head_len.min(FAST_START_HEAD_SERVE_CHUNK_SIZE);
-            let slice = entry.head_bytes.slice(0..chunk_len);
-            let end_offset = (chunk_len as u64).saturating_sub(1);
-            METRICS.bytes_served_lan.fetch_add(chunk_len as u64, Ordering::Relaxed);
-
-            info!(
-                %item_id,
-                chunk_len,
-                head_len,
-                total_size = entry.total_size,
-                "[FAST-START] Buffer hit (no range): serving {} head bytes locally over LAN (chunked)",
-                chunk_len
-            );
-
-            let resp = Response::builder()
-                .status(StatusCode::PARTIAL_CONTENT)
-                .header(header::CONTENT_TYPE, &entry.content_type)
-                .header(
-                    header::CONTENT_RANGE,
-                    format!("bytes 0-{}/{}", end_offset, entry.total_size),
-                )
-                .header(header::CONTENT_LENGTH, chunk_len.to_string())
-                .header(header::ACCEPT_RANGES, "bytes")
-                .header("X-Remux-FastStart", "hit-head")
-                .body(Body::from(slice))
-                .unwrap();
-
-            Some(resp)
-        }
+        // Case 2: No Range header specified at all — do NOT return an unsolicited 206
+        // Partial Content (violates RFC 9110 §15.3.7 and truncates /Items/{id}/Download
+        // and HEAD probes to 16 MB). Fall back to full-stream proxy (200 OK).
+        None => None,
 
         // Case 3: Tail / MKV Cues index probe
         Some(rng) if is_tail_range(rng, entry.total_size) => {

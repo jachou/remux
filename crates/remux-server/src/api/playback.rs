@@ -90,6 +90,7 @@ struct SubtitlePrefetch {
 
 #[post("/items/{id}/playbackinfo")]
 pub async fn items_playbackinfo(
+    headers: headers::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Path(id): Path<Uuid>,
@@ -147,17 +148,18 @@ pub async fn items_playbackinfo(
     q.device_profile = query
         .device_profile
         .or(q.device_profile);
-    items_playbackinfo_inner(state, session, id, q).await
+    items_playbackinfo_inner(headers, state, session, id, q).await
 }
 
 #[get("/items/{id}/playbackinfo")]
 pub async fn items_playbackinfo_get(
+    headers: headers::HeaderMap,
     State(state): State<AppState>,
     session: auth::AuthSession,
     Path(id): Path<Uuid>,
     Query(q): Query<api::PlaybackInfoQuery>,
 ) -> Result<impl IntoResponse> {
-    items_playbackinfo_inner(state, session, id, q).await
+    items_playbackinfo_inner(headers, state, session, id, q).await
 }
 
 /// Load remembered audio/subtitle stream selections for a user+item
@@ -217,6 +219,7 @@ fn playback_original_language(
 }
 
 async fn items_playbackinfo_inner(
+    headers: headers::HeaderMap,
     state: AppState,
     session: auth::AuthSession,
     id: Uuid,
@@ -574,8 +577,11 @@ async fn items_playbackinfo_inner(
             .is_some_and(|pd| pd.video_stream().is_some() && !pd.is_filename_guess())
     });
 
-    // Fast-Start pre-warm: kickoff background download of the primary stream's 16 MB head buffer
-    // so it is downloading into RAM while the client processes the PlaybackInfo response.
+    // Fast-Start pre-warm: for LAN non-browser clients, download head/tail/resume into RAM.
+    // For remote or browser clients (which 307-bypass RAM), avoid 64-170 MB downloads and dual-IP
+    // debrid hits; only run a lightweight 8-byte liveness check on non-IP-locked URLs to pre-resolve CDN.
+    let is_remote_req = crate::fast_start::is_remote_client(&headers);
+    let is_browser_req = crate::fast_start::is_browser_video_request(&headers);
     if let Some(first) = probed.results.first() {
         let stream_info = first
             .effective_stream
@@ -589,32 +595,64 @@ async fn items_playbackinfo_inner(
                 ..
             } = &si.descriptor
             {
-                let url_clone = url.clone();
-                let headers_clone = request_headers.clone();
-                let item_id = id;
-                let user_id = Some(session.user.id);
-                let db_pool = state.ctx.db.clone();
-                let is_4k = first.stream.probe_data.as_ref().map_or(false, |pd| {
-                    pd.media_streams.iter().any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160)
-                });
-                let stream_size = si.size.map(|s| s as u64);
-                tokio::spawn(async move {
-                    let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
-                    let head_size = if resume_pos.is_some() {
-                        crate::fast_start::calculate_fast_start_resume_head_size(&url_clone, stream_size, Some(is_4k))
-                    } else {
-                        crate::fast_start::calculate_fast_start_head_size(&url_clone, stream_size, Some(is_4k))
-                    };
-                    crate::fast_start::prewarm_fast_start(
-                        Some(item_id),
-                        &url_clone,
-                        &headers_clone,
-                        crate::fast_start::PrewarmPriority::High,
-                        Some(head_size),
-                        resume_pos,
-                    )
-                    .await;
-                });
+                if is_remote_req || is_browser_req {
+                    if !crate::fast_start::is_ip_locked_cdn_url(url) {
+                        let desc = si.descriptor.clone();
+                        tokio::spawn(async move {
+                            let _ = desc.is_alive().await;
+                        });
+                    }
+                } else {
+                    let url_clone = url.clone();
+                    let headers_clone = request_headers.clone();
+                    let item_id = id;
+                    let user_id = Some(session.user.id);
+                    let db_pool = state.ctx.db.clone();
+                    let is_4k = first
+                        .effective_stream
+                        .probe_data
+                        .as_ref()
+                        .or(first.stream.probe_data.as_ref())
+                        .map_or(false, |pd| {
+                            pd.media_streams
+                                .iter()
+                                .any(|s| s.width.unwrap_or(0) >= 2160 || s.height.unwrap_or(0) >= 2160)
+                        });
+                    let stream_size = si.size.map(|s| s as u64);
+                    let prewarm_notify_guard =
+                        crate::fast_start::register_active_prewarm_notify(url);
+                    tokio::spawn(async move {
+                        let _prewarm_notify_guard = prewarm_notify_guard;
+                        let resume_pos = crate::fast_start::lookup_resume_position(
+                            &db_pool,
+                            user_id,
+                            Some(item_id),
+                        )
+                        .await;
+                        let head_size = if resume_pos.is_some() {
+                            crate::fast_start::calculate_fast_start_resume_head_size(
+                                &url_clone,
+                                stream_size,
+                                Some(is_4k),
+                            )
+                        } else {
+                            crate::fast_start::calculate_fast_start_head_size(
+                                &url_clone,
+                                stream_size,
+                                Some(is_4k),
+                            )
+                        };
+                        crate::fast_start::prewarm_fast_start(
+                            Some(item_id),
+                            &url_clone,
+                            &headers_clone,
+                            crate::fast_start::PrewarmPriority::High,
+                            Some(head_size),
+                            resume_pos,
+                        )
+                        .await;
+                    });
+                }
             }
         }
     }
@@ -1732,6 +1770,7 @@ async fn videos_stream_inner(
                 })
                 .unwrap_or(true);
             if !host_is_internal
+                && request_headers.is_empty()
                 && state
                     .ctx
                     .addons

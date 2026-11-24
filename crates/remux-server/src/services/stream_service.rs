@@ -61,27 +61,28 @@ fn is_bitmap_subtitle_codec(codec: Option<&str>) -> bool {
 }
 
 /// Checks whether a media source (or probed stream) already contains playable, non-forced
-/// text embedded subtitle tracks covering any of the user's preferred subtitle languages.
+/// text embedded subtitle tracks covering ALL of the user's configured preferred subtitle languages.
+/// Returns false when `preferred_languages` is empty (default "show all subtitles") so external
+/// subtitles are never suppressed by an unrelated embedded language track.
 /// Bitmap tracks (PGS/DVD/DVB) and forced-only tracks do not satisfy full-subtitle coverage.
 pub(crate) fn has_matching_embedded_subtitles(
     source: &api::MediaSourceInfo,
     preferred_languages: &[String],
 ) -> bool {
-    source.media_streams.iter().any(|stream| {
-        if stream.type_ != Some(MediaStreamType::Subtitle)
-            || stream.is_external
-            || stream.is_forced
-            || is_bitmap_subtitle_codec(stream.codec.as_deref())
-        {
-            return false;
-        }
-        if preferred_languages.is_empty() {
-            return true;
-        }
-        let stream_lang =
-            crate::subtitle_selection::normalized_language(stream.language.as_deref());
-        preferred_languages.iter().any(|pref| {
-            crate::subtitle_selection::normalized_language(Some(pref.as_str())) == stream_lang
+    if preferred_languages.is_empty() {
+        return false;
+    }
+    preferred_languages.iter().all(|pref| {
+        let pref_norm = crate::subtitle_selection::normalized_language(Some(pref.as_str()));
+        source.media_streams.iter().any(|stream| {
+            if stream.type_ != Some(MediaStreamType::Subtitle)
+                || stream.is_external
+                || stream.is_forced
+                || is_bitmap_subtitle_codec(stream.codec.as_deref())
+            {
+                return false;
+            }
+            crate::subtitle_selection::normalized_language(stream.language.as_deref()) == pref_norm
         })
     })
 }
@@ -866,52 +867,13 @@ impl StreamService {
                 .map(|s| s.id)
         };
 
-        // Kick off High-priority Fast-Start pre-warm in parallel with probing
-        // so the 16 MB head buffer downloads concurrently while liveness / ffprobe runs.
-        if let Some(first) = sel.candidates.first() {
-            if let Some(si) = &first.stream_info {
-                if !si.descriptor.is_known_dead() {
-                    if let crate::stream::StreamDescriptor::Http {
-                        url,
-                        request_headers,
-                        ..
-                    } = &si.descriptor
-                    {
-                        let url_clone = url.clone();
-                        let headers_clone = request_headers.clone();
-                        let item_id = self.item_id;
-                        let user_id = self.user_id;
-                        let db_pool = self.ctx.db.clone();
-                        let head_size = crate::fast_start::calculate_fast_start_head_size(
-                            url,
-                            si.size.map(|s| s as u64),
-                            None,
-                        );
-                        let prewarm_notify_guard =
-                            crate::fast_start::register_active_prewarm_notify(url);
-                        tokio::spawn(async move {
-                            let _prewarm_notify_guard = prewarm_notify_guard;
-                            let resume_pos = crate::fast_start::lookup_resume_position(&db_pool, user_id, Some(item_id)).await;
-                            crate::fast_start::prewarm_fast_start(
-                                Some(item_id),
-                                &url_clone,
-                                &headers_clone,
-                                crate::fast_start::PrewarmPriority::High,
-                                Some(head_size),
-                                resume_pos,
-                            )
-                            .await;
-                        });
-                    }
-                }
-            }
-        }
         let probe_cfg = db::Settings::get_config_or_default(
             &self
                 .ctx
                 .db,
         )
         .await;
+        let dedup_subtitles = probe_cfg.deduplicate_subtitle_tracks.unwrap_or(true);
         let timeout = probe_cfg
             .probe_timeout_secs
             .unwrap_or(20) as u64;
@@ -975,15 +937,17 @@ impl StreamService {
                 if !probed && !real_probe_data {
                     return false;
                 }
-                // Smart skip: if candidate is already probed in cache and has embedded subtitles
-                // covering the user's preferred languages, do not fetch external subtitles!
-                if let Some(ref pd) = stream.probe_data {
-                    if is_reusable_probe_cache(pd) && has_matching_embedded_subtitles(pd, &sub_langs) {
-                        tracing::debug!(
-                            stream_id = %stream.id,
-                            "Stream has matching embedded subtitles in DB cache; skipping external subtitle fetch"
-                        );
-                        return false;
+                // Smart skip: if deduplication is enabled and candidate is already probed in cache
+                // with embedded subtitles covering all preferred languages, skip external fetch.
+                if dedup_subtitles {
+                    if let Some(ref pd) = stream.probe_data {
+                        if is_reusable_probe_cache(pd) && has_matching_embedded_subtitles(pd, &sub_langs) {
+                            tracing::debug!(
+                                stream_id = %stream.id,
+                                "Stream has matching embedded subtitles in DB cache; skipping external subtitle fetch"
+                            );
+                            return false;
+                        }
                     }
                 }
                 true
@@ -1114,7 +1078,8 @@ impl StreamService {
                 } else {
                     cached_external_subtitles = Some(Vec::new());
                 }
-            } else if !external_subtitles.is_empty()
+            } else if dedup_subtitles
+                && !external_subtitles.is_empty()
                 && has_matching_embedded_subtitles(&source, &sub_langs)
             {
                 // 2. If external subtitles were pre-fetched, but the probed source already contains
@@ -2307,52 +2272,65 @@ async fn prefetch_subtitles_for_media(
         }
     }
 
-    if !ctx.addons.has_subtitle_addons() || sub_langs.is_empty() {
-        let _ = seg_media.grandparent(&ctx.db).await;
-        ctx.addons.fetch_segments(&seg_media, ctx, true).await;
-        return;
-    }
-
     let query = target_stream
         .as_ref()
         .map(|s| subtitle_query_for(s))
         .unwrap_or_default();
+    let has_addon_subs = ctx.addons.has_subtitle_addons();
     let (subs, _) = tokio::join!(
-        ctx.addons
-            .fetch_subtitles(&mut item_media, &query, ctx, true, user_id),
+        async {
+            if has_addon_subs {
+                ctx.addons
+                    .fetch_subtitles(&mut item_media, &query, ctx, true, user_id)
+                    .await
+            } else {
+                Vec::new()
+            }
+        },
         async {
             let _ = seg_media.grandparent(&ctx.db).await;
             ctx.addons.fetch_segments(&seg_media, ctx, true).await
         }
     );
-    let mut descriptors: Vec<crate::stream::StreamDescriptor> = subs
-        .into_iter()
-        .filter(|s| {
-            let s_lang = crate::subtitle_selection::normalized_language(s.lang.as_deref());
-            sub_langs.iter().any(|lang| {
-                crate::subtitle_selection::normalized_language(Some(lang.as_str())) == s_lang
-            })
-        })
-        .take(sub_langs.len().max(1) * 2)
-        .filter_map(|s| s.url)
-        .collect();
-
-    if let Some(ref target) = target_stream {
-        if let Some(si) = target.stream_info.as_ref() {
-            for s in &si.subtitles {
-                let info = crate::conversions::stremio_subtitle_to_subtitle_info(s);
-                let s_lang = crate::subtitle_selection::normalized_language(info.lang.as_deref());
-                if sub_langs.iter().any(|lang| {
+    let mut descriptors: Vec<crate::stream::StreamDescriptor> = if sub_langs.is_empty() {
+        // Default config ("show all subtitles"): addon metadata cache is now warm;
+        // avoid downloading dozens of external subtitle files across all languages.
+        Vec::new()
+    } else {
+        subs.into_iter()
+            .filter(|s| {
+                let s_lang = crate::subtitle_selection::normalized_language(s.lang.as_deref());
+                sub_langs.iter().any(|lang| {
                     crate::subtitle_selection::normalized_language(Some(lang.as_str())) == s_lang
-                }) && let Some(url) = info.url
-                {
-                    descriptors.push(url);
+                })
+            })
+            .take(sub_langs.len().max(1) * 2)
+            .filter_map(|s| s.url)
+            .collect()
+    };
+
+    if !sub_langs.is_empty() {
+        if let Some(ref target) = target_stream {
+            if let Some(si) = target.stream_info.as_ref() {
+                for s in &si.subtitles {
+                    let info = crate::conversions::stremio_subtitle_to_subtitle_info(s);
+                    let s_lang =
+                        crate::subtitle_selection::normalized_language(info.lang.as_deref());
+                    if sub_langs.iter().any(|lang| {
+                        crate::subtitle_selection::normalized_language(Some(lang.as_str()))
+                            == s_lang
+                    }) && let Some(url) = info.url
+                    {
+                        descriptors.push(url);
+                    }
                 }
             }
         }
     }
 
-    crate::api::subtitles::prefetch_external_subtitles(ctx.clone(), descriptors);
+    if !descriptors.is_empty() {
+        crate::api::subtitles::prefetch_external_subtitles(ctx.clone(), descriptors);
+    }
 }
 
 /// Looks up the next episode in the series (e.g. S01E02 after S01E01, or S02E01 after S01 finale),
@@ -2386,7 +2364,7 @@ pub fn spawn_next_episode_probe_opts(
             (current.grandparent_id, current.parent_idx, current.idx)
         {
             sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM media WHERE grandparent_id = ? AND ((parent_idx = ? AND idx > ?) OR (parent_idx > ?)) AND (released_at IS NULL OR released_at <= CURRENT_TIMESTAMP) ORDER BY COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC LIMIT 1",
+                "SELECT id FROM media WHERE kind = 'episode' AND grandparent_id = ? AND ((parent_idx = ? AND idx > ?) OR (parent_idx > ?)) AND (released_at IS NULL OR released_at <= CURRENT_TIMESTAMP) ORDER BY COALESCE(parent_idx, 9999) ASC, COALESCE(idx, 9999) ASC LIMIT 1",
             )
             .bind(gp_id)
             .bind(p_idx)
@@ -2398,7 +2376,7 @@ pub fn spawn_next_episode_probe_opts(
             .flatten()
         } else if let (Some(p_id), Some(idx)) = (current.parent_id, current.idx) {
             sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM media WHERE parent_id = ? AND idx > ? AND (released_at IS NULL OR released_at <= CURRENT_TIMESTAMP) ORDER BY COALESCE(idx, 9999) ASC LIMIT 1",
+                "SELECT id FROM media WHERE kind = 'episode' AND parent_id = ? AND idx > ? AND (released_at IS NULL OR released_at <= CURRENT_TIMESTAMP) ORDER BY COALESCE(idx, 9999) ASC LIMIT 1",
             )
             .bind(p_id)
             .bind(idx)

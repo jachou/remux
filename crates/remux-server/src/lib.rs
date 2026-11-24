@@ -490,7 +490,20 @@ pub async fn init_app(
                 .on_failure(()),
         )
         .layer(cors)
-        .layer(tower_http::compression::CompressionLayer::new());
+        .layer({
+            use tower_http::compression::{
+                CompressionLayer, CompressionLevel,
+                predicate::{DefaultPredicate, NotForContentType, Predicate},
+            };
+            let predicate = DefaultPredicate::new()
+                .and(NotForContentType::new("video/"))
+                .and(NotForContentType::new("audio/"))
+                .and(NotForContentType::new("application/octet-stream"))
+                .and(NotForContentType::new("font/"));
+            CompressionLayer::new()
+                .quality(CompressionLevel::Fastest)
+                .compress_when(predicate)
+        });
 
     Ok((router, ctx))
 }
