@@ -681,10 +681,15 @@ static EXTERNAL_SUBTITLE_INFLIGHT: std::sync::LazyLock<
 > = std::sync::LazyLock::new(dashmap::DashMap::new);
 
 /// Raw fetch of external subtitle bytes through proxy / addon / local filesystem.
+/// Enforces a 15-second timeout and 16 MB size cap so a stalled or misbehaving
+/// subtitle host cannot hang single-flight coalescers or OOM the server.
 async fn raw_fetch_external_subtitle_bytes(
     ctx: &crate::AppContext,
     descriptor: &crate::stream::StreamDescriptor,
 ) -> anyhow::Result<axum::body::Bytes> {
+    const MAX_SUBTITLE_BYTES: usize = 16 * 1024 * 1024;
+    const SUBTITLE_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
     match descriptor {
         crate::stream::StreamDescriptor::Http {
             url,
@@ -695,18 +700,43 @@ async fn raw_fetch_external_subtitle_bytes(
             for (k, v) in request_headers {
                 req = req.header(k.as_str(), v.as_str());
             }
-            let resp = req
-                .send()
+            let resp = tokio::time::timeout(SUBTITLE_FETCH_TIMEOUT, req.send())
                 .await
+                .map_err(|_| anyhow!("upstream subtitle request timed out"))?
                 .map_err(|e| anyhow!("upstream HTTP request failed: {e}"))?;
             if !resp.status().is_success() {
                 return Err(anyhow!("upstream subtitle status {}", resp.status()));
             }
-            resp.bytes()
-                .await
-                .map_err(|e| anyhow!("read subtitle bytes: {e}"))
+            if let Some(len) = resp.content_length() {
+                if len as usize > MAX_SUBTITLE_BYTES {
+                    return Err(anyhow!("upstream subtitle too large: {len} bytes"));
+                }
+            }
+            use futures::StreamExt;
+            let mut stream = resp.bytes_stream();
+            let mut buf = Vec::new();
+            let read_res = tokio::time::timeout(SUBTITLE_FETCH_TIMEOUT, async {
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| anyhow!("read subtitle bytes: {e}"))?;
+                    if buf.len() + chunk.len() > MAX_SUBTITLE_BYTES {
+                        return Err(anyhow!("upstream subtitle exceeded {MAX_SUBTITLE_BYTES} byte cap"));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| anyhow!("upstream subtitle body read timed out"))?;
+            read_res?;
+            Ok(axum::body::Bytes::from(buf))
         }
         crate::stream::StreamDescriptor::Local(path) => {
+            let meta = tokio::fs::metadata(path)
+                .await
+                .map_err(|e| anyhow!("stat local subtitle file: {e}"))?;
+            if meta.len() as usize > MAX_SUBTITLE_BYTES {
+                return Err(anyhow!("local subtitle too large: {} bytes", meta.len()));
+            }
             tokio::fs::read(path)
                 .await
                 .map(Into::into)
@@ -721,16 +751,77 @@ async fn raw_fetch_external_subtitle_bytes(
                 .stream
                 .as_ref()
                 .ok_or_else(|| anyhow!("addon has no stream capability"))?;
-            let resp = stream_cap
-                .serve_stream(descriptor, &axum::http::HeaderMap::new())
-                .await
-                .map_err(|e| anyhow!("upstream serve failed: {e:?}"))?;
+            let resp = tokio::time::timeout(
+                SUBTITLE_FETCH_TIMEOUT,
+                stream_cap.serve_stream(descriptor, &axum::http::HeaderMap::new()),
+            )
+            .await
+            .map_err(|_| anyhow!("opendal subtitle request timed out"))?
+            .map_err(|e| anyhow!("upstream serve failed: {e:?}"))?;
             if !resp.status().is_success() {
                 return Err(anyhow!("upstream subtitle status {}", resp.status()));
             }
-            axum::body::to_bytes(resp.into_body(), usize::MAX)
+            tokio::time::timeout(
+                SUBTITLE_FETCH_TIMEOUT,
+                axum::body::to_bytes(resp.into_body(), MAX_SUBTITLE_BYTES),
+            )
+            .await
+            .map_err(|_| anyhow!("opendal subtitle body read timed out"))?
+            .map_err(|e| anyhow!("read subtitle bytes: {e}"))
+        }
+        crate::stream::StreamDescriptor::Torrent {
+            info_hash,
+            file_hint,
+            file_idx,
+            trackers,
+        } => {
+            let torrent = ctx
+                .torrent
+                .read()
                 .await
-                .map_err(|e| anyhow!("read subtitle bytes: {e}"))
+                .clone()
+                .ok_or_else(|| anyhow!("P2P is disabled"))?;
+            let _lease = torrent.acquire(info_hash).await;
+            let src = crate::stream::TorrentSource {
+                info_hash: info_hash.clone(),
+                file_hint: file_hint.clone(),
+                file_idx: *file_idx,
+                trackers: trackers.clone(),
+            };
+            let resolved = tokio::time::timeout(
+                SUBTITLE_FETCH_TIMEOUT,
+                torrent.resolve_url(&src.to_magnet()),
+            )
+            .await
+            .map_err(|_| anyhow!("torrent subtitle resolve timed out"))?
+            .map_err(|e| anyhow!("resolve torrent subtitle: {e}"))?;
+            let resp = tokio::time::timeout(
+                SUBTITLE_FETCH_TIMEOUT,
+                crate::stream::STREAM_PROXY_CLIENT.get(&resolved).send(),
+            )
+            .await
+            .map_err(|_| anyhow!("torrent subtitle request timed out"))?
+            .map_err(|e| anyhow!("torrent subtitle HTTP failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!("torrent subtitle status {}", resp.status()));
+            }
+            use futures::StreamExt;
+            let mut stream = resp.bytes_stream();
+            let mut buf = Vec::new();
+            let read_res = tokio::time::timeout(SUBTITLE_FETCH_TIMEOUT, async {
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|e| anyhow!("read torrent subtitle: {e}"))?;
+                    if buf.len() + chunk.len() > MAX_SUBTITLE_BYTES {
+                        return Err(anyhow!("torrent subtitle exceeded {MAX_SUBTITLE_BYTES} byte cap"));
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .map_err(|_| anyhow!("torrent subtitle body read timed out"))?;
+            read_res?;
+            Ok(axum::body::Bytes::from(buf))
         }
         other => Err(anyhow!(
             "unsupported external subtitle descriptor: {other:?}"

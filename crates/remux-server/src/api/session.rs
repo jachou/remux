@@ -1116,7 +1116,7 @@ pub(crate) async fn build_session_list(
 #[get("/sessions")]
 pub async fn get_sessions(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Query(q): Query<SessionsQuery>,
 ) -> Result<impl IntoResponse> {
     // Unlike Jellyfin (in-memory sessions that vanish on restart), our sessions
@@ -1134,23 +1134,16 @@ pub async fn get_sessions(
     )
     .await?;
 
-    if let Some(ctrl_uid) = q.controllable_by_user_id {
+    if let Some(_ctrl_uid) = q.controllable_by_user_id {
         // Only remotely-controllable sessions (require active WS / media control capability).
         sessions.retain(|s| s.supports_remote_control);
+    }
 
-        let ctrl_user = db::User::get_by_id(
-            &state
-                .ctx
-                .db,
-            &ctrl_uid,
-        )
-        .await?;
-        let can_control_others = ctrl_user
-            .as_ref()
-            .map_or(false, |u| u.can_remote_control_others());
-        if !can_control_others {
-            sessions.retain(|s| s.user_id == ctrl_uid.to_string());
-        }
+    // Scope visible sessions by the authenticated caller's privileges (never trust an
+    // arbitrary controllableByUserId query parameter to escalate privileges).
+    if !session.user.is_admin && !session.user.can_remote_control_others() {
+        let caller_uid = session.user.id.to_string();
+        sessions.retain(|s| s.user_id == caller_uid);
     }
 
     Ok(Json(sessions))
@@ -1574,10 +1567,18 @@ pub async fn remove_session_user(
 #[delete("/videos/activeencodings")]
 pub async fn delete_transcoding(
     State(state): State<AppState>,
-    _session: auth::AuthSession,
+    session: auth::AuthSession,
     Query(q): Query<api::HlsVideoQuery>,
 ) -> Result<impl IntoResponse> {
     if let Some(play_session_id) = q.play_session_id {
+        if !session.user.is_admin {
+            if let Some(active) = state.ctx.sessions.get(&play_session_id) {
+                if active.user_id != session.user.id {
+                    return Err(anyhow::anyhow!("Forbidden")
+                        .context_forbidden("cannot stop another user's transcode"));
+                }
+            }
+        }
         info!("Stopping transcode session: {}", play_session_id);
         state
             .ctx

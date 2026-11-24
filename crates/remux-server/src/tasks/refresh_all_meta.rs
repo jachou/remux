@@ -69,74 +69,66 @@ impl Task for RefreshAllMetaTask {
             })
         };
 
-        // Composite (kind, id) cursor pagination walks `idx_media_kind_id` in native
-        // index order with zero temp B-tree sort across all media kinds.
-        let mut last_cursor: Option<(db::MediaKind, uuid::Uuid)> = None;
+        // Walk one MediaKind partition at a time with `WHERE kind = ? AND id > ? ORDER BY id LIMIT ?`
+        // so SQLite performs a true O(N) range seek on `idx_media_kind_id (kind, id)` with zero temp B-tree.
         let mut batches = 0usize;
-        loop {
-            let fetch_started = std::time::Instant::now();
-            let batch = if let Some((ref cursor_kind, cursor_id)) = last_cursor {
-                sqlx::query_as::<_, db::Media>(
-                    "SELECT * FROM media \
-                     WHERE kind IN (?, ?, ?, ?) \
-                       AND (kind > ? OR (kind = ? AND id > ?)) \
-                     ORDER BY kind, id LIMIT ?",
-                )
-                .bind(db::MediaKind::Movie)
-                .bind(db::MediaKind::Series)
-                .bind(db::MediaKind::Artist)
-                .bind(db::MediaKind::Album)
-                .bind(cursor_kind)
-                .bind(cursor_kind)
-                .bind(cursor_id)
-                .bind(CHUNK_SIZE)
-                .fetch_all(&ctx.db)
-                .await?
-            } else {
-                sqlx::query_as::<_, db::Media>(
-                    "SELECT * FROM media \
-                     WHERE kind IN (?, ?, ?, ?) \
-                     ORDER BY kind, id LIMIT ?",
-                )
-                .bind(db::MediaKind::Movie)
-                .bind(db::MediaKind::Series)
-                .bind(db::MediaKind::Artist)
-                .bind(db::MediaKind::Album)
-                .bind(CHUNK_SIZE)
-                .fetch_all(&ctx.db)
-                .await?
-            };
+        for kind in [
+            db::MediaKind::Movie,
+            db::MediaKind::Series,
+            db::MediaKind::Artist,
+            db::MediaKind::Album,
+        ] {
+            let mut last_id: Option<uuid::Uuid> = None;
+            loop {
+                let fetch_started = std::time::Instant::now();
+                let batch = if let Some(cursor_id) = last_id {
+                    sqlx::query_as::<_, db::Media>(
+                        "SELECT * FROM media WHERE kind = ? AND id > ? ORDER BY id LIMIT ?",
+                    )
+                    .bind(&kind)
+                    .bind(cursor_id)
+                    .bind(CHUNK_SIZE)
+                    .fetch_all(&ctx.db)
+                    .await?
+                } else {
+                    sqlx::query_as::<_, db::Media>(
+                        "SELECT * FROM media WHERE kind = ? ORDER BY id LIMIT ?",
+                    )
+                    .bind(&kind)
+                    .bind(CHUNK_SIZE)
+                    .fetch_all(&ctx.db)
+                    .await?
+                };
 
-            if batch.is_empty() {
-                break;
+                if batch.is_empty() {
+                    break;
+                }
+                batches += 1;
+                let batch_len = batch.len();
+                let fetch_elapsed = fetch_started.elapsed();
+                trace!(
+                    target: "remux_server::metadata_refresh",
+                    batch = batches,
+                    items = batch_len,
+                    processed = processed.load(Ordering::Relaxed),
+                    fetch_elapsed = ?fetch_elapsed,
+                    "full metadata refresh batch starting"
+                );
+                last_id = batch.last().map(|m| m.id);
+                let process_started = std::time::Instant::now();
+                ctx.addons
+                    .process_meta_batch(batch, &ctx, true, Some(Arc::clone(&on_item_done)))
+                    .await?;
+                trace!(
+                    target: "remux_server::metadata_refresh",
+                    batch = batches,
+                    items = batch_len,
+                    processed = processed.load(Ordering::Relaxed),
+                    fetch_elapsed = ?fetch_elapsed,
+                    process_elapsed = ?process_started.elapsed(),
+                    "full metadata refresh batch complete"
+                );
             }
-            batches += 1;
-            let batch_len = batch.len();
-            let fetch_elapsed = fetch_started.elapsed();
-            trace!(
-                target: "remux_server::metadata_refresh",
-                batch = batches,
-                items = batch_len,
-                processed = processed.load(Ordering::Relaxed),
-                fetch_elapsed = ?fetch_elapsed,
-                "full metadata refresh batch starting"
-            );
-            last_cursor = batch
-                .last()
-                .map(|m| (m.kind.clone(), m.id));
-            let process_started = std::time::Instant::now();
-            ctx.addons
-                .process_meta_batch(batch, &ctx, true, Some(Arc::clone(&on_item_done)))
-                .await?;
-            trace!(
-                target: "remux_server::metadata_refresh",
-                batch = batches,
-                items = batch_len,
-                processed = processed.load(Ordering::Relaxed),
-                fetch_elapsed = ?fetch_elapsed,
-                process_elapsed = ?process_started.elapsed(),
-                "full metadata refresh batch complete"
-            );
         }
         trace!(
             target: "remux_server::metadata_refresh",

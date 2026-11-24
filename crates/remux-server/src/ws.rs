@@ -298,7 +298,10 @@ fn parse_sessions_data(data: Option<&serde_json::Value>) -> (u64, u64) {
                 .parse::<u64>()
                 .ok()
         })
-        .unwrap_or(10_000);
+        .unwrap_or(10_000)
+        // Enforce a 1-second minimum polling floor so a client sending "0,0"
+        // cannot trigger a 0ms infinite SQLite busy-loop.
+        .max(1_000);
     (initial, interval)
 }
 

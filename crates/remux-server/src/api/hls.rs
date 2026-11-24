@@ -1613,13 +1613,15 @@ async fn hls_segment_inner(
 
             let needs_restart = match current_idx {
                 None => {
-                    // No segments on disk yet. If FFmpeg is still running
-                    // (Starting/Running), just fall through to the wait loop —
-                    // killing it here causes an infinite restart cycle.
-                    matches!(
-                        s.state,
-                        TranscodeState::Error(_) | TranscodeState::Complete
-                    )
+                    // No segments on disk yet. Restart if FFmpeg exited/errored, OR if the
+                    // client requested a segment strictly before our resumed start_index
+                    // (which FFmpeg will never generate, preventing a 60s hang).
+                    let start_idx = s.start_time_secs / segment_length.max(1);
+                    requested_idx < start_idx
+                        || matches!(
+                            s.state,
+                            TranscodeState::Error(_) | TranscodeState::Complete
+                        )
                 }
                 Some(cur) if requested_idx < cur => true, // seeking backward
                 Some(cur)
@@ -1662,6 +1664,7 @@ async fn hls_segment_inner(
                     let audio_channels = s.audio_channels;
                     let subtitle_stream_index = s.subtitle_stream_index;
                     let burn_subtitle = s.burn_subtitle;
+                    let saved_video_bitrate = s.video_bitrate;
                     drop(s);
 
                     // Kill running FFmpeg and clean up stale segments (params
@@ -1720,7 +1723,8 @@ async fn hls_segment_inner(
                             .map(|v| v as u32),
                         video_bitrate: q
                             .video_bit_rate
-                            .map(|v| v as u32),
+                            .map(|v| v as u32)
+                            .or(saved_video_bitrate),
                         audio_bitrate: q
                             .audio_bit_rate
                             .map(|v| v as u32),

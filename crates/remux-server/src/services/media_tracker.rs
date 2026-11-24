@@ -248,7 +248,15 @@ impl Subscriber for MediaTrackerSubscriber {
                         .await;
                     }
                     Err(e) => {
-                        errors.push(anyhow::anyhow!("{e}"));
+                        let _ = db::UserMediaTracker::mark_failure(
+                            &self.ctx.db,
+                            tracker.id,
+                            &e,
+                        )
+                        .await;
+                        if e.is_retryable() {
+                            errors.push(anyhow::anyhow!("{e}"));
+                        }
                     }
                 }
             }

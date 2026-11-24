@@ -69,6 +69,18 @@ pub(crate) fn has_matching_embedded_subtitles(
     source: &api::MediaSourceInfo,
     preferred_languages: &[String],
 ) -> bool {
+    has_matching_embedded_subtitles_for_profile(source, preferred_languages, None)
+}
+
+/// Profile-aware check: when a `DeviceProfile` is provided (e.g. HTML5 browser), only
+/// counts embedded subtitle tracks whose codec the profile actually supports via `Embed`,
+/// so browser clients playing HTTP MKVs never lose external subtitles when embedded tracks
+/// will later be stripped by `keeps_embedded_subtitle`.
+pub(crate) fn has_matching_embedded_subtitles_for_profile(
+    source: &api::MediaSourceInfo,
+    preferred_languages: &[String],
+    device_profile: Option<&remux_sdks::remux::DeviceProfile>,
+) -> bool {
     if preferred_languages.is_empty() {
         return false;
     }
@@ -81,6 +93,18 @@ pub(crate) fn has_matching_embedded_subtitles(
                 || is_bitmap_subtitle_codec(stream.codec.as_deref())
             {
                 return false;
+            }
+            if let Some(dp) = device_profile {
+                let codec = stream
+                    .codec
+                    .as_deref()
+                    .and_then(|c| c.parse::<remux_sdks::remux::SubtitleCodec>().ok());
+                let embeds = codec.as_ref().is_some_and(|c| {
+                    crate::device_profile::profile_embeds_subtitle_codec(Some(dp), c)
+                });
+                if !embeds {
+                    return false;
+                }
             }
             crate::subtitle_selection::normalized_language(stream.language.as_deref()) == pref_norm
         })
@@ -912,6 +936,7 @@ impl StreamService {
         // download would rebuild a different menu than the one advertised.
         // The fetches start now, concurrently, so each overlaps the probe
         // loop below instead of adding to it.
+        let dp_ref = ranking.and_then(|r| r.device_profile);
         let sub_langs = probe_cfg
             .subtitle_languages
             .clone()
@@ -938,10 +963,12 @@ impl StreamService {
                     return false;
                 }
                 // Smart skip: if deduplication is enabled and candidate is already probed in cache
-                // with embedded subtitles covering all preferred languages, skip external fetch.
+                // with embedded subtitles deliverable to this client profile, skip external fetch.
                 if dedup_subtitles {
                     if let Some(ref pd) = stream.probe_data {
-                        if is_reusable_probe_cache(pd) && has_matching_embedded_subtitles(pd, &sub_langs) {
+                        if is_reusable_probe_cache(pd)
+                            && has_matching_embedded_subtitles_for_profile(pd, &sub_langs, dp_ref)
+                        {
                             tracing::debug!(
                                 stream_id = %stream.id,
                                 "Stream has matching embedded subtitles in DB cache; skipping external subtitle fetch"
@@ -1055,7 +1082,7 @@ impl StreamService {
             if external_subtitles.is_empty()
                 && cached_external_subtitles.is_none()
                 && self.ctx.addons.has_subtitle_addons()
-                && !has_matching_embedded_subtitles(&source, &sub_langs)
+                && !has_matching_embedded_subtitles_for_profile(&source, &sub_langs, dp_ref)
             {
                 if let Some(mut media) = item
                     .clone()
@@ -1080,7 +1107,7 @@ impl StreamService {
                 }
             } else if dedup_subtitles
                 && !external_subtitles.is_empty()
-                && has_matching_embedded_subtitles(&source, &sub_langs)
+                && has_matching_embedded_subtitles_for_profile(&source, &sub_langs, dp_ref)
             {
                 // 2. If external subtitles were pre-fetched, but the probed source already contains
                 //    native embedded subtitles, discard external subtitles to keep the menu clean!

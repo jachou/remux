@@ -331,6 +331,25 @@ mod error_video_tests {
             expiry.expire_after_create(&key, &LivenessEntry::new(true), now),
             Some(std::time::Duration::from_secs(3600))
         );
+        // expire_after_update must also reset TTL when overwriting an existing entry
+        assert_eq!(
+            expiry.expire_after_update(
+                &key,
+                &LivenessEntry::new_rate_limited_or_timeout(),
+                now,
+                Some(std::time::Duration::from_secs(3500)),
+            ),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            expiry.expire_after_update(
+                &key,
+                &LivenessEntry::new(true),
+                now,
+                Some(std::time::Duration::from_secs(45)),
+            ),
+            Some(std::time::Duration::from_secs(3600))
+        );
     }
 
     #[test]
@@ -954,13 +973,8 @@ pub fn is_rate_limited_or_timed_out(url: &str) -> bool {
 
 struct LivenessExpiry;
 
-impl moka::Expiry<String, LivenessEntry> for LivenessExpiry {
-    fn expire_after_create(
-        &self,
-        _key: &String,
-        value: &LivenessEntry,
-        _created_at: std::time::Instant,
-    ) -> Option<std::time::Duration> {
+impl LivenessExpiry {
+    fn ttl(value: &LivenessEntry) -> Option<std::time::Duration> {
         if value.rate_limited_or_timeout {
             // Short cooldown for transient 429/5xx/timeouts so a brief upstream hiccup
             // doesn't poison the top stream as dead for a full hour.
@@ -968,6 +982,27 @@ impl moka::Expiry<String, LivenessEntry> for LivenessExpiry {
         } else {
             Some(std::time::Duration::from_secs(60 * 60))
         }
+    }
+}
+
+impl moka::Expiry<String, LivenessEntry> for LivenessExpiry {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &LivenessEntry,
+        _created_at: std::time::Instant,
+    ) -> Option<std::time::Duration> {
+        Self::ttl(value)
+    }
+
+    fn expire_after_update(
+        &self,
+        _key: &String,
+        value: &LivenessEntry,
+        _updated_at: std::time::Instant,
+        _duration_until_expiry: Option<std::time::Duration>,
+    ) -> Option<std::time::Duration> {
+        Self::ttl(value)
     }
 }
 
@@ -1061,7 +1096,7 @@ pub struct TorrentSource {
 }
 
 impl TorrentSource {
-    fn to_magnet(&self) -> String {
+    pub(crate) fn to_magnet(&self) -> String {
         let mut m = format!("magnet:?xt=urn:btih:{}", self.info_hash);
         let trackers = &self.trackers;
         if trackers.is_empty() {

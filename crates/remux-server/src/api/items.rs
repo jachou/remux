@@ -1040,6 +1040,9 @@ pub async fn items_flat(
     q.media_types = None;
     // /items/latest returns a bare JSON array without TotalRecordCount, so skip COUNT(*).
     q.enable_total_record_count = Some(false);
+    // Ensure user_id is always populated so ?isPlayed=false / ?filters=IsUnplayed work
+    // even when clients omit userId from the query string and rely on AuthSession.
+    q.user_id.get_or_insert(session.user.id);
     let client = session
         .device
         .jellyfin_client();
@@ -1198,7 +1201,7 @@ pub async fn delete_item(
             .await?
             .ok_or_else(|| anyhow::anyhow!("item not found"))
             .context_not_found("item not found")?;
-        if item.kind != db::MediaKind::Playlist {
+        if item.kind != db::MediaKind::Playlist || item.user_id != Some(session.user.id) {
             return Err(anyhow::anyhow!("forbidden").context_forbidden("admin required"));
         }
     }

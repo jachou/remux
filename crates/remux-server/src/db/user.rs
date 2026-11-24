@@ -295,7 +295,19 @@ impl User {
             return Ok(None);
         };
 
-        if user.verify_password(password)? {
+        let hash = user.password_hash.expose().to_string();
+        let pw = password.to_string();
+        let valid = tokio::task::spawn_blocking(move || -> Result<bool> {
+            let parsed = PasswordHash::new(&hash)
+                .map_err(|e| anyhow!("invalid stored password hash: {e}"))?;
+            Ok(Argon2::default()
+                .verify_password(pw.as_bytes(), &parsed)
+                .is_ok())
+        })
+        .await
+        .map_err(|e| anyhow!("password verification task failed: {e}"))??;
+
+        if valid {
             Ok(Some(user))
         } else {
             Ok(None)

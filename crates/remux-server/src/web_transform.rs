@@ -135,12 +135,7 @@ where
             let (parts, body) = response.into_parts();
 
             if !is_html {
-                let bytes = body
-                    .collect()
-                    .await
-                    .map(|c| c.to_bytes())
-                    .unwrap_or_default();
-                return Ok(Response::from_parts(parts, Body::from(bytes)));
+                return Ok(Response::from_parts(parts, Body::new(body)));
             }
 
             // Buffer → inject
@@ -164,7 +159,9 @@ where
             if !JS.is_empty() || user_js.is_some() {
                 let extra = user_js
                     .as_deref()
-                    .unwrap_or("");
+                    .unwrap_or("")
+                    .replace("</script", "<\\/script")
+                    .replace("</SCRIPT", "<\\/SCRIPT");
                 let tag = format!("<script data-remux>{JS}{extra}</script></body>");
                 html = html.replace("</body>", &tag);
             }

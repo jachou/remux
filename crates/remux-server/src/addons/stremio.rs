@@ -548,9 +548,10 @@ impl TreeAddon for StremioAddon {
                     Some(arc) => arc,
                     None => {
                         let svc = self.service()?;
+                        let series_target = root.grandparent.as_deref().unwrap_or(root);
                         match fetch_and_cache_meta(
                             &svc,
-                            root,
+                            series_target,
                             &self.medias_cache,
                             &self.failed,
                             ctx,

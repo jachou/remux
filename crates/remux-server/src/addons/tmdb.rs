@@ -754,21 +754,24 @@ fn tmdb_client(
 async fn tmdb_client_from_ctx(
     ctx: &AppContext,
 ) -> Result<sdks::RestClient<sdks::BearerAuth>> {
-    // Cache the client after first build to avoid querying the DB for the
-    // API key on every call — critical when many concurrent refresh_meta
-    // or get_tree calls all need a TMDB client.
-    use std::sync::OnceLock;
-    static CLIENT: OnceLock<sdks::RestClient<sdks::BearerAuth>> = OnceLock::new();
-    if let Some(client) = CLIENT.get() {
-        return Ok(client.clone());
-    }
+    // Cache the client keyed on (api_key, base_url) so runtime API key updates
+    // in Server Settings take effect immediately without restarting.
+    static CLIENT: std::sync::LazyLock<
+        std::sync::RwLock<Option<((String, String), sdks::RestClient<sdks::BearerAuth>)>>,
+    > = std::sync::LazyLock::new(|| std::sync::RwLock::new(None));
+
     let config = crate::db::Settings::get_config(&ctx.db).await?;
-    let client = tmdb_client(
-        config.get_tmdb_key(),
-        &ctx.config
-            .tmdb_base_url,
-    )?;
-    let _ = CLIENT.set(client.clone());
+    let key = (
+        config.get_tmdb_key().to_string(),
+        ctx.config.tmdb_base_url.clone(),
+    );
+    if let Some((cached_key, client)) = CLIENT.read().unwrap().as_ref() {
+        if *cached_key == key {
+            return Ok(client.clone());
+        }
+    }
+    let client = tmdb_client(&key.0, &key.1)?;
+    *CLIENT.write().unwrap() = Some((key, client.clone()));
     Ok(client)
 }
 

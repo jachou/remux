@@ -670,17 +670,20 @@ fn select_sidecar_subtitles(
                 .split(|character: char| !character.is_ascii_alphanumeric())
                 .filter(|token| !token.is_empty())
                 .collect();
+            let language = subtitle_language_from_name(&normalized);
+            let is_hindi = language.as_deref() == Some("hi");
             Some(SidecarSubtitleFile {
                 file_idx,
                 path: normalized.clone(),
-                language: subtitle_language_from_name(&normalized),
+                language,
                 is_forced: tokens
                     .iter()
                     .any(|token| matches!(*token, "forced" | "foreign" | "signs")),
                 is_hearing_impaired: tokens
                     .iter()
                     .any(|token| {
-                        matches!(*token, "sdh" | "cc" | "hi" | "hearingimpaired")
+                        matches!(*token, "sdh" | "cc" | "hearingimpaired")
+                            || (*token == "hi" && !is_hindi)
                     }),
             })
         })

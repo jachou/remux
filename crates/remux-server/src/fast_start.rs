@@ -1710,6 +1710,17 @@ fn build_remote_direct_handoff(
     redirect
 }
 
+tokio::task_local! {
+    /// Task-local flag controlling whether cold `PlaybackInfo` liveness checks may
+    /// opportunistically spawn 32-64 MB Fast-Start RAM pre-warms. Defaults to `true`
+    /// for LAN / background probes; scoped to `false` for remote WAN / browser requests.
+    pub(crate) static ALLOW_FAST_START_PREWARM: bool;
+}
+
+pub(crate) fn allow_fast_start_prewarm() -> bool {
+    ALLOW_FAST_START_PREWARM.try_with(|v| *v).unwrap_or(true)
+}
+
 /// Evaluates an incoming stream playback request from a media player (e.g. Infuse)
 /// and handles it via local fast-start cache or direct CDN handoff.
 ///

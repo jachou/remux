@@ -155,6 +155,10 @@ impl Task for RefreshPopularityTask {
         // retry the probe with backoff. If still unavailable, schedule a delayed retry (5 minutes)
         // so an outage at scheduled run time doesn't wait 24 hours for tomorrow.
         let check_url = format!("{}/api/media/tt0903747", base_url.trim_end_matches('/'));
+        static OUTAGE_RETRIES: std::sync::atomic::AtomicU32 =
+            std::sync::atomic::AtomicU32::new(0);
+        const MAX_OUTAGE_RETRIES: u32 = 3;
+
         let check_client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(8))
             .build()
@@ -163,9 +167,9 @@ impl Task for RefreshPopularityTask {
         for attempt in 1..=3 {
             let res = check_client.head(&check_url).send().await;
             if let Ok(resp) = res
-                && !resp
-                    .status()
-                    .is_server_error()
+                && !resp.status().is_server_error()
+                && resp.status() != reqwest::StatusCode::FORBIDDEN
+                && resp.status() != reqwest::StatusCode::TOO_MANY_REQUESTS
             {
                 is_available = true;
                 break;
@@ -175,21 +179,27 @@ impl Task for RefreshPopularityTask {
                 warn!(
                     attempt,
                     delay_secs = delay.as_secs(),
-                    "RemuxDB upstream check failed (5xx / Cloudflare); retrying check..."
+                    "RemuxDB upstream check failed (5xx / 403 / 429); retrying check..."
                 );
                 tokio::time::sleep(delay).await;
             }
         }
 
         if !is_available {
-            warn!("RemuxDB upstream is temporarily unavailable (5xx / Cloudflare); scheduling retry in 5 minutes");
-            let tasks = _tasks.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
-                if let Err(e) = tasks.run_task("RefreshPopularity").await {
-                    tracing::warn!(error = %e, "delayed retry of RemuxDB popularity sync failed to start");
-                }
-            });
+            let attempt = OUTAGE_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if attempt <= MAX_OUTAGE_RETRIES {
+                warn!(attempt, max = MAX_OUTAGE_RETRIES, "RemuxDB upstream is temporarily unavailable; scheduling retry in 5 minutes");
+                let tasks = _tasks.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+                    if let Err(e) = tasks.run_task("RefreshPopularity").await {
+                        tracing::warn!(error = %e, "delayed retry of RemuxDB popularity sync failed to start");
+                    }
+                });
+            } else {
+                warn!("RemuxDB upstream remains unavailable after {MAX_OUTAGE_RETRIES} retries; deferring to next scheduled run");
+                OUTAGE_RETRIES.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
             return Ok(());
         }
         let ids =
@@ -264,17 +274,23 @@ impl Task for RefreshPopularityTask {
             )
             .await?;
             if outage {
-                let tasks = _tasks.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
-                    if let Err(e) = tasks.run_task("RefreshPopularity").await {
-                        tracing::warn!(error = %e, "delayed retry of RemuxDB popularity sync failed to start");
-                    }
-                });
-                anyhow::bail!("RemuxDB is unavailable; metrics sync stopped early, scheduled retry in 5 minutes");
+                let attempt = OUTAGE_RETRIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if attempt <= MAX_OUTAGE_RETRIES {
+                    let tasks = _tasks.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(5 * 60)).await;
+                        if let Err(e) = tasks.run_task("RefreshPopularity").await {
+                            tracing::warn!(error = %e, "delayed retry of RemuxDB popularity sync failed to start");
+                        }
+                    });
+                    anyhow::bail!("RemuxDB is unavailable; metrics sync stopped early, scheduled retry {attempt}/{MAX_OUTAGE_RETRIES} in 5 minutes");
+                }
+                OUTAGE_RETRIES.store(0, std::sync::atomic::Ordering::Relaxed);
+                anyhow::bail!("RemuxDB is unavailable after {MAX_OUTAGE_RETRIES} retries; deferring to next scheduled run");
             }
             progress.set((completed as f64 / total as f64 * 100.0).min(99.0));
         }
+        OUTAGE_RETRIES.store(0, std::sync::atomic::Ordering::Relaxed);
         info!("RemuxDB metrics sync complete");
         progress.set(100.0);
         Ok(())

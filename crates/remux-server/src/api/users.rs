@@ -112,6 +112,7 @@ pub async fn get_display_preferences(
     Query(q): Query<DisplayPrefQuery>,
 ) -> Result<impl IntoResponse> {
     let user = if let Some(user_id) = q.user_id {
+        require_self_or_admin(user_id, &session)?;
         db::User::get_by_id(
             &state
                 .ctx
@@ -176,6 +177,7 @@ pub async fn update_display_preferences(
     Json(payload): Json<api::DisplayPreferencesDto>,
 ) -> Result<impl IntoResponse> {
     let user = if let Some(user_id) = q.user_id {
+        require_self_or_admin(user_id, &session)?;
         db::User::get_by_id(
             &state
                 .ctx
@@ -1264,6 +1266,23 @@ pub async fn update_user_policy(
     )
     .await?
     .ok_or_else(|| anyhow::anyhow!("User not found"))?;
+    // Prevent demoting or disabling the last active administrator account.
+    if user.is_admin && (!policy.is_administrator || policy.is_disabled) {
+        let other_admins: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM users WHERE is_admin = 1 AND id != ?",
+        )
+        .bind(user_id)
+        .fetch_one(&state.ctx.db)
+        .await?;
+        if other_admins == 0 {
+            return Err(anyhow::anyhow!(
+                "Cannot remove or disable the last administrator account"
+            )
+            .context_bad_request(
+                "Cannot remove or disable the last administrator account",
+            ));
+        }
+    }
     user.is_admin = policy.is_administrator;
     user.policy = Some(sqlx::types::Json(policy));
     user.save(
@@ -1882,7 +1901,7 @@ async fn resume_items(
         query.enable_resumable = Some(false);
         let now = chrono::Utc::now();
         let candidates = next_up_candidates(&state, &session, &query).await?;
-        let activity: HashMap<Uuid, chrono::DateTime<chrono::Utc>> = candidates
+        let filtered_candidates: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = candidates
             .into_iter()
             .filter(|(media, _)| {
                 media
@@ -1897,6 +1916,34 @@ async fn resume_items(
             })
             .map(|(media, date)| (media.id, date))
             .collect();
+        let has_post_filters = q.parent_id.is_some()
+            || q.filters.is_some()
+            || q.is_favorite.is_some()
+            || q.tags.is_some()
+            || q.genres.is_some()
+            || q.genre_ids.is_some()
+            || q.studio_ids.is_some()
+            || q.years.is_some()
+            || q.search_term.as_deref().is_some_and(|s| !s.is_empty())
+            || session.user.policy.as_ref().is_some_and(|p| {
+                p.0.max_parental_rating.is_some()
+                    || !p.0.blocked_tags.is_empty()
+                    || !p.0.allowed_tags.is_empty()
+                    || p.0.filter_rules.is_some()
+                    || !p.0.enable_all_folders
+                    || !p.0.enabled_folders.is_empty()
+            });
+        let total_next_up_candidates = filtered_candidates.len() as i64;
+        let hydrate_candidates: Vec<(Uuid, chrono::DateTime<chrono::Utc>)> = if has_post_filters {
+            filtered_candidates
+        } else {
+            // candidates are already ordered by most-recent activity; only hydrate
+            // enough Next Up rows to fill [0..start+limit] after merging with resumables.
+            let cap = (start as usize).saturating_add(limit as usize);
+            filtered_candidates.into_iter().take(cap).collect()
+        };
+        let activity: HashMap<Uuid, chrono::DateTime<chrono::Utc>> =
+            hydrate_candidates.into_iter().collect();
         if !activity.is_empty() {
             // Reuse normal request scope, policy, user data and image handling.
             query.ids = Some(
@@ -1933,7 +1980,11 @@ async fn resume_items(
             if q.enable_total_record_count
                 .unwrap_or(true)
             {
-                total += next_up.len() as i64;
+                total += if has_post_filters {
+                    next_up.len() as i64
+                } else {
+                    total_next_up_candidates
+                };
             }
             items.extend(next_up);
         }

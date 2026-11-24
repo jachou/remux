@@ -506,6 +506,9 @@ async fn items_playbackinfo_inner(
         .then(|| media.clone());
     // Addon subtitles are fetched per source inside `probe_candidates`,
     // alongside that source's probe, so only the item itself is loaded here.
+    let is_remote_req = crate::fast_start::is_remote_client(&headers);
+    let is_browser_req = crate::fast_start::is_browser_video_request(&headers);
+    let allow_prewarm = !(is_remote_req || is_browser_req);
     let pbi_start = std::time::Instant::now();
     let (probed_result, subtitle_media) = tokio::join!(
         async {
@@ -518,8 +521,8 @@ async fn items_playbackinfo_inner(
             let discovery_ms = t_discovery.elapsed().as_millis() as u64;
 
             let t_probe = std::time::Instant::now();
-            let res = service
-                .probe_candidates(ranking, ranking_prefs)
+            let res = crate::fast_start::ALLOW_FAST_START_PREWARM
+                .scope(allow_prewarm, service.probe_candidates(ranking, ranking_prefs))
                 .await?;
             let probe_ms = t_probe.elapsed().as_millis() as u64;
 
@@ -580,8 +583,6 @@ async fn items_playbackinfo_inner(
     // Fast-Start pre-warm: for LAN non-browser clients, download head/tail/resume into RAM.
     // For remote or browser clients (which 307-bypass RAM), avoid 64-170 MB downloads and dual-IP
     // debrid hits; only run a lightweight 8-byte liveness check on non-IP-locked URLs to pre-resolve CDN.
-    let is_remote_req = crate::fast_start::is_remote_client(&headers);
-    let is_browser_req = crate::fast_start::is_browser_video_request(&headers);
     if let Some(first) = probed.results.first() {
         let stream_info = first
             .effective_stream

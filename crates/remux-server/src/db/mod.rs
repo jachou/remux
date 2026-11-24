@@ -191,12 +191,14 @@ async fn vacuum_if_needed(pool: &SqlitePool) -> Result<()> {
         sqlx::query("PRAGMA temp_store = 1")
             .execute(&mut *conn)
             .await?;
-        sqlx::query("VACUUM")
+        let vacuum_res = sqlx::query("VACUUM")
             .execute(&mut *conn)
-            .await?;
+            .await;
         sqlx::query("PRAGMA temp_store = 2")
             .execute(&mut *conn)
-            .await?;
+            .await
+            .ok();
+        vacuum_res?;
     }
     Ok(())
 }
@@ -455,6 +457,13 @@ pub async fn migrate_channel_ids(pool: &SqlitePool) -> Result<()> {
         Ok(())
     }
     .await;
+
+    if result.is_err() {
+        sqlx::query("ROLLBACK")
+            .execute(&mut *conn)
+            .await
+            .ok();
+    }
 
     // Always restore FK enforcement before returning.
     sqlx::query("PRAGMA foreign_keys = ON")

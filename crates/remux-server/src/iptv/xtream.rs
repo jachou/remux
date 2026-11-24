@@ -41,12 +41,15 @@ pub async fn fetch_xtream_categories(
     password: &str,
 ) -> HashMap<String, ProgramKind> {
     let base = server.trim_end_matches('/');
-    let url = format!(
-        "{}/player_api.php?username={}&password={}&action=get_live_categories",
-        base, username, password
-    );
+    let Ok(mut url) = url::Url::parse(&format!("{base}/player_api.php")) else {
+        return HashMap::new();
+    };
+    url.query_pairs_mut()
+        .append_pair("username", username)
+        .append_pair("password", password)
+        .append_pair("action", "get_live_categories");
     let Ok(resp) = client
-        .get(&url)
+        .get(url)
         .send()
         .await
     else {
@@ -88,16 +91,17 @@ pub async fn fetch_xtream_channels(
     let base = server
         .trim_end_matches('/')
         .to_owned();
-    let url = format!(
-        "{}/player_api.php?username={}&password={}&action=get_live_streams",
-        base, username, password
-    );
+    let mut url = url::Url::parse(&format!("{base}/player_api.php"))?;
+    url.query_pairs_mut()
+        .append_pair("username", username)
+        .append_pair("password", password)
+        .append_pair("action", "get_live_streams");
     let username = username.to_owned();
     let password = password.to_owned();
     let category_kinds = category_kinds.clone();
 
     let resp = client
-        .get(&url)
+        .get(url)
         .send()
         .await?;
     let byte_stream = resp

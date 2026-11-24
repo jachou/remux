@@ -6956,8 +6956,10 @@ impl Media {
             .filters
             .as_deref()
             .unwrap_or(&[]);
-        let is_played = item_filters.contains(&api::ItemFilter::IsPlayed);
-        let is_unplayed = item_filters.contains(&api::ItemFilter::IsUnplayed);
+        let is_played =
+            item_filters.contains(&api::ItemFilter::IsPlayed) || filter.is_played == Some(true);
+        let is_unplayed =
+            item_filters.contains(&api::ItemFilter::IsUnplayed) || filter.is_played == Some(false);
         let is_resumable = item_filters.contains(&api::ItemFilter::IsResumable);
         let favorite = filter.favorite();
         let watchlist = filter.watchlist();
@@ -7210,7 +7212,18 @@ impl Media {
 
     pub async fn delete(db: &SqlitePool, id: &Uuid) -> Result<()> {
         let mut tx = db.begin().await?;
-        sqlx::query("DELETE FROM media_relations WHERE left_media_id = ?1")
+        // Clean left_media_id relations for this item and any children/grandchildren
+        // (left_media_id has no FK cascade), and delete flat grandparent-linked children
+        // (grandparent_id has no ON DELETE CASCADE).
+        sqlx::query(
+            "DELETE FROM media_relations \
+             WHERE left_media_id = ?1 \
+                OR left_media_id IN (SELECT id FROM media WHERE parent_id = ?1 OR grandparent_id = ?1)",
+        )
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM media WHERE grandparent_id = ?1")
             .bind(id)
             .execute(&mut *tx)
             .await?;

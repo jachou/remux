@@ -425,12 +425,6 @@ pub async fn import_catalog_items(
                 let tag_rows: Vec<(Uuid, &String)> = item_weights
                     .iter()
                     .map(|(item_id, _)| item_id)
-                    .chain(
-                        existing_items
-                            .iter()
-                            .filter(|item| item.kind != db::MediaKind::TvProgram)
-                            .map(|item| &item.id),
-                    )
                     .flat_map(|item_id| {
                         catalog_tags
                             .iter()

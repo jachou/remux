@@ -1492,8 +1492,10 @@ async fn check_liveness_with_fallback(
             continue;
         }
         attempts += 1;
-        // For Candidate #1 or fallback Candidate #2 (attempts <= 2), initiate fast-start pre-warm if not already running so liveness and head buffering coalesce in one upstream request!
-        if attempts <= 2 {
+        // For Candidate #1 or fallback Candidate #2 (attempts <= 2), initiate fast-start pre-warm
+        // for LAN/native clients if not already running, registering ACTIVE_PREWARM_NOTIFY synchronously
+        // BEFORE tokio::spawn so `d.is_alive().await` below coalesces onto the single upstream request.
+        if attempts <= 2 && crate::fast_start::allow_fast_start_prewarm() {
             if let Some(crate::stream::StreamDescriptor::Http { url, request_headers, .. }) = stream.stream_info.as_ref().map(|si| &si.descriptor) {
                 if !crate::stream::STREAM_LIVENESS_CACHE.contains_key(url) && crate::fast_start::get_active_prewarm_notify(url).is_none() {
                     let url_c = url.clone();
@@ -1502,7 +1504,10 @@ async fn check_liveness_with_fallback(
                     let head_sz = stream.stream_info.as_ref().map(|si| {
                         crate::fast_start::calculate_fast_start_head_size(&url_c, si.size.map(|s| s as u64), None)
                     });
+                    let prewarm_notify_guard =
+                        crate::fast_start::register_active_prewarm_notify(url);
                     tokio::spawn(async move {
+                        let _prewarm_notify_guard = prewarm_notify_guard;
                         crate::fast_start::prewarm_fast_start(
                             Some(item_id),
                             &url_c,

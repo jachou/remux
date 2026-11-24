@@ -1652,6 +1652,8 @@ pub struct GetItemsQuery {
     pub include_item_types: Option<Vec<MediaType>>,
     #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
     pub is_favorite: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_option_bool_from_anything")]
+    pub is_played: Option<bool>,
     pub image_type_limit: Option<i64>,
     #[serde(
         serialize_with = "serialize_comma_opt",
