@@ -69,6 +69,16 @@ pub struct UserFilter {
     pub total_count: bool,
 }
 
+static ARGON2_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(4));
+
+static DUMMY_PASSWORD_HASH: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    User::hash_password("remux-dummy-timing-equalizer-password").unwrap_or_else(|_| {
+        "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            .to_string()
+    })
+});
+
 impl User {
     pub async fn save(&mut self, db: &SqlitePool) -> Result<()> {
         sqlx::query(
@@ -297,14 +307,22 @@ impl User {
         username: &str,
         password: &str,
     ) -> Result<Option<Self>> {
-        let Some(user) = Self::get_by_username(db, username).await? else {
-            return Ok(None);
-        };
-        if user.is_disabled() {
-            return Ok(None);
-        }
+        let _permit = ARGON2_SEMAPHORE
+            .acquire()
+            .await
+            .map_err(|e| anyhow!("argon2 semaphore closed: {e}"))?;
 
-        let hash = user.password_hash.expose().to_string();
+        let user = Self::get_by_username(db, username).await?;
+        let active_user = user.filter(|u| !u.is_disabled());
+
+        let hash = active_user
+            .as_ref()
+            .map(|u| {
+                u.password_hash
+                    .expose()
+                    .to_string()
+            })
+            .unwrap_or_else(|| DUMMY_PASSWORD_HASH.clone());
         let pw = password.to_string();
         let valid = tokio::task::spawn_blocking(move || -> Result<bool> {
             let parsed = PasswordHash::new(&hash)
@@ -316,10 +334,9 @@ impl User {
         .await
         .map_err(|e| anyhow!("password verification task failed: {e}"))??;
 
-        if valid {
-            Ok(Some(user))
-        } else {
-            Ok(None)
+        match active_user {
+            Some(user) if valid => Ok(Some(user)),
+            _ => Ok(None),
         }
     }
 

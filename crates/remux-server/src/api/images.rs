@@ -134,7 +134,8 @@ async fn items_images_inner(
         format: q
             .format
             .clone(),
-    };
+    }
+    .sanitized();
 
     // Resolve to (raw_bytes, content_type, source_key_for_cache, is_remote).
     // is_remote=true means the bytes came from an external URL and must not be

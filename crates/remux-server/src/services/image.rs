@@ -1789,16 +1789,58 @@ fn encode_jpeg_rgba(img: RgbaImage) -> anyhow::Result<Vec<u8>> {
 // Image processing helpers (sync — run in spawn_blocking)
 // ---------------------------------------------------------------------------
 
+pub const MAX_IMAGE_DIMENSION: u32 = 4096;
+pub const MAX_IMAGE_BLUR: u32 = 50;
+
+impl ImageProcessOptions {
+    /// Clamp caller-supplied resize, blur, and quality parameters to safe
+    /// upper bounds so unauthenticated image requests cannot trigger OOM or
+    /// excessive CPU usage.
+    pub fn sanitized(mut self) -> Self {
+        self.fill_width = self
+            .fill_width
+            .map(|v| v.clamp(1, MAX_IMAGE_DIMENSION));
+        self.fill_height = self
+            .fill_height
+            .map(|v| v.clamp(1, MAX_IMAGE_DIMENSION));
+        self.width = self
+            .width
+            .map(|v| v.clamp(1, MAX_IMAGE_DIMENSION));
+        self.height = self
+            .height
+            .map(|v| v.clamp(1, MAX_IMAGE_DIMENSION));
+        self.max_width = self
+            .max_width
+            .map(|v| v.clamp(1, MAX_IMAGE_DIMENSION));
+        self.max_height = self
+            .max_height
+            .map(|v| v.clamp(1, MAX_IMAGE_DIMENSION));
+        self.blur = self
+            .blur
+            .map(|b| b.min(MAX_IMAGE_BLUR));
+        self.quality = self
+            .quality
+            .map(|q| q.clamp(1, 100));
+        self
+    }
+}
+
 fn process_image_sync(
     bytes: &[u8],
     opts: &ImageProcessOptions,
 ) -> anyhow::Result<(Vec<u8>, &'static str)> {
+    let opts = opts
+        .clone()
+        .sanitized();
     let img = image::load_from_memory(bytes)?;
     let has_alpha = img
         .color()
         .has_alpha();
-    let img = apply_sizing(img, opts);
-    let img = if let Some(sigma) = opts.blur {
+    let img = apply_sizing(img, &opts);
+    let img = if let Some(sigma) = opts
+        .blur
+        .filter(|&s| s > 0)
+    {
         img.blur(sigma as f32)
     } else {
         img
@@ -1833,6 +1875,9 @@ fn process_image_sync(
 
 /// Resize `img` according to sizing params (fill → exact → max priority order).
 fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
+    let opts = opts
+        .clone()
+        .sanitized();
     let orig_w = img.width();
     let orig_h = img.height();
 
@@ -1852,10 +1897,10 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
                 img.resize_to_fill(width, height, image::imageops::FilterType::Lanczos3)
             }
             (Some(width), None) => {
-                img.resize(width, u32::MAX, image::imageops::FilterType::Lanczos3)
+                img.resize(width, MAX_IMAGE_DIMENSION, image::imageops::FilterType::Lanczos3)
             }
             (None, Some(height)) => {
-                img.resize(u32::MAX, height, image::imageops::FilterType::Lanczos3)
+                img.resize(MAX_IMAGE_DIMENSION, height, image::imageops::FilterType::Lanczos3)
             }
             (None, None) => unreachable!("fill sizing requires a dimension"),
         };
@@ -1871,20 +1916,20 @@ fn apply_sizing(img: DynamicImage, opts: &ImageProcessOptions) -> DynamicImage {
     {
         let nw = opts
             .width
-            .unwrap_or(u32::MAX);
+            .unwrap_or(MAX_IMAGE_DIMENSION);
         let nh = opts
             .height
-            .unwrap_or(u32::MAX);
+            .unwrap_or(MAX_IMAGE_DIMENSION);
         return img.resize(nw, nh, image::imageops::FilterType::Lanczos3);
     }
 
     // Priority 3: max — cap size, scale down only.
     let cap_w = opts
         .max_width
-        .unwrap_or(u32::MAX);
+        .unwrap_or(MAX_IMAGE_DIMENSION);
     let cap_h = opts
         .max_height
-        .unwrap_or(u32::MAX);
+        .unwrap_or(MAX_IMAGE_DIMENSION);
     if orig_w > cap_w || orig_h > cap_h {
         return img.resize(cap_w, cap_h, image::imageops::FilterType::Lanczos3);
     }
@@ -1919,6 +1964,31 @@ mod tests {
         let result = apply_sizing(source, &opts);
 
         assert_eq!((result.width(), result.height()), (1170, 657));
+    }
+
+    #[test]
+    fn image_process_options_clamps_extreme_dimensions_and_blur() {
+        let opts = ImageProcessOptions {
+            fill_width: Some(50_000),
+            fill_height: Some(50_000),
+            width: Some(0),
+            height: Some(99_999),
+            max_width: Some(100_000),
+            max_height: Some(0),
+            blur: Some(999),
+            quality: Some(255),
+            ..Default::default()
+        }
+        .sanitized();
+
+        assert_eq!(opts.fill_width, Some(MAX_IMAGE_DIMENSION));
+        assert_eq!(opts.fill_height, Some(MAX_IMAGE_DIMENSION));
+        assert_eq!(opts.width, Some(1));
+        assert_eq!(opts.height, Some(MAX_IMAGE_DIMENSION));
+        assert_eq!(opts.max_width, Some(MAX_IMAGE_DIMENSION));
+        assert_eq!(opts.max_height, Some(1));
+        assert_eq!(opts.blur, Some(MAX_IMAGE_BLUR));
+        assert_eq!(opts.quality, Some(100));
     }
 
     #[test]

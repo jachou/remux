@@ -300,25 +300,143 @@ async fn build_auth_response(
     }))
 }
 
+const LOGIN_RATE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+const LOGIN_MAX_FAILS_PER_IP: usize = 20;
+const LOGIN_MAX_FAILS_PER_USER: usize = 5;
+
+static LOGIN_FAIL_BY_IP: std::sync::LazyLock<
+    dashmap::DashMap<String, std::collections::VecDeque<std::time::Instant>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+static LOGIN_FAIL_BY_USER: std::sync::LazyLock<
+    dashmap::DashMap<String, std::collections::VecDeque<std::time::Instant>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+fn login_client_ip(headers: &axum::http::HeaderMap) -> String {
+    if let Some(ip) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ip.to_string();
+    }
+    if let Some(ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ip.to_string();
+    }
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ip.to_string();
+    }
+    "local".to_string()
+}
+
+fn is_login_rate_limited(
+    map: &dashmap::DashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    key: &str,
+    limit: usize,
+) -> bool {
+    let now = std::time::Instant::now();
+    let Some(mut entry) = map.get_mut(key) else {
+        return false;
+    };
+    while entry
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > LOGIN_RATE_WINDOW)
+    {
+        entry.pop_front();
+    }
+    entry.len() >= limit
+}
+
+fn record_login_failure(
+    map: &dashmap::DashMap<String, std::collections::VecDeque<std::time::Instant>>,
+    key: &str,
+) {
+    let now = std::time::Instant::now();
+    if map.len() > 10_000 {
+        map.retain(|_, q| {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > LOGIN_RATE_WINDOW)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+    }
+    let mut entry = map
+        .entry(key.to_string())
+        .or_default();
+    while entry
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > LOGIN_RATE_WINDOW)
+    {
+        entry.pop_front();
+    }
+    entry.push_back(now);
+}
+
 #[post("/users/authenticatebyname")]
 pub async fn users_authenticatebyname(
+    headers: axum::http::HeaderMap,
     State(state): State<AppState>,
     auth_header: auth::JellyfinAuthHeader,
     Json(data): Json<api::AuthenticateUserByName>,
-) -> Result<impl IntoResponse> {
-    let user = User::authenticate(
+) -> Result<axum::response::Response> {
+    let ip = login_client_ip(&headers);
+    let username = data
+        .username
+        .as_deref()
+        .unwrap_or("");
+    let user_key = username
+        .trim()
+        .to_ascii_lowercase();
+
+    if is_login_rate_limited(&LOGIN_FAIL_BY_IP, &ip, LOGIN_MAX_FAILS_PER_IP)
+        || (!user_key.is_empty()
+            && is_login_rate_limited(&LOGIN_FAIL_BY_USER, &user_key, LOGIN_MAX_FAILS_PER_USER))
+    {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many failed login attempts. Please try again later.",
+        )
+            .into_response());
+    }
+
+    let Some(user) = User::authenticate(
         &state
             .ctx
             .db,
-        data.username
-            .as_deref()
-            .unwrap_or(""),
+        username,
         data.pw
             .as_deref()
             .unwrap_or(""),
     )
     .await?
-    .context_unauthorized("not found")?;
+    else {
+        record_login_failure(&LOGIN_FAIL_BY_IP, &ip);
+        if !user_key.is_empty() {
+            record_login_failure(&LOGIN_FAIL_BY_USER, &user_key);
+        }
+        return Err(anyhow::anyhow!("invalid credentials"))
+            .context_unauthorized("Invalid username or password");
+    };
+
+    if !user_key.is_empty() {
+        LOGIN_FAIL_BY_USER.remove(&user_key);
+    }
+
     let mut device = auth::Device::new_from_header(auth_header, &user)?;
     device
         .save(
@@ -328,7 +446,9 @@ pub async fn users_authenticatebyname(
         )
         .await?;
 
-    build_auth_response(&state, device, user).await
+    Ok(build_auth_response(&state, device, user)
+        .await?
+        .into_response())
 }
 
 #[post("/users/authenticatewithquickconnect")]
@@ -5806,6 +5926,31 @@ mod e2e_tests {
             ids.contains(&watched_col.id),
             "Watched collection missing after user2 watches an item"
         );
+    }
+
+    #[tokio::test]
+    async fn authenticatebyname_rate_limits_repeated_failures() {
+        let (server, _guard, _token) = authenticated_server().await;
+        let ip = "198.51.100.99";
+        let username = "ratelimit-nonexistent-user";
+
+        for _ in 0..super::LOGIN_MAX_FAILS_PER_USER {
+            server
+                .post("/users/authenticatebyname")
+                .add_header("cf-connecting-ip", HeaderValue::from_static(ip))
+                .json(&json!({ "Username": username, "Pw": "wrong-password" }))
+                .expect_failure()
+                .await
+                .assert_status(StatusCode::UNAUTHORIZED);
+        }
+
+        server
+            .post("/users/authenticatebyname")
+            .add_header("cf-connecting-ip", HeaderValue::from_static(ip))
+            .json(&json!({ "Username": username, "Pw": "wrong-password" }))
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::TOO_MANY_REQUESTS);
     }
 }
 

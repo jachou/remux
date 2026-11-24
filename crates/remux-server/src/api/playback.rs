@@ -1307,11 +1307,9 @@ pub async fn items_file(
     let mut response = videos_stream_inner(
         headers,
         state,
-        Some(
-            session
-                .user
-                .id,
-        ),
+        session
+            .user
+            .id,
         Some(
             session
                 .device
@@ -1388,6 +1386,7 @@ pub async fn audio_stream(
     Query(q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
     let (user_id, device_id) = best_effort_caller(&state, &jfauth).await;
+    let user_id = user_id.context_unauthorized("Authentication required")?;
     videos_stream_inner(headers, state, user_id, device_id, id, q).await
 }
 
@@ -1405,6 +1404,7 @@ pub async fn audio_stream_by_container(
         q.container = Some(container);
     }
     let (user_id, device_id) = best_effort_caller(&state, &jfauth).await;
+    let user_id = user_id.context_unauthorized("Authentication required")?;
     videos_stream_inner(headers, state, user_id, device_id, id, q).await
 }
 
@@ -1417,6 +1417,7 @@ pub async fn videos_stream(
     Query(q): Query<api::VideoStreamQuery>,
 ) -> Result<impl IntoResponse> {
     let (user_id, device_id) = best_effort_caller(&state, &jfauth).await;
+    let user_id = user_id.context_unauthorized("Authentication required")?;
     videos_stream_inner(headers, state, user_id, device_id, id, q).await
 }
 
@@ -1434,6 +1435,7 @@ pub async fn videos_stream_by_container(
         q.container = Some(container);
     }
     let (user_id, device_id) = best_effort_caller(&state, &jfauth).await;
+    let user_id = user_id.context_unauthorized("Authentication required")?;
     videos_stream_inner(headers, state, user_id, device_id, id, q).await
 }
 
@@ -1501,24 +1503,26 @@ fn can_serve_mkv_source_directly(
 async fn videos_stream_inner(
     headers: headers::HeaderMap,
     state: AppState,
-    user_id: Option<Uuid>,
+    user_id: Uuid,
     device_id: Option<String>,
     id: Uuid,
     q: api::VideoStreamQuery,
 ) -> Result<impl IntoResponse> {
-    let user_id = user_id.or(q.user_id);
     let device_id = device_id.or(q.device_id.clone());
-    let user = if let Some(user_id) = user_id {
-        db::User::get_by_id(
-            &state
-                .ctx
-                .db,
-            &user_id,
-        )
-        .await?
-    } else {
-        None
-    };
+    let user = db::User::get_by_id(
+        &state
+            .ctx
+            .db,
+        &user_id,
+    )
+    .await?;
+    if user
+        .as_ref()
+        .is_some_and(|u| u.is_disabled())
+    {
+        return Err(anyhow::anyhow!("user disabled"))
+            .context_unauthorized("User account is disabled");
+    }
 
     // Follow the stream PlaybackInfo selected. A client may echo the item
     // ID, group ID, or original stream ID even after probe fallback;
@@ -1538,7 +1542,7 @@ async fn videos_stream_inner(
         id,
         requested_id,
         device_id.as_deref(),
-        user_id,
+        Some(user_id),
     )
     .await;
 
@@ -2252,6 +2256,7 @@ const BITRATE_TEST_CHUNK_BYTES: u64 = 64 * 1024;
 /// the first byte leaves immediately instead of after building the whole body.
 #[get("/playback/bitratetest")]
 pub async fn playback_bitratetest_sized(
+    _session: auth::AuthSession,
     Query(q): Query<BitrateTestQuery>,
 ) -> Result<impl IntoResponse> {
     let size = q
@@ -6410,5 +6415,32 @@ mod tests {
             .assert_status(StatusCode::PARTIAL_CONTENT);
 
         let _ = tokio::fs::remove_file(fixture).await;
+    }
+
+    #[tokio::test]
+    async fn media_streams_and_bitrate_test_require_auth() {
+        let (server, _guard, _token) = authenticated_server().await;
+        let id = uuid::Uuid::new_v4();
+
+        server
+            .get(&format!("/videos/{id}/stream"))
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        server
+            .get(&format!("/videos/{id}/stream.mkv"))
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        server
+            .get(&format!("/audio/{id}/stream"))
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
+        server
+            .get("/playback/bitratetest?size=1024")
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::UNAUTHORIZED);
     }
 }

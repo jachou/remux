@@ -467,11 +467,93 @@ pub struct QuickConnectEntry {
     pub date_added: chrono::DateTime<chrono::Utc>,
 }
 
+const QC_TTL_SECS: u64 = 600;
+const QC_MAX_ACTIVE_CODES: usize = 256;
+const QC_IP_WINDOW_SECS: u64 = 60;
+const QC_IP_MAX_PER_WINDOW: usize = 10;
+const QC_MAX_FIELD_CHARS: usize = 128;
+
+static QC_ACTIVE_CODES: std::sync::LazyLock<
+    dashmap::DashMap<String, std::time::Instant>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+static QC_IP_RATE: std::sync::LazyLock<
+    dashmap::DashMap<String, std::collections::VecDeque<std::time::Instant>>,
+> = std::sync::LazyLock::new(dashmap::DashMap::new);
+
+fn qc_client_ip(headers: &HeaderMap) -> String {
+    if let Some(ip) = headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ip.to_string();
+    }
+    if let Some(ip) = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ip.to_string();
+    }
+    if let Some(ip) = headers
+        .get("x-real-ip")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return ip.to_string();
+    }
+    "local".to_string()
+}
+
+fn truncate_qc_field(value: Option<String>) -> String {
+    value
+        .unwrap_or_default()
+        .chars()
+        .take(QC_MAX_FIELD_CHARS)
+        .collect()
+}
+
+fn check_qc_ip_rate_limit(ip: &str) -> bool {
+    let now = std::time::Instant::now();
+    let window = Duration::from_secs(QC_IP_WINDOW_SECS);
+    if QC_IP_RATE.len() > 10_000 {
+        QC_IP_RATE.retain(|_, q| {
+            while q
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > window)
+            {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+    }
+    let mut entry = QC_IP_RATE
+        .entry(ip.to_string())
+        .or_default();
+    while entry
+        .front()
+        .is_some_and(|t| now.duration_since(*t) > window)
+    {
+        entry.pop_front();
+    }
+    if entry.len() >= QC_IP_MAX_PER_WINDOW {
+        return false;
+    }
+    entry.push_back(now);
+    true
+}
+
 #[post("/quickconnect/initiate")]
 pub async fn quickconnect_initiate(
+    headers: HeaderMap,
     State(state): State<AppState>,
     auth_header: auth::JellyfinAuthHeader,
-) -> Result<impl IntoResponse> {
+) -> Result<Response> {
     let cfg = db::Settings::get_config(
         &state
             .ctx
@@ -486,23 +568,55 @@ pub async fn quickconnect_initiate(
             .context_forbidden("QuickConnect is disabled on this server");
     }
 
+    let ip = qc_client_ip(&headers);
+    if !check_qc_ip_rate_limit(&ip) {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many QuickConnect requests" })),
+        )
+            .into_response());
+    }
+
+    let now = std::time::Instant::now();
+    let ttl = Duration::from_secs(QC_TTL_SECS);
+    QC_ACTIVE_CODES.retain(|_, created| now.duration_since(*created) < ttl);
+    if QC_ACTIVE_CODES.len() >= QC_MAX_ACTIVE_CODES {
+        return Ok((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({ "error": "Too many active QuickConnect sessions" })),
+        )
+            .into_response());
+    }
+
     let secret = get_uuid()
         .simple()
         .to_string();
-    let code = format!("{:06}", get_uuid().as_u128() % 1_000_000);
+    let mut code = None;
+    for _ in 0..8 {
+        let candidate = format!("{:06}", get_uuid().as_u128() % 1_000_000);
+        if state
+            .ctx
+            .store
+            .get::<String>(format!("qc:code:{candidate}"))
+            .is_none()
+        {
+            code = Some(candidate);
+            break;
+        }
+    }
+    let Some(code) = code else {
+        return Ok((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "Unable to allocate QuickConnect code" })),
+        )
+            .into_response());
+    };
+    QC_ACTIVE_CODES.insert(code.clone(), now);
 
-    let device_id = auth_header
-        .device_id
-        .unwrap_or_default();
-    let device_name = auth_header
-        .device
-        .unwrap_or_default();
-    let app_name = auth_header
-        .client
-        .unwrap_or_default();
-    let app_version = auth_header
-        .version
-        .unwrap_or_default();
+    let device_id = truncate_qc_field(auth_header.device_id);
+    let device_name = truncate_qc_field(auth_header.device);
+    let app_name = truncate_qc_field(auth_header.client);
+    let app_version = truncate_qc_field(auth_header.version);
 
     let date_added = chrono::Utc::now();
     let entry = QuickConnectEntry {
@@ -518,15 +632,11 @@ pub async fn quickconnect_initiate(
     state
         .ctx
         .store
-        .save(format!("qc:{secret}"), entry, Duration::from_secs(600));
+        .save(format!("qc:{secret}"), entry, ttl);
     state
         .ctx
         .store
-        .save(
-            format!("qc:code:{code}"),
-            secret.clone(),
-            Duration::from_secs(600),
-        );
+        .save(format!("qc:code:{code}"), secret.clone(), ttl);
 
     Ok(Json(api::QuickConnectResult {
         secret,
@@ -538,7 +648,8 @@ pub async fn quickconnect_initiate(
         device_name: Some(device_name),
         app_name: Some(app_name),
         app_version: Some(app_version),
-    }))
+    })
+    .into_response())
 }
 
 #[query]
@@ -1324,6 +1435,48 @@ mod test {
             .await;
         resp.assert_status_ok();
         resp.assert_json_contains(&json!({ "CustomCss": "body{color:red}" }));
+    }
+
+    #[tokio::test]
+    async fn quickconnect_initiate_truncates_metadata_and_rate_limits() {
+        let (server, _ctx) = new_test_server()
+            .await
+            .unwrap();
+        let long_name = "x".repeat(500);
+        let auth_hdr = format!(
+            r#"MediaBrowser Client="{long_name}", Device="{long_name}", DeviceId="{long_name}", Version="{long_name}""#
+        );
+
+        let ip = "198.51.100.77";
+        let resp = server
+            .post("/quickconnect/initiate")
+            .add_header("cf-connecting-ip", HeaderValue::from_static(ip))
+            .add_header(http::header::AUTHORIZATION, HeaderValue::from_str(&auth_hdr).unwrap())
+            .await;
+        resp.assert_status_ok();
+        let body: serde_json::Value = resp.json();
+        assert_eq!(
+            body["DeviceId"]
+                .as_str()
+                .unwrap()
+                .len(),
+            super::QC_MAX_FIELD_CHARS
+        );
+
+        // Exhaust the remaining per-IP quota (10 total) and assert the 11th returns 429.
+        for _ in 1..super::QC_IP_MAX_PER_WINDOW {
+            server
+                .post("/quickconnect/initiate")
+                .add_header("cf-connecting-ip", HeaderValue::from_static(ip))
+                .await
+                .assert_status_ok();
+        }
+        server
+            .post("/quickconnect/initiate")
+            .add_header("cf-connecting-ip", HeaderValue::from_static(ip))
+            .expect_failure()
+            .await
+            .assert_status(StatusCode::TOO_MANY_REQUESTS);
     }
 
     // --- POST /system/configuration/branding ---
