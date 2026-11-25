@@ -3898,13 +3898,26 @@ impl AddonService {
                 .collect()
         };
         info!(streams = deduped.len(), ?sources, elapsed = ?instant.elapsed(), "streams synced");
+        let had_existing_streams = !existing.is_empty();
         if deduped.is_empty() {
             let now = chrono::Utc::now().naive_utc();
-            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+            if had_existing_streams {
+                sqlx::query(
+                    "UPDATE media SET streams_refreshed_at = ?, updated_at = ? WHERE id = ?",
+                )
+                .bind(now)
                 .bind(now)
                 .bind(media.id)
                 .execute(&ctx.db)
                 .await?;
+                media.updated_at = now;
+            } else {
+                sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                    .bind(now)
+                    .bind(media.id)
+                    .execute(&ctx.db)
+                    .await?;
+            }
             media.streams_refreshed_at = Some(now);
             media.sources = None;
             let _ = media
@@ -3919,11 +3932,23 @@ impl AddonService {
         }
 
         let now = chrono::Utc::now().naive_utc();
-        sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+        if !had_existing_streams {
+            sqlx::query(
+                "UPDATE media SET streams_refreshed_at = ?, updated_at = ? WHERE id = ?",
+            )
+            .bind(now)
             .bind(now)
             .bind(media.id)
             .execute(&ctx.db)
             .await?;
+            media.updated_at = now;
+        } else {
+            sqlx::query("UPDATE media SET streams_refreshed_at = ? WHERE id = ?")
+                .bind(now)
+                .bind(media.id)
+                .execute(&ctx.db)
+                .await?;
+        }
         media.streams_refreshed_at = Some(now);
         let mut sources: Vec<db::Media> = deduped
             .into_iter()

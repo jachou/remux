@@ -390,6 +390,28 @@ fn community_rating(media: &db::Media) -> Option<f64> {
     }
 }
 
+fn media_etag_at(media: &db::Media, now: chrono::NaiveDateTime) -> uuid::Uuid {
+    let release_date = [media.digital_released_at, media.released_at]
+        .into_iter()
+        .flatten()
+        .max();
+    let crossed_release_boundary = matches!(
+        (media.streams_refreshed_at, release_date),
+        (Some(refreshed), Some(rel)) if refreshed < rel && now >= rel
+    );
+    let updated_ns = media
+        .updated_at
+        .and_utc()
+        .timestamp_nanos_opt()
+        .unwrap_or(0);
+    let key = format!("v1:{updated_ns}:{}", u8::from(crossed_release_boundary));
+    uuid::Uuid::new_v5(&media.id, key.as_bytes())
+}
+
+pub fn media_etag(media: &db::Media) -> uuid::Uuid {
+    media_etag_at(media, chrono::Utc::now().naive_utc())
+}
+
 pub fn db_media_to_item(media: db::Media, hide_sources: bool) -> BaseItemDto {
     db_media_to_item_inner(media, hide_sources, true)
 }
@@ -451,7 +473,7 @@ fn db_media_to_item_inner(
         id: media
             .id
             .clone(),
-        etag: Some(media.id),
+        etag: Some(media_etag(&media)),
         server_id: common::server_id(),
         name: Some(
             media
@@ -1465,5 +1487,54 @@ mod stream_row_tests {
                 .media_sources
                 .is_none()
         );
+    }
+
+    #[test]
+    fn etag_changes_on_update_and_release_boundary_but_stays_stable_otherwise() {
+        use chrono::NaiveDate;
+
+        let nov19 = NaiveDate::from_ymd_opt(2026, 11, 19)
+            .unwrap()
+            .and_hms_opt(2, 37, 23)
+            .unwrap();
+        let nov23 = NaiveDate::from_ymd_opt(2026, 11, 23)
+            .unwrap()
+            .and_hms_opt(0, 4, 18)
+            .unwrap();
+        let nov24 = NaiveDate::from_ymd_opt(2026, 11, 24)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let nov25 = NaiveDate::from_ymd_opt(2026, 11, 25)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+
+        let mut media = db::Media {
+            id: uuid::Uuid::new_v4(),
+            kind: db::MediaKind::Movie,
+            title: "You Can See Everything".into(),
+            digital_released_at: Some(nov24),
+            streams_refreshed_at: Some(nov19),
+            updated_at: nov23,
+            ..Default::default()
+        };
+
+        let pre_release = media_etag_at(&media, nov23);
+        // Stable across calls when nothing changed, and distinct from static media.id.
+        assert_eq!(pre_release, media_etag_at(&media, nov23));
+        assert_ne!(pre_release, media.id);
+
+        // Crossing digital_released_at after a pre-release refresh busts the Etag.
+        let post_release = media_etag_at(&media, nov25);
+        assert_ne!(pre_release, post_release);
+        assert_eq!(post_release, media_etag_at(&media, nov25));
+
+        // Bumping updated_at (e.g., 0 -> >0 streams discovered) also busts the Etag.
+        media.updated_at = nov25;
+        media.streams_refreshed_at = Some(nov25);
+        let after_streams_found = media_etag_at(&media, nov25);
+        assert_ne!(post_release, after_streams_found);
+        assert_ne!(pre_release, after_streams_found);
     }
 }
